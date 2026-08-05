@@ -1,0 +1,5 @@
+# my_proxy uses only Python standard library (asyncio, ssl, struct, json, etc.)
+# No external dependencies required.
+#
+# This file is intentionally empty, kept for documentation purposes and
+# consistency with typical Python project structure.

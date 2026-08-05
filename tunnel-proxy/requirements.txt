@@ -1,0 +1,13 @@
+# proxy_server.py itself uses only the Python standard library
+# (asyncio, ssl, sqlite3, struct, json, ...) so this file is intentionally
+# almost empty.
+
+# Optional: enables CPU/RAM figures on the dashboard. If not installed,
+# the dashboard simply omits those two fields.
+psutil>=5.9
+
+# Not a pip package: certificate issuance/renewal is delegated to the
+# `certbot` CLI tool (see README.md "Install certbot" section), plus
+# whichever `certbot-dns-<provider>` plugin matches your DNS host, e.g.:
+#   pip install certbot certbot-dns-cloudflare
+#   pip install certbot certbot-dns-route53

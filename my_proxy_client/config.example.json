@@ -1,0 +1,29 @@
+{
+  "server": "proxy.example.com:9000",
+  "token": "shared-secret-here",
+  "tunnels": [
+    {
+      "type": "http",
+      "local": "127.0.0.1:3000",
+      "subdomain": "api"
+    },
+    {
+      "type": "http",
+      "local": "8080",
+      "subdomain": "frontend"
+    },
+    {
+      "type": "http",
+      "local": "5173"
+    },
+    {
+      "type": "tcp",
+      "local": "localhost:22",
+      "remote_port": 20022
+    },
+    {
+      "type": "tcp",
+      "local": "5432"
+    }
+  ]
+}

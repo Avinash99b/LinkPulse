@@ -1,0 +1,41 @@
+{
+  "shared_secret": "REPLACE_WITH_A_LONG_RANDOM_SECRET",
+
+  "control": {
+    "host": "0.0.0.0",
+    "port": 9000,
+    "tls": false
+  },
+
+  "http": {
+    "host": "0.0.0.0",
+    "port": 80
+  },
+
+  "wildcard_domain": "forwarding.example.com",
+
+  "tcp": {
+    "port_range": [20000, 20100],
+    "bind_host": "0.0.0.0"
+  },
+
+  "dashboard": {
+    "host": "127.0.0.1",
+    "port": 8080
+  },
+
+  "http_only": true,
+
+  "heartbeat_interval_seconds": 20,
+  "heartbeat_timeout_seconds": 60,
+  "stale_grace_seconds": 300,
+
+  "storage": {
+    "db_path": "/var/lib/tunnel-proxy/tunnel_proxy.db"
+  },
+
+  "logging": {
+    "level": "INFO",
+    "file": "/var/log/tunnel-proxy/tunnel_proxy.log"
+  }
+}
