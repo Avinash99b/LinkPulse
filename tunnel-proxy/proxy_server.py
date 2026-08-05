@@ -167,7 +167,7 @@ class ServerContext:
     def __init__(self, config: dict):
         self.config = config
         self.storage = Storage(config["storage"]["db_path"])
-        self.clients: dict[str, ClientSession] = {}
+        self.clients: dict[str, set[ClientSession]] = {}
         self.by_subdomain: dict[str, tuple[ClientSession, str]] = {}
         self.by_port: dict[int, tuple[ClientSession, str]] = {}
         self.seen_nonces: dict[bytes, int] = {}
@@ -700,7 +700,9 @@ async def cleanup_client(session: ClientSession, ctx: ServerContext):
         except Exception:
             pass
     session.streams.clear()
-    if ctx.clients.get(session.client_id) is session:
+    sessions = ctx.clients.get(session.client_id, set())
+    sessions.discard(session)
+    if not sessions:
         ctx.clients.pop(session.client_id, None)
     try:
         session.writer.close()
@@ -740,15 +742,12 @@ async def handle_control_connection(reader: asyncio.StreamReader, writer: asynci
         writer.close()
         return
 
-    # If this client_id already has a live session (e.g. reconnect race /
-    # duplicate connection), tear down the old one first.
-    old = ctx.clients.get(client_id)
-    if old is not None:
-        log.info("Client %s reconnected; replacing previous session", client_id[:8])
-        await cleanup_client(old, ctx)
+    # If this client_id already has live sessions, keep them (support multiple connections per client_id)
+    existing_sessions = ctx.clients.get(client_id, set())
 
     session = ClientSession(client_id, reader, writer)
-    ctx.clients[client_id] = session
+    existing_sessions.add(session)
+    ctx.clients[client_id] = existing_sessions
     ctx.storage.upsert_client(client_id)
 
     resp = json.dumps({
@@ -759,7 +758,9 @@ async def handle_control_connection(reader: asyncio.StreamReader, writer: asynci
     try:
         await session.send_frame(FrameType.HELLO_OK, CONTROL_STREAM_ID, resp)
     except Exception:
-        ctx.clients.pop(client_id, None)
+        existing_sessions.discard(session)
+        if not existing_sessions:
+            ctx.clients.pop(client_id, None)
         return
 
     ctx.log_event(f"Client {client_id[:8]} connected from {addr[0]}")
@@ -889,11 +890,12 @@ async def run():
     log.info("Shutting down...")
     for t in tasks:
         t.cancel()
-    for session in list(ctx.clients.values()):
-        try:
-            session.writer.close()
-        except Exception:
-            pass
+    for sessions in ctx.clients.values():
+        for session in sessions:
+            try:
+                session.writer.close()
+            except Exception:
+                pass
     control_server.close()
     http_server.close()
     await asyncio.gather(*tasks, return_exceptions=True)

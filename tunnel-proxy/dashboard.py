@@ -147,30 +147,31 @@ setInterval(refresh, 3000);
 def build_stats(ctx) -> dict:
     now = time.time()
     clients = []
-    for cid, session in list(ctx.clients.items()):
-        tunnels = []
-        for tid, t in list(session.tunnels.items()):
-            if t.type == "http":
-                public_address = f"http://{t.subdomain}.{ctx.config['wildcard_domain']}"
-            else:
-                public_address = f"tcp://{ctx.config['wildcard_domain']}:{t.remote_port}"
-            tunnels.append({
-                "tunnel_id": tid,
-                "type": t.type,
-                "public_address": public_address,
-                "connections": t.connection_count,
-                "bytes_in": t.bytes_in,
-                "bytes_out": t.bytes_out,
+    for cid, sessions in list(ctx.clients.items()):
+        for session in sessions:
+            tunnels = []
+            for tid, t in list(session.tunnels.items()):
+                if t.type == "http":
+                    public_address = f"http://{t.subdomain}.{ctx.config['wildcard_domain']}"
+                else:
+                    public_address = f"tcp://{ctx.config['wildcard_domain']}:{t.remote_port}"
+                tunnels.append({
+                    "tunnel_id": tid,
+                    "type": t.type,
+                    "public_address": public_address,
+                    "connections": t.connection_count,
+                    "bytes_in": t.bytes_in,
+                    "bytes_out": t.bytes_out,
+                })
+            clients.append({
+                "client_id": cid,
+                "connected_since": session.connected_at,
+                "connected_for": round(now - session.connected_at),
+                "tunnels": tunnels,
+                "bytes_in": session.bytes_in,
+                "bytes_out": session.bytes_out,
+                "active_streams": len(session.streams),
             })
-        clients.append({
-            "client_id": cid,
-            "connected_since": session.connected_at,
-            "connected_for": round(now - session.connected_at),
-            "tunnels": tunnels,
-            "bytes_in": session.bytes_in,
-            "bytes_out": session.bytes_out,
-            "active_streams": len(session.streams),
-        })
 
     proc_stats = {}
     if psutil:
