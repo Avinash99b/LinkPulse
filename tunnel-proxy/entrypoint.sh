@@ -1,16 +1,28 @@
 #!/bin/sh
-# Entrypoint script for nginx container
-# HTTP only - Render handles HTTPS termination
+# Entrypoint for tunnel-proxy container.
+# Runs as root so we can fix up ownership of mounted volumes (Render
+# persistent disks mount as root), then hands off to supervisord which
+# drops privileges per-program to the unprivileged `tunnelproxy` user.
 
 set -e
 
-# Determine upstream host (default to tunnel-proxy for docker-compose, localhost for standalone)
-UPSTREAM_HOST="${NGINX_UPSTREAM_HOST:-tunnel-proxy}"
-UPSTREAM_PORT="${NGINX_UPSTREAM_PORT:-8080}"
+# Ensure all writable dirs exist and belong to tunnelproxy.
+# This is what makes /data (Render disk) usable after it is mounted.
+mkdir -p /data \
+    /var/log/tunnel-proxy \
+    /var/log/nginx \
+    /var/log/supervisor \
+    /run/nginx \
+    /run/supervisord
 
-# Substitute environment variables in nginx config
-sed -e "s|server tunnel-proxy:8080;|server ${UPSTREAM_HOST}:${UPSTREAM_PORT};|g" \
-    /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf
+chown -R tunnelproxy:tunnelproxy \
+    /data \
+    /var/log/tunnel-proxy \
+    /var/log/nginx \
+    /var/log/supervisor \
+    /run/nginx \
+    /run/supervisord \
+    /var/lib/nginx
 
-# Start nginx
-exec nginx -g "daemon off;"
+# Hand off to supervisord (pidfile now lands in /run/supervisord/)
+exec /usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.conf

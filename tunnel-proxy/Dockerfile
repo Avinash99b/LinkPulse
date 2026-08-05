@@ -57,7 +57,7 @@ COPY dashboard.py .
 COPY requirements.txt .
 COPY examples/ ./examples/
 
-# Copy nginx config (modified for single container - use localhost)
+# Copy nginx config
 COPY nginx.conf /etc/nginx/nginx.conf
 
 # Copy haproxy config (protocol-sniffing front door)
@@ -66,12 +66,13 @@ COPY haproxy.cfg /etc/haproxy/haproxy.cfg
 # Copy supervisord config
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
-# Create directories for data, logs, and nginx
-RUN mkdir -p /data /var/log/tunnel-proxy /var/log/nginx /var/lib/nginx/body /run/nginx /var/log/supervisor && \
-    chown -R tunnelproxy:tunnelproxy /data /var/log/tunnel-proxy /var/log/nginx /var/lib/nginx /run/nginx /var/log/supervisor /app
+# Copy entrypoint (runs as root, chowns mounted volumes, then starts supervisord)
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
-# Switch to non-root user
-USER tunnelproxy
+# Create directories for data, logs, and nginx
+RUN mkdir -p /data /var/log/tunnel-proxy /var/log/nginx /var/lib/nginx/body /run/nginx /var/log/supervisor /run/supervisord && \
+    chown -R tunnelproxy:tunnelproxy /data /var/log/tunnel-proxy /var/log/nginx /var/lib/nginx /run/nginx /var/log/supervisor /run/supervisord /app
 
 # Environment variables with defaults
 ENV PYTHONUNBUFFERED=1 \
@@ -91,5 +92,5 @@ EXPOSE 80
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -f http://localhost/health || exit 1
 
-# Run supervisord to manage both processes
-CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
+# Run entrypoint as root (to chown mounted volumes), supervisord drops per-program privileges
+ENTRYPOINT ["/entrypoint.sh"]
