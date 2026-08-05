@@ -25,9 +25,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Stage 2: Final runtime image
 FROM python:3.11-slim AS runtime
 
-# Install runtime dependencies: nginx + supervisord + SSL libs
+# Install runtime dependencies: nginx + haproxy + supervisord + SSL libs
+# libnginx-mod-stream provides the stream module (dynamic .so) used for
+# proxying the control channel; plain `nginx` only installs nginx-core.
+# haproxy is the single public entry point (sniffs control-vs-HTTP on :80).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     nginx \
+    libnginx-mod-stream \
+    haproxy \
     supervisor \
     libssl3 \
     ca-certificates \
@@ -55,6 +60,9 @@ COPY examples/ ./examples/
 # Copy nginx config (modified for single container - use localhost)
 COPY nginx.conf /etc/nginx/nginx.conf
 
+# Copy haproxy config (protocol-sniffing front door)
+COPY haproxy.cfg /etc/haproxy/haproxy.cfg
+
 # Copy supervisord config
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
@@ -75,7 +83,8 @@ ENV PYTHONUNBUFFERED=1 \
     OMP_NUM_THREADS=1 \
     MKL_NUM_THREADS=1
 
-# Expose only port 80 externally (nginx entry point)
+# Expose only port 80 externally:
+#   :80 - haproxy sniffs "TN" -> control channel, else -> HTTP tunnels + dashboard
 EXPOSE 80
 
 # Health check - checks nginx health endpoint

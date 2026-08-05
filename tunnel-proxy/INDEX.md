@@ -10,16 +10,13 @@
 | **protocol.py** | 215 | Canonical binary framed wire protocol. Single source of truth; clients must implement exactly. Frame layout, frame types, HMAC auth, flow control constants. |
 | **dashboard.py** | 251 | Read-only status page (HTML + JSON API). Shows connected clients, active tunnels, bytes/request counts, uptime, logs, CPU/RAM. |
 | **storage.py** | 117 | SQLite persistence. Bookkeeping only (not used for live routing decisions). Survives restarts for observability. |
-| **dashboard.py** | 251 | Read-only status page (HTML + JSON API). Shows connected clients, active tunnels, bytes/request counts, uptime, logs, CPU/RAM. |
+| **haproxy.cfg** | — | Protocol-sniffing front door on `:80`. Routes `"TN"` magic (control channel) to nginx stream, everything else (HTTP) to nginx http. |
+| **nginx.conf** | — | Nginx reverse proxy: HTTP server on `:8088` (dashboard + tunnels) + `stream` module on `:9000` (control channel TCP proxy). |
+| **supervisord.conf** | — | Runs `proxy_server.py`, nginx, and haproxy together in a single container. |
 | **config.example.json** | — | Config template (legacy, kept for reference). |
-| **requirements.txt** | — | Optional `psutil` for dashboard CPU/RAM; certbot setup notes. |
+| **requirements.txt** | — | Optional `psutil` for dashboard CPU/RAM. |
 | **examples/reference_client.py** | — | Minimal working client. Demonstrates protocol implementation. |
-| **systemd/tunnel-proxy.service** | — | Example systemd unit for production deployment. |
-| **scripts/certbot_renew.sh** | — | Optional cron/timer script for out-of-band cert renewal. |
-| **nginx.conf** | — | Nginx reverse proxy config with SSL termination. |
-| **Dockerfile** | — | Multi-stage build for tunnel-proxy server. |
-| **Dockerfile.nginx** | — | Nginx container with SSL termination and env var substitution. |
-| **docker-compose.yml** | — | Complete deployment with tunnel-proxy + nginx. |
+| **Dockerfile** | — | Multi-stage build. Single container: tunnel-proxy + nginx + haproxy via supervisord. Only port 80 exposed. |
 | **README.md** | — | Full architecture, protocol spec, config reference, setup & run instructions. |
 | **DEPLOYMENT.md** | — | Detailed deployment guide for Docker and Render. |
 
@@ -28,15 +25,19 @@
 ## What it does
 
 ```
-HTTPS / TCP traffic from the Internet
-         ↓
-    nginx (SSL termination)
-         ↓
-    proxy_server.py
-   (control channel + HTTP router + TCP listeners)
-         ↓ (one persistent, authenticated, multiplexed connection)
-       Client (your laptop, server, CI runner, ...)
-       (runs one or more tunnels: HTTP or TCP)
+Internet traffic (HTTP)  and  client control connections
+                    │
+                    ▼
+    haproxy  :80  (single public port, sniffs first bytes)
+       ├─ "TN" magic → nginx stream :9000 → control channel
+       └─ HTTP       → nginx http   :8088
+                          ├─ /dashboard/, /api/ → dashboard
+                          └─ else               → proxy_server.py
+                                                      │ (one persistent, authenticated,
+                                                      │  multiplexed connection)
+                                                      ▼
+                                                  Client (your laptop, server, CI runner, ...)
+                                                  (runs one or more tunnels: HTTP or TCP)
 ```
 
 - **Authentication**: HMAC-SHA256 challenge-response (no shared secret sent over wire).
@@ -44,11 +45,12 @@ HTTPS / TCP traffic from the Internet
 - **TCP routing**: Random port allocation (or preferred port, if free). Concurrent TCP listeners, one per tunnel.
 - **Multiplexing**: One persistent connection carries many logical streams. Each stream = one HTTP request-connection or one TCP connection.
 - **Flow control**: Per-stream, credit-based (HTTP/2 style). Backpressure-aware. Prevents one slow tunnel from stalling others.
-- **SSL termination**: Handled externally by nginx/Render. Proxy server runs HTTP only.
+- **Single public port**: HAProxy sniffs the protocol, so one port serves both the control channel and HTTP tunnels.
+- **SSL termination**: Handled externally by Render/Cloudflare/etc. Proxy server runs HTTP only.
 - **Dashboard**: Real-time client/tunnel status, bytes transferred, connection counts, uptime, logs, optional CPU/RAM.
 - **SQLite**: Lightweight persistence for bookkeeping & observability. Routing decisions live in memory; DB is purely informational.
 - **No external services**: Just the proxy binary + SQLite + local files.
-- **Docker ready**: Multi-stage builds, resource limits optimized for 512MB RAM / 0.5 vCPU.
+- **Docker ready**: Single container (supervisord runs tunnel-proxy + nginx + haproxy), multi-stage build, resource limits optimized for 512MB RAM / 0.5 vCPU.
 - **Environment-based config**: No config files needed, all via environment variables.
 - **Auto directory creation**: DB and log directories created automatically.
 
@@ -69,18 +71,22 @@ cp .env.example .env
 #   - WILDCARD_DOMAIN: your domain (DNS *.domain.com → this server)
 ```
 
-### 3. Run (Docker Compose)
+### 3. Run (Docker)
 ```bash
-docker-compose up -d
+docker build -t tunnel-proxy .
+docker run -d -p 80:80 --env-file .env -v tunnel-proxy-data:/data tunnel-proxy
 ```
 
 ### 4. Verify
 ```bash
+# Health:
+curl http://localhost:80/health
+
 # Dashboard:
-open http://<server>:8081/
+open http://localhost:80/dashboard/
 
 # HTTP routing (once a client registers "app" subdomain):
-curl -H "Host: app.tunnel.example.com" http://<server>/
+curl -H "Host: app.tunnel.example.com" http://localhost:80/
 ```
 
 ## Protocol at a glance
@@ -153,50 +159,34 @@ Resists replay and proves knowledge of shared secret without sending it.
 
 **requirements.txt** — Dependencies
 - `psutil` (optional): for CPU/RAM on dashboard
-- Notes on installing `certbot` + provider-specific DNS plugins
-
-**systemd/tunnel-proxy.service** — Production systemd unit
-- Runs as unprivileged `tunnelproxy` user (not root)
-- Uses `CAP_NET_BIND_SERVICE` to bind ports 80/443 without root
-- Restart-on-failure
-- WorkingDirectory, LogLevel, LimitNOFILE settings
-
-**scripts/certbot_renew.sh** — Optional external renewal cron script
-- Simple wrapper around `certbot renew --non-interactive`
-- Can be scheduled via cron/systemd timer independently of the proxy process
 
 ### Docker files
 
-**nginx.conf** — Nginx reverse proxy configuration
-- SSL termination (Let's Encrypt or self-signed)
-- Proxy to tunnel-proxy on port 8080
-- WebSocket support
-- Security headers
+**haproxy.cfg** — Protocol-sniffing front door on `:80`
+- `tcp-request inspect-delay` + payload match on `"TN"` (0x544e)
+- Routes control-channel connections to nginx stream, everything else to nginx http
+- This is what allows a single public port to serve both protocols
 
-**Dockerfile** — Multi-stage build for tunnel-proxy
+**nginx.conf** — Nginx reverse proxy + stream
+- `http` block listens on `:8088`: `/dashboard/` and `/api/` → dashboard `:8081`, everything else → tunnel-proxy `:8080`
+- `stream` block listens on `:9000` and TCP-proxies the control channel to the internal control port `:9001`
+- Loads `ngx_stream_module.so` (via `libnginx-mod-stream`) for the stream/TCP proxy
+
+**supervisord.conf** — Process manager
+- Runs `proxy_server.py`, `nginx`, and `haproxy` in a single container
+- All three run as the unprivileged `tunnelproxy` user
+- Restart-on-failure for each process
+
+**Dockerfile** — Multi-stage build for the whole container
 - Builder stage: compiles dependencies
-- Runtime stage: minimal python:3.11-slim
-- Non-root user
-- Health check
-- Resource optimization
-
-**Dockerfile.nginx** — Nginx container
-- Alpine-based
-- Entrypoint script for env var substitution
-- Auto-generates self-signed certs for development
-
-**docker-compose.yml** — Complete deployment
-- tunnel-proxy service (with resource limits)
-- nginx service (with resource limits)
-- certbot profile for Let's Encrypt
-- dashboard profile
-- Volumes for persistence
+- Runtime stage: minimal python:3.11-slim + nginx + haproxy + supervisor
+- Installs `libnginx-mod-stream` (nginx stream module is dynamic)
+- Non-root user, health check, resource optimization
+- `EXPOSE 80` only
 
 **DEPLOYMENT.md** — Detailed deployment guide
-- Docker Compose quick start
-- Manual Docker run
+- Single-container Docker quick start
 - Render deployment
-- SSL certificate setup
 - Client usage
 - Monitoring
 - Troubleshooting
@@ -228,11 +218,12 @@ Resists replay and proves knowledge of shared secret without sending it.
 3. **Per-stream flow control** — Backpressure-aware, prevents one slow tunnel from starving others.
 4. **Replay-protected auth** — HMAC-SHA256 + timestamp checks + nonce tracking; no secret sent over wire.
 5. **Stable reconnect behavior** — Clients persist their ID, routes aren't "reserved" ahead of time (just first-come first-served), allows graceful recovery without complex state sync.
-6. **SSL termination externalized** — Handled by nginx/Render, keeps proxy server simple and focused.
-7. **Observability, not governance** — SQLite bookkeeping, dashboard, and logs are for transparency; routing is purely in-memory and rebuilt on reconnect.
-8. **Minimal dependencies** — Asyncio (stdlib), ssl (stdlib), sqlite3 (stdlib), psutil (optional). Main server has zero required external packages.
-9. **Environment-based config** — No config files, all via environment variables for container-friendly deployment.
-10. **Auto directory creation** — DB and log directories created automatically.
+6. **SSL termination externalized** — Handled by nginx/Render/Cloudflare, keeps proxy server simple and focused.
+7. **Single public port** — HAProxy sniffs the protocol, so one port serves both the control channel and HTTP tunnels.
+8. **Observability, not governance** — SQLite bookkeeping, dashboard, and logs are for transparency; routing is purely in-memory and rebuilt on reconnect.
+9. **Minimal dependencies** — Asyncio (stdlib), ssl (stdlib), sqlite3 (stdlib), psutil (optional). Main server has zero required external packages.
+10. **Environment-based config** — No config files, all via environment variables for container-friendly deployment.
+11. **Auto directory creation** — DB and log directories created automatically.
 
 ## Testing
 
@@ -250,7 +241,8 @@ All tests passed before finalizing the deliverable.
 - [ ] Set `SHARED_SECRET` to a long random value (`openssl rand -hex 32`)
 - [ ] Set `WILDCARD_DOMAIN` to your actual domain
 - [ ] Ensure DNS has `*.yourdomain` and `yourdomain` pointing to the server
-- [ ] Configure SSL certificates (Let's Encrypt, Render managed, or self-signed)
+- [ ] Expose only port 80; verify both tunnel traffic and client connections work through it
+- [ ] Configure HTTPS termination in front (Render managed, Cloudflare, or your own reverse proxy)
 - [ ] Bind dashboard to `127.0.0.1` or put it behind reverse-proxy auth
 - [ ] Set `tcp.port_range` to your preferred allocation pool
 - [ ] Set resource limits appropriate for your infrastructure

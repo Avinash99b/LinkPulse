@@ -38,6 +38,7 @@ import logging
 import os
 import secrets
 import signal
+import sys
 import struct
 import sys
 import time
@@ -383,6 +384,7 @@ class TunnelClient:
     # =========================================================================
 
     async def _connect_and_serve(self, first_attempt: bool):
+        print("Connecting to %s:%s..." % (self.server_host, self.server_port), file=sys.stderr)
         self.reader, self.writer = await asyncio.wait_for(
             asyncio.open_connection(self.server_host, self.server_port), timeout=10
         )
@@ -926,17 +928,48 @@ async def serve_dashboard(client: TunnelClient, host: str, port: int, log: loggi
 # CLI
 # =============================================================================
 
-DEFAULT_SERVER = "127.0.0.1:9000"
+DEFAULT_SERVER = "127.0.0.1:80"
 DEFAULT_DASHBOARD = "127.0.0.1:4040"
 DEFAULT_GRACE_TIME = 10.0
 DEFAULT_STATE_FILE = Path.home() / ".my_proxy" / "state.json"
 
 
-def _parse_host_port(s: str, default_host: str = "127.0.0.1") -> tuple[str, int]:
+def _get_config_dir() -> Path:
+    """Get the config directory, handling PyInstaller frozen executables.
+    Uses ~/.config/linkpulse/ on all systems (XDG_CONFIG_HOME compliant)."""
+    # XDG_CONFIG_HOME or ~/.config
+    config_home = os.environ.get("XDG_CONFIG_HOME")
+    if config_home:
+        base = Path(config_home)
+    else:
+        base = Path.home() / ".config"
+    return base / "linkpulse"
+
+
+DEFAULT_TOKEN_FILE = _get_config_dir() / "authtoken.json"
+
+
+def _parse_host_port(s: str, default_host: str = "127.0.0.1", default_port: int = 9000) -> tuple[str, int]:
     if ":" in s:
         host, port = s.rsplit(":", 1)
         return (host or default_host), int(port)
-    return default_host, int(s)
+    # If only hostname provided, use default control port (9000)
+    return s, default_port
+
+
+def _normalize_server_address(s: str, default_port: int = 9000) -> str:
+    """Normalize server address - strip protocol/prefix, append default control port if no port specified."""
+    # Strip protocol prefix
+    if s.startswith("https://"):
+        s = s[8:]
+    elif s.startswith("http://"):
+        s = s[7:]
+    # Strip trailing slash
+    s = s.rstrip("/")
+    # If no port specified, append default
+    if ":" not in s:
+        s = f"{s}:{default_port}"
+    return s
 
 
 def _parse_target(s: str) -> tuple[str, int]:
@@ -980,6 +1013,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                               help="open multiple tunnels at once from a config file")
     start_p.add_argument("config", help="path to a JSON file listing tunnels (see config.example.json)")
 
+    auth_p = sub.add_parser("authtoken", parents=[common],
+                            help="save the shared secret (auth token) to config file for future use")
+    auth_p.add_argument("token", help="the shared secret to save")
+
+    server_p = sub.add_parser("server", parents=[common],
+                              help="save the proxy server address to config file for future use")
+    server_p.add_argument("address", help="the proxy server address (host:port) to save")
+
     return parser
 
 
@@ -991,7 +1032,7 @@ def _load_start_config(path: str, cli_args: argparse.Namespace) -> tuple[list[Tu
     # tell us "was this explicitly passed", so we only let the file fill in
     # values that are still at their hard-coded default / None.
     if cfg.get("server") and cli_args.server == DEFAULT_SERVER:
-        cli_args.server = cfg["server"]
+        cli_args.server = _normalize_server_address(cfg["server"])
     if cfg.get("token") and cli_args.token is None:
         cli_args.token = cfg["token"]
 
@@ -1012,6 +1053,49 @@ def _load_start_config(path: str, cli_args: argparse.Namespace) -> tuple[list[Tu
     return specs, cli_args
 
 
+def _load_saved_token() -> Optional[str]:
+    """Load the saved auth token from the config file."""
+    try:
+        if DEFAULT_TOKEN_FILE.exists():
+            data = json.loads(DEFAULT_TOKEN_FILE.read_text())
+            return data.get("token")
+    except Exception:
+        pass
+    return None
+
+
+def _load_saved_server() -> Optional[str]:
+    """Load the saved server address from the config file."""
+    try:
+        if DEFAULT_TOKEN_FILE.exists():
+            data = json.loads(DEFAULT_TOKEN_FILE.read_text())
+            return data.get("server")
+    except Exception:
+        pass
+    return None
+
+
+def _save_config(token: Optional[str] = None, server: Optional[str] = None) -> None:
+    """Save the auth token and/or server address to the config file."""
+    try:
+        data = {}
+        if DEFAULT_TOKEN_FILE.exists():
+            data = json.loads(DEFAULT_TOKEN_FILE.read_text())
+        if token is not None:
+            data["token"] = token
+        if server is not None:
+            data["server"] = server
+        DEFAULT_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        DEFAULT_TOKEN_FILE.write_text(json.dumps(data, indent=2))
+        if token is not None:
+            print(f"Saved auth token to {DEFAULT_TOKEN_FILE}")
+        if server is not None:
+            print(f"Saved server address to {DEFAULT_TOKEN_FILE}")
+    except OSError as e:
+        print(f"Error saving config: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 def _setup_logging(level: str, recent_logs: deque) -> logging.Logger:
     log = logging.getLogger("my_proxy")
     log.setLevel(getattr(logging, level))
@@ -1026,8 +1110,28 @@ async def _async_main(args: argparse.Namespace):
     recent_logs: deque = deque(maxlen=200)
     log = _setup_logging(args.log_level, recent_logs)
 
+    # Handle authtoken command
+    if args.command == "authtoken":
+        _save_config(token=args.token)
+        return
+
+    # Handle server command
+    if args.command == "server":
+        _save_config(server=_normalize_server_address(args.address))
+        return
+
+    # Load saved token if not provided via CLI or env
     if not args.token:
-        log.error("No shared secret provided. Pass --token or set MY_PROXY_TOKEN.")
+        args.token = _load_saved_token()
+
+    # Load saved server if not provided via CLI or env
+    if args.server == DEFAULT_SERVER:
+        saved_server = _load_saved_server()
+        if saved_server:
+            args.server = _normalize_server_address(saved_server)
+
+    if not args.token:
+        log.error("No shared secret provided. Pass --token, set MY_PROXY_TOKEN, or run 'my_proxy authtoken <token>' to save it.")
         sys.exit(2)
 
     if args.command == "http":

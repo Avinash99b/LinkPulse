@@ -2,7 +2,20 @@
 
 This document describes how to deploy the tunnel proxy server using Docker.
 
-## Quick Start with Docker Compose
+## Architecture Overview
+
+A single container runs three processes under supervisord. **Only port 80 is exposed publicly.**
+
+```
+:80  (haproxy) ──────────────────────────── only externally exposed port
+  │  sniffs first 2 bytes: "TN" (0x544e)?
+  ├─ YES → backend control  → nginx stream :9000 → proxy_server :9001 (control channel)
+  └─ NO  → backend http     → nginx http   :8088
+                                ├─ /dashboard/, /api/ → dashboard :8081
+                                └─ everything else     → proxy_server :8080 (tunnel HTTP)
+```
+
+## Quick Start
 
 ### 1. Create `.env` file
 
@@ -19,63 +32,34 @@ cp .env.example .env
 
 All other settings have sensible defaults and don't need to be set.
 
-### 2. Start services
+### 2. Build and run
 
 ```bash
-# Start tunnel-proxy and nginx
-docker-compose up -d
+# Build the single container
+docker build -t tunnel-proxy .
+
+# Run - only port 80 is exposed
+docker run -d \
+  --name tunnel-proxy \
+  -p 80:80 \
+  --env-file .env \
+  -v tunnel-proxy-data:/data \
+  -v tunnel-proxy-logs:/var/log/tunnel-proxy \
+  tunnel-proxy
 ```
 
 ### 3. Verify deployment
 
 ```bash
 # Check logs
-docker-compose logs -f tunnel-proxy
+docker logs -f tunnel-proxy
 
-# Test health endpoint
+# Test health endpoint (via haproxy -> nginx)
 curl http://localhost/health
 
-# Test dashboard
-curl http://localhost:8081/api/stats
-```
-
-## Manual Docker Run
-
-### Build images
-
-```bash
-# Build tunnel-proxy
-docker build -t tunnel-proxy .
-
-# Build nginx
-docker build -t tunnel-proxy-nginx -f Dockerfile.nginx .
-```
-
-### Run tunnel-proxy
-
-```bash
-docker run -d \
-  --name tunnel-proxy \
-  -e SHARED_SECRET="your-secret" \
-  -e WILDCARD_DOMAIN="tunnel.example.com" \
-  -p 9000:9000 \
-  -p 8080:8080 \
-  -p 8081:8081 \
-  -v tunnel-proxy-data:/data \
-  -v tunnel-proxy-logs:/var/log/tunnel-proxy \
-  tunnel-proxy
-```
-
-### Run nginx (HTTP only)
-
-```bash
-docker run -d \
-  --name tunnel-proxy-nginx \
-  -e WILDCARD_DOMAIN="tunnel.example.com" \
-  -e NGINX_UPSTREAM_HOST="tunnel-proxy" \
-  -e NGINX_UPSTREAM_PORT="8080" \
-  -p 80:80 \
-  tunnel-proxy-nginx
+# Test dashboard (via haproxy -> nginx -> dashboard)
+curl http://localhost/dashboard/
+curl http://localhost/api/stats
 ```
 
 ## Environment Variables
@@ -85,7 +69,7 @@ docker run -d \
 | `SHARED_SECRET` | **Yes** | - | Authentication secret (generate with `openssl rand -hex 32`) |
 | `WILDCARD_DOMAIN` | **Yes** | - | Wildcard domain for tunnels (e.g., `tunnel.example.com`) |
 | `CONTROL_HOST` | No | `0.0.0.0` | Control channel bind host |
-| `CONTROL_PORT` | No | `9000` | Control channel port |
+| `CONTROL_PORT` | No | `9001` | Control channel port (internal; nginx stream fronts it at `:9000`) |
 | `HTTP_HOST` | No | `0.0.0.0` | HTTP server bind host |
 | `HTTP_PORT` | No | `8080` | HTTP server port |
 | `TCP_PORT_MIN` | No | `20000` | TCP port range minimum |
@@ -102,6 +86,8 @@ docker run -d \
 
 **Only `SHARED_SECRET` and `WILDCARD_DOMAIN` are required.** All other variables have sensible defaults.
 
+> In the container, `CONTROL_PORT` is set to `9001` so that nginx's stream module (listening on `:9000`) can front the control channel. Do not change it back to `9000` in `.env` — that would collide with nginx's listener.
+
 ## Render Deployment
 
 ### Manual Render setup
@@ -113,9 +99,10 @@ docker run -d \
    - `SHARED_SECRET`
    - `WILDCARD_DOMAIN`
 5. Add persistent disk at `/data` (1GB)
-6. Deploy
+6. Set the **Port** to `80` (HAProxy front door)
+7. Deploy
 
-**Note:** Render handles HTTPS termination automatically. The tunnel proxy runs HTTP only on port 8080.
+**Note:** Render handles HTTPS termination automatically. The container exposes HTTP on port 80 only; the proxy server itself runs HTTP only.
 
 ## Resource Optimization
 
@@ -140,46 +127,61 @@ deploy:
 
 ## SSL/TLS
 
-**Render handles HTTPS termination automatically.** The tunnel proxy runs HTTP only. No SSL certificates, Let's Encrypt, or certbot needed.
+**HTTPS termination is handled externally** (Render, Cloudflare, or your own reverse proxy). The container runs HTTP only. No SSL certificates, Let's Encrypt, or certbot needed.
 
 ## Monitoring
 
-- Dashboard: `http://localhost:8081` (or via your Render URL)
-- API: `http://localhost:8081/api/stats`
-- Health: `http://localhost/health`
+- Dashboard: `http://your-server:80/dashboard/`
+- API: `http://your-server:80/api/stats`
+- Health: `http://your-server:80/health`
 
 ## Client Usage
 
 ```bash
 # Using the reference client
 python3 examples/reference_client.py \
-  --server your-server:9000 \
+  --server your-server:80 \
   --secret your-shared-secret \
   --local-http 127.0.0.1:3000 \
   --subdomain myapp
 ```
 
-Your app will be available at `https://myapp.tunnel.example.com` (via Render's HTTPS)
+> Point the client at the **public port (80)**. HAProxy sniffs the control protocol (`"TN"` magic) and routes it to the control channel automatically — the client does not need a separate control port.
+
+Your app will be available at `https://myapp.tunnel.example.com` (via your HTTPS-terminating front).
 
 ## Troubleshooting
 
 ### Check logs
 ```bash
-docker-compose logs -f tunnel-proxy
-docker-compose logs -f nginx
+docker logs -f tunnel-proxy
+# Inside the container:
+docker exec tunnel-proxy cat /var/log/nginx/error.log
+docker exec tunnel-proxy cat /var/log/supervisor/haproxy.err.log
+docker exec tunnel-proxy cat /var/log/tunnel-proxy/tunnel_proxy.log
+```
+
+### Verify process status inside the container
+```bash
+docker exec tunnel-proxy ps aux | grep -E "haproxy|nginx|python"
 ```
 
 ### Verify connectivity
 ```bash
-# Test control channel
-nc -zv your-server 9000
+# Test control channel through the public port (client connects to :80)
+python3 examples/reference_client.py --server your-server:80 --secret ... --local-http 127.0.0.1:3000
 
-# Test HTTP
-curl -H "Host: test.tunnel.example.com" http://your-server
+# Test HTTP routing
+curl -H "Host: test.tunnel.example.com" http://your-server:80
 ```
+
+### Protocol sniffing not working?
+- Confirm the client is connecting to **port 80** (HAProxy), not 9000
+- Confirm HAProxy sees the connection: `docker exec tunnel-proxy cat /var/log/supervisor/haproxy.err.log`
+- The magic is the first 2 bytes `"TN"` (0x544e) — verify with `nc -v your-server 80` and check the log
 
 ### Database issues
 ```bash
 # Check database
-sqlite3 /data/tunnel_proxy.db ".tables"
+docker exec tunnel-proxy sqlite3 /data/tunnel_proxy.db ".tables"
 ```

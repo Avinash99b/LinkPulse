@@ -3,18 +3,20 @@
 A minimal, self-hosted alternative to ngrok. One `proxy_server.py`, no external services (SQLite + local files only), automatic wildcard DNS routing, HTTP host-based routing, and randomly allocated TCP ports for raw TCP tunnels.
 
 ```
-                                     ┌───────────────────────────┐
-    HTTPS  app.tunnel.example.com     │                           │
-    ───────────────────────────────▶  │    Render (SSL termination)│
-                                       │         ↓                  │
-                                       │    nginx (HTTP proxy)      │
-    HTTP   app.tunnel.example.com     │         ↓                  │
-    ───────────────────────────────▶  │    proxy_server.py        │
-                                       │  - control channel (auth)  │      persistent
-                                       │  - HTTP router             │◀────multiplexed────▶  client
-                                       │  - TCP listeners           │      connection        (your
-                                       │  - SQLite bookkeeping      │                        laptop /
-                                       └───────────────────────────┘                        server)
+                                         ┌────────────────────────────────┐
+    HTTP  app.tunnel.example.com         │       Single container         │
+    ───────────────────────────────────▶ │   :80  haproxy (protocol sniff)│
+                                         │         ├─ "TN"  magic → control│
+    Control channel (client)             │         └─ HTTP → nginx http    │
+    ───────────────────────────────────▶ │              │                  │
+                                         │         nginx :8088 (HTTP)      │  persistent
+                                         │              │                  │◀───multiplexed───▶  client
+                                         │         proxy_server.py        │      connection     (your
+                                         │  - control channel (auth)      │                       laptop /
+                                         │  - HTTP router                 │                       server)
+                                         │  - TCP listeners               │
+                                         │  - SQLite bookkeeping          │
+                                         └────────────────────────────────┘
 ```
 
 ## Key Features
@@ -24,17 +26,18 @@ A minimal, self-hosted alternative to ngrok. One `proxy_server.py`, no external 
 - **TCP routing**: Random port allocation (or preferred port, if free). Concurrent TCP listeners, one per tunnel
 - **Multiplexing**: One persistent connection carries many logical streams. Each stream = one HTTP request-connection or one TCP connection
 - **Flow control**: Per-stream, credit-based (HTTP/2 style). Backpressure-aware. Prevents one slow tunnel from stalling others
-- **SSL termination**: Handled by Render automatically. Proxy server runs HTTP only.
+- **Single public port**: HAProxy fronts `:80` and sniffs the first bytes — `"TN"` magic routes to the control channel, everything else (HTTP) routes to nginx
+- **SSL termination**: Handled externally (Render, Cloudflare, or your own nginx). Proxy server runs HTTP only.
 - **Dashboard**: Real-time client/tunnel status, bytes transferred, connection counts, uptime, logs, optional CPU/RAM
 - **SQLite**: Lightweight persistence for bookkeeping & observability
 - **No external services**: Just the proxy binary + SQLite + local files
-- **Docker ready**: Multi-stage builds, resource limits optimized for 512MB RAM / 0.5 vCPU
+- **Docker ready**: Single container (supervisord runs tunnel-proxy + nginx + haproxy), multi-stage build, resource limits optimized for 512MB RAM / 0.5 vCPU
 - **Environment-based config**: No config files needed, all via environment variables
 - **Auto directory creation**: DB and log directories created automatically
 
 ## Quick Start
 
-### 1. Using Docker Compose (Recommended)
+### 1. Manual Docker Run (Recommended)
 
 ```bash
 # Copy environment template
@@ -44,43 +47,23 @@ cp .env.example .env
 # Required: SHARED_SECRET, WILDCARD_DOMAIN
 vim .env
 
-# Start services
-docker-compose up -d
-
-# Check logs
-docker-compose logs -f tunnel-proxy
-```
-
-### 2. Manual Docker Run
-
-```bash
 # Build
 docker build -t tunnel-proxy .
-docker build -t tunnel-proxy-nginx -f Dockerfile.nginx .
 
-# Run tunnel-proxy
+# Run - only port 80 is exposed
 docker run -d \
   --name tunnel-proxy \
-  -e SHARED_SECRET="your-secret" \
-  -e WILDCARD_DOMAIN="tunnel.example.com" \
-  -p 9000:9000 \
-  -p 8080:8080 \
-  -p 8081:8081 \
+  -p 80:80 \
+  --env-file .env \
   -v tunnel-proxy-data:/data \
   -v tunnel-proxy-logs:/var/log/tunnel-proxy \
   tunnel-proxy
 
-# Run nginx (HTTP only - Render handles HTTPS)
-docker run -d \
-  --name tunnel-proxy-nginx \
-  -e WILDCARD_DOMAIN="tunnel.example.com" \
-  -e NGINX_UPSTREAM_HOST="tunnel-proxy" \
-  -e NGINX_UPSTREAM_PORT="8080" \
-  -p 80:80 \
-  tunnel-proxy-nginx
+# Check health
+curl http://localhost/health
 ```
 
-### 3. Direct Python Run (Development)
+### 2. Direct Python Run (Development)
 
 ```bash
 # Install dependencies
@@ -93,6 +76,8 @@ HTTP_PORT=8080 \
 python3 proxy_server.py
 ```
 
+> The dev run binds control on `:9000`, HTTP on `:8080`, and dashboard on `:8081` directly (no HAProxy/nginx in front).
+
 ## Configuration
 
 All configuration is via environment variables:
@@ -102,7 +87,7 @@ All configuration is via environment variables:
 | `SHARED_SECRET` | **Yes** | - | Authentication secret (generate with `openssl rand -hex 32`) |
 | `WILDCARD_DOMAIN` | **Yes** | - | Wildcard domain for tunnels (e.g., `tunnel.example.com`) |
 | `CONTROL_HOST` | No | `0.0.0.0` | Control channel bind host |
-| `CONTROL_PORT` | No | `9000` | Control channel port |
+| `CONTROL_PORT` | No | `9001` | Control channel port (internal; nginx stream fronts it at `:9000`) |
 | `HTTP_HOST` | No | `0.0.0.0` | HTTP server bind host |
 | `HTTP_PORT` | No | `8080` | HTTP server port |
 | `TCP_PORT_MIN` | No | `20000` | TCP port range minimum |
@@ -121,6 +106,25 @@ All configuration is via environment variables:
 
 **Directories are auto-created**: The server automatically creates `/data` and `/var/log/tunnel-proxy` directories if they don't exist.
 
+## Container Architecture
+
+A single container runs three processes under supervisord:
+
+```
+:80  (haproxy) ──────────────────────────── only externally exposed port
+  │  sniffs first 2 bytes: "TN" (0x544e)?
+  ├─ YES → backend control  → nginx stream :9000 → proxy_server :9001 (control channel)
+  └─ NO  → backend http     → nginx http   :8088
+                                ├─ /dashboard/, /api/ → dashboard :8081
+                                └─ everything else     → proxy_server :8080 (tunnel HTTP)
+```
+
+- **haproxy** — protocol sniffer / front door (`haproxy.cfg`)
+- **nginx** — reverse proxy for HTTP (dashboard + tunnels) and TCP stream for the control channel (`nginx.conf`, `libnginx-mod-stream`)
+- **proxy_server.py** — the tunnel proxy itself (`supervisord.conf`)
+
+The control channel rides through nginx's `stream` module: the client connects to the public port, HAProxy detects the `"TN"` magic, and forwards to nginx stream which relays to the internal control port.
+
 ## Render Deployment
 
 ### Manual Render Setup
@@ -132,32 +136,35 @@ All configuration is via environment variables:
    - `SHARED_SECRET`
    - `WILDCARD_DOMAIN`
 5. Add persistent disk at `/data` (1GB)
-6. Deploy
+6. Set the port to `80` (HAProxy front door)
+7. Deploy
 
-**Note:** Render handles HTTPS termination automatically. The tunnel proxy runs HTTP only on port 8080.
+**Note:** Render handles HTTPS termination automatically. Point `*.yourdomain` and `yourdomain` at the service — the proxy server runs HTTP only on the single public port 80.
 
 ## SSL/TLS
 
-**Render handles HTTPS termination automatically.** The tunnel proxy runs HTTP only. No SSL certificates, Let's Encrypt, or certbot needed.
+**HTTPS termination is handled externally** (Render, Cloudflare, or your own reverse proxy). The container exposes HTTP on port 80 only. No SSL certificates, Let's Encrypt, or certbot needed.
 
 ## Client Usage
 
 ```bash
 # Using the reference client
 python3 examples/reference_client.py \
-  --server your-server:9000 \
+  --server your-server:80 \
   --secret your-shared-secret \
   --local-http 127.0.0.1:3000 \
   --subdomain myapp
 ```
 
-Your app will be available at `https://myapp.tunnel.example.com` (via Render's HTTPS)
+> Point the client at the **public port (80)** — HAProxy sniffs the control protocol and routes it automatically.
+
+Your app will be available at `https://myapp.tunnel.example.com` (via your HTTPS-terminating front).
 
 ## Monitoring
 
-- Dashboard: `http://localhost:8081` (or via your Render URL)
-- API: `http://localhost:8081/api/stats`
-- Health: `http://localhost/health`
+- Dashboard: `http://your-server:80/dashboard/`
+- API: `http://your-server:80/api/stats`
+- Health: `http://your-server:80/health`
 
 ## Project Structure
 
@@ -167,14 +174,12 @@ protocol.py           Canonical wire protocol (frames, auth, constants)
 storage.py            SQLite persistence (clients/tunnels bookkeeping)
 dashboard.py          Read-only status dashboard (HTML + JSON API)
 config.example.json   Config template (legacy)
-requirements.txt      Optional deps (psutil) + certbot notes
+requirements.txt      Optional deps (psutil)
 examples/reference_client.py  Illustrative client implementation
-systemd/tunnel-proxy.service  Example systemd unit
-scripts/certbot_renew.sh      Optional external renewal cron script
-nginx.conf            Nginx reverse proxy config (HTTP only)
-Dockerfile            Multi-stage build for tunnel-proxy
-Dockerfile.nginx      Nginx container (HTTP only)
-docker-compose.yml    Complete deployment with nginx
+haproxy.cfg           HAProxy config: sniffs "TN" vs HTTP on :80
+nginx.conf            Nginx config: HTTP proxy (:8088) + stream control (:9000)
+supervisord.conf      Runs proxy_server.py + nginx + haproxy in one container
+Dockerfile            Single multi-stage build for everything
 DEPLOYMENT.md         Detailed deployment guide
 ```
 
@@ -211,18 +216,20 @@ Resists replay and proves knowledge of shared secret without sending it.
 3. **Per-stream flow control** — Backpressure-aware, prevents one slow tunnel from starving others
 4. **Replay-protected auth** — HMAC-SHA256 + timestamp checks + nonce tracking; no secret sent over wire
 5. **Stable reconnect behavior** — Clients persist their ID, routes aren't "reserved" ahead of time (first-come first-served), allows graceful recovery without complex state sync
-6. **SSL termination externalized** — Handled by Render, keeps proxy server simple and focused
-7. **Observability, not governance** — SQLite bookkeeping, dashboard, and logs are for transparency; routing is purely in-memory and rebuilt on reconnect
-8. **Minimal dependencies** — Asyncio (stdlib), sqlite3 (stdlib), psutil (optional). Main server has zero required external packages
-9. **Environment-based config** — No config files, all via environment variables for container-friendly deployment
-10. **Auto directory creation** — DB and log directories created automatically
+6. **SSL termination externalized** — Handled by Render/Cloudflare/etc., keeps proxy server simple and focused
+7. **Single public port** — HAProxy sniffs the protocol, so one port serves both the control channel and HTTP tunnels
+8. **Observability, not governance** — SQLite bookkeeping, dashboard, and logs are for transparency; routing is purely in-memory and rebuilt on reconnect
+9. **Minimal dependencies** — Asyncio (stdlib), sqlite3 (stdlib), psutil (optional). Main server has zero required external packages
+10. **Environment-based config** — No config files, all via environment variables for container-friendly deployment
+11. **Auto directory creation** — DB and log directories created automatically
 
 ## Production Checklist
 
 - [ ] Set `SHARED_SECRET` to a long random value (`openssl rand -hex 32`)
 - [ ] Set `WILDCARD_DOMAIN` to your actual domain
 - [ ] Ensure DNS has `*.yourdomain` and `yourdomain` pointing to the server
-- [ ] Configure custom domain in Render dashboard (handles HTTPS)
+- [ ] Expose only port 80; verify both tunnel traffic and client connections work through it
+- [ ] Configure custom domain / HTTPS termination in front (Render, Cloudflare, etc.)
 - [ ] Bind dashboard to `127.0.0.1` or put it behind reverse-proxy auth
 - [ ] Set `tcp.port_range` to your preferred allocation pool
 - [ ] Set resource limits appropriate for your infrastructure
