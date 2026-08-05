@@ -88,9 +88,9 @@ ENV PYTHONUNBUFFERED=1 \
 #   :80 - haproxy sniffs "TN" -> control channel, else -> HTTP tunnels + dashboard
 EXPOSE 80
 
-# Health check - checks nginx health endpoint
+# Health check - hits the Python server directly (port 8080) so it fails if proxy_server.py dies
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD curl -f http://localhost/health || exit 1
+    CMD curl -f http://127.0.0.1:8080/health || exit 1
 
 # Run entrypoint as root (to chown mounted volumes), supervisord drops per-program privileges
 ENTRYPOINT ["/entrypoint.sh"]

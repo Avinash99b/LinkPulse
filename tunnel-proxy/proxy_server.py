@@ -185,7 +185,7 @@ class ServerContext:
 
 DEFAULT_CONFIG = {
     "shared_secret": "CHANGE_ME",
-    "control": {"host": "0.0.0.0", "port": 9000, "tls": False},
+    "control": {"host": "0.0.0.0", "port": 9001, "tls": False},
     "http": {"host": "0.0.0.0", "port": 8080},
     "wildcard_domain": "forwarding.example.com",
     "tcp": {"port_range": [20000, 20100]},
@@ -433,6 +433,13 @@ async def handle_public_http_conn(reader: asyncio.StreamReader, writer: asyncio.
     try:
         header_bytes = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=10)
     except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError, OSError):
+        writer.close()
+        return
+
+    # Health check endpoint - respond before Host validation
+    if header_bytes.startswith(b"GET /health "):
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 7\r\n\r\nhealthy\n")
+        await writer.drain()
         writer.close()
         return
 
