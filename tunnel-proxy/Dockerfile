@@ -84,9 +84,11 @@ ENV PYTHONUNBUFFERED=1 \
     OMP_NUM_THREADS=1 \
     MKL_NUM_THREADS=1
 
-# Expose only port 80 externally:
-#   :80 - haproxy sniffs "TN" -> control channel, else -> HTTP tunnels + dashboard
+# Expose ports externally:
+#   :80    - haproxy (HTTP tunnels + dashboard)
+#   :9000  - nginx stream (control channel) -> internal :9001
 EXPOSE 80
+EXPOSE 9000
 
 # Health check - hits the Python server directly (port 8080) so it fails if proxy_server.py dies
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \

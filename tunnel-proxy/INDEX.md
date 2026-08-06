@@ -10,13 +10,14 @@
 | **protocol.py** | 215 | Canonical binary framed wire protocol. Single source of truth; clients must implement exactly. Frame layout, frame types, HMAC auth, flow control constants. |
 | **dashboard.py** | 251 | Read-only status page (HTML + JSON API). Shows connected clients, active tunnels, bytes/request counts, uptime, logs, CPU/RAM. |
 | **storage.py** | 117 | SQLite persistence. Bookkeeping only (not used for live routing decisions). Survives restarts for observability. |
-| **haproxy.cfg** | — | Protocol-sniffing front door on `:80`. Routes `"TN"` magic (control channel) to nginx stream, everything else (HTTP) to nginx http. |
+| **haproxy.cfg** | — | HTTP front door on `:80`. Routes HTTP traffic (tunnels + dashboard) to nginx http. Control channel is on separate port 9000. |
 | **nginx.conf** | — | Nginx reverse proxy: HTTP server on `:8088` (dashboard + tunnels) + `stream` module on `:9000` (control channel TCP proxy). |
 | **supervisord.conf** | — | Runs `proxy_server.py`, nginx, and haproxy together in a single container. |
 | **config.example.json** | — | Config template (legacy, kept for reference). |
 | **requirements.txt** | — | Optional `psutil` for dashboard CPU/RAM. |
 | **examples/reference_client.py** | — | Minimal working client. Demonstrates protocol implementation. |
-| **Dockerfile** | — | Multi-stage build. Single container: tunnel-proxy + nginx + haproxy via supervisord. Only port 80 exposed. |
+| **Dockerfile** | — | Multi-stage build. Single container: tunnel-proxy + nginx + haproxy via supervisord. Exposes ports 80 and 9000. |
+| **entrypoint.sh** | — | Root entrypoint: chowns mounted volumes, starts supervisord. |
 | **README.md** | — | Full architecture, protocol spec, config reference, setup & run instructions. |
 | **DEPLOYMENT.md** | — | Detailed deployment guide for Docker and Render. |
 
@@ -28,11 +29,17 @@
 Internet traffic (HTTP)  and  client control connections
                     │
                     ▼
-    haproxy  :80  (single public port, sniffs first bytes)
-       ├─ "TN" magic → nginx stream :9000 → control channel
-       └─ HTTP       → nginx http   :8088
-                          ├─ /dashboard/, /api/ → dashboard
-                          └─ else               → proxy_server.py
+    haproxy  :80  ────────────────────────── HTTP tunnels + dashboard
+       │  (HTTP only, no protocol sniffing)
+       └─ → nginx http :8088
+              ├─ /dashboard/, /api/ → dashboard
+              └─ else               → proxy_server.py
+                                                          │ (one persistent, authenticated,
+                                                          │  multiplexed connection)
+                                                          ▼
+    nginx stream :9000 ──────────────── Control channel (client)
+       │  (raw TCP, "TN" magic)
+       └─ → proxy_server.py :9001 (control channel)
                                                       │ (one persistent, authenticated,
                                                       │  multiplexed connection)
                                                       ▼
@@ -45,7 +52,7 @@ Internet traffic (HTTP)  and  client control connections
 - **TCP routing**: Random port allocation (or preferred port, if free). Concurrent TCP listeners, one per tunnel.
 - **Multiplexing**: One persistent connection carries many logical streams. Each stream = one HTTP request-connection or one TCP connection.
 - **Flow control**: Per-stream, credit-based (HTTP/2 style). Backpressure-aware. Prevents one slow tunnel from stalling others.
-- **Single public port**: HAProxy sniffs the protocol, so one port serves both the control channel and HTTP tunnels.
+- **Two public ports**: Port 80 for HTTP, port 9000 for raw TCP control. Works with cloud platforms that terminate TLS at the edge.
 - **SSL termination**: Handled externally by Render/Cloudflare/etc. Proxy server runs HTTP only.
 - **Dashboard**: Real-time client/tunnel status, bytes transferred, connection counts, uptime, logs, optional CPU/RAM.
 - **SQLite**: Lightweight persistence for bookkeeping & observability. Routing decisions live in memory; DB is purely informational.
@@ -74,7 +81,7 @@ cp .env.example .env
 ### 3. Run (Docker)
 ```bash
 docker build -t tunnel-proxy .
-docker run -d -p 80:80 --env-file .env -v tunnel-proxy-data:/data tunnel-proxy
+docker run -d -p 80:80 -p 9000:9000 --env-file .env -v tunnel-proxy-data:/data tunnel-proxy
 ```
 
 ### 4. Verify
@@ -162,10 +169,9 @@ Resists replay and proves knowledge of shared secret without sending it.
 
 ### Docker files
 
-**haproxy.cfg** — Protocol-sniffing front door on `:80`
-- `tcp-request inspect-delay` + payload match on `"TN"` (0x544e)
-- Routes control-channel connections to nginx stream, everything else to nginx http
-- This is what allows a single public port to serve both protocols
+**haproxy.cfg** — HTTP front door on `:80`
+- Routes HTTP traffic (tunnels + dashboard) to nginx http
+- Control channel is handled on separate port 9000 via nginx stream
 
 **nginx.conf** — Nginx reverse proxy + stream
 - `http` block listens on `:8088`: `/dashboard/` and `/api/` → dashboard `:8081`, everything else → tunnel-proxy `:8080`
@@ -182,11 +188,15 @@ Resists replay and proves knowledge of shared secret without sending it.
 - Runtime stage: minimal python:3.11-slim + nginx + haproxy + supervisor
 - Installs `libnginx-mod-stream` (nginx stream module is dynamic)
 - Non-root user, health check, resource optimization
-- `EXPOSE 80` only
+- `EXPOSE 80 9000`
+
+**entrypoint.sh** — Root entrypoint
+- Chowns mounted volumes (handles Render persistent disks)
+- Starts supervisord
 
 **DEPLOYMENT.md** — Detailed deployment guide
 - Single-container Docker quick start
-- Render deployment
+- Render deployment (ports 80 + 9000)
 - Client usage
 - Monitoring
 - Troubleshooting
@@ -219,7 +229,7 @@ Resists replay and proves knowledge of shared secret without sending it.
 4. **Replay-protected auth** — HMAC-SHA256 + timestamp checks + nonce tracking; no secret sent over wire.
 5. **Stable reconnect behavior** — Clients persist their ID, routes aren't "reserved" ahead of time (just first-come first-served), allows graceful recovery without complex state sync.
 6. **SSL termination externalized** — Handled by nginx/Render/Cloudflare, keeps proxy server simple and focused.
-7. **Single public port** — HAProxy sniffs the protocol, so one port serves both the control channel and HTTP tunnels.
+7. **Two public ports** — Port 80 for HTTP, port 9000 for raw TCP control. Works with cloud platforms that terminate TLS at the edge.
 8. **Observability, not governance** — SQLite bookkeeping, dashboard, and logs are for transparency; routing is purely in-memory and rebuilt on reconnect.
 9. **Minimal dependencies** — Asyncio (stdlib), ssl (stdlib), sqlite3 (stdlib), psutil (optional). Main server has zero required external packages.
 10. **Environment-based config** — No config files, all via environment variables for container-friendly deployment.
@@ -241,7 +251,7 @@ All tests passed before finalizing the deliverable.
 - [ ] Set `SHARED_SECRET` to a long random value (`openssl rand -hex 32`)
 - [ ] Set `WILDCARD_DOMAIN` to your actual domain
 - [ ] Ensure DNS has `*.yourdomain` and `yourdomain` pointing to the server
-- [ ] Expose only port 80; verify both tunnel traffic and client connections work through it
+- [ ] Expose ports 80 (HTTP) and 9000 (control); verify both work
 - [ ] Configure HTTPS termination in front (Render managed, Cloudflare, or your own reverse proxy)
 - [ ] Bind dashboard to `127.0.0.1` or put it behind reverse-proxy auth
 - [ ] Set `tcp.port_range` to your preferred allocation pool
