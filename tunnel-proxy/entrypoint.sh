@@ -1,7 +1,7 @@
 #!/bin/sh
 # Entrypoint for tunnel-proxy container.
 # Runs as root to:
-#   - fix ownership of mounted volumes (Render persistent disks mount as root)
+#   - fix ownership of mounted volumes
 #   - provision/renew wildcard SSL certificates via certbot (DNS challenge)
 #   - start supervisord which drops privileges per-program to `tunnelproxy` user.
 
@@ -9,7 +9,8 @@ set -e
 
 WILDCARD_DOMAIN="${WILDCARD_DOMAIN:-}"
 CERTBOT_EMAIL="${CERTBOT_EMAIL:-admin@${WILDCARD_DOMAIN}}"
-DNS_PROVIDER="${DNS_PROVIDER:-cloudflare}"  # cloudflare, route53, digitalocean, etc.
+DNS_PROVIDER="${DNS_PROVIDER:-cloudflare}"
+CF_API_TOKEN="${CF_API_TOKEN:-}"
 
 # Ensure all writable dirs exist and belong to tunnelproxy.
 mkdir -p /data \
@@ -56,10 +57,21 @@ if [ -n "$WILDCARD_DOMAIN" ] && [ "${EXTERNAL_SSL:-false}" != "true" ]; then
             ;;
     esac
 
-    # Install certbot DNS plugin if needed
-    if [ "$CERTBOT_PLUGIN" != "manual" ]; then
-        pip install --quiet "certbot-$CERTBOT_PLUGIN" 2>/dev/null || true
+    # Create Cloudflare credentials file from CF_API_TOKEN
+    if [ "$DNS_PROVIDER" = "cloudflare" ] && [ -n "$CF_API_TOKEN" ]; then
+        cat > /etc/letsencrypt/cloudflare.ini <<EOF
+dns_cloudflare_api_token = $CF_API_TOKEN
+EOF
+        chmod 600 /etc/letsencrypt/cloudflare.ini
+        echo "Created Cloudflare credentials at /etc/letsencrypt/cloudflare.ini"
     fi
+
+    # Install certbot DNS plugin if needed
+    case "$CERTBOT_PLUGIN" in
+        dns-cloudflare|dns-digitalocean|dns-route53)
+            pip install --quiet "certbot-$CERTBOT_PLUGIN" 2>/dev/null || true
+            ;;
+    esac
 
     # Check if cert exists and is valid (>30 days)
     CERT_PATH="/etc/letsencrypt/live/$WILDCARD_DOMAIN/fullchain.pem"
@@ -86,16 +98,15 @@ if [ -n "$WILDCARD_DOMAIN" ] && [ "${EXTERNAL_SSL:-false}" != "true" ]; then
         if [ "$CERTBOT_PLUGIN" != "manual" ] && [ -n "$CREDENTIALS_FILE" ] && [ -f "$CREDENTIALS_FILE" ]; then
             CERTBOT_ARGS="$CERTBOT_ARGS --$CERTBOT_PLUGIN --$CERTBOT_PLUGIN-credentials $CREDENTIALS_FILE"
         elif [ "$CERTBOT_PLUGIN" = "dns-route53" ]; then
-            # Route53 uses AWS credentials from env/instance profile
             CERTBOT_ARGS="$CERTBOT_ARGS --dns-route53"
         else
-            # Manual DNS challenge - requires hook scripts or manual intervention
+            echo "WARNING: No valid DNS plugin/credentials. Falling back to manual (will fail without hooks)."
             CERTBOT_ARGS="$CERTBOT_ARGS --manual --manual-auth-hook /usr/local/bin/dns-auth-hook.sh --manual-cleanup-hook /usr/local/bin/dns-cleanup-hook.sh"
         fi
 
         certbot $CERTBOT_ARGS 2>&1 | tee /var/log/certbot-init.log || {
             echo "WARNING: Certificate provisioning failed. Check DNS credentials and logs."
-            echo "Continuing without SSL - external termination (Render/Cloudflare) expected."
+            echo "Continuing with self-signed - external termination (Render/Cloudflare) expected."
         }
     fi
 
@@ -105,11 +116,9 @@ if [ -n "$WILDCARD_DOMAIN" ] && [ "${EXTERNAL_SSL:-false}" != "true" ]; then
 17 3 * * * root certbot renew --quiet --post-hook "nginx -s reload" >> /var/log/certbot-renew.log 2>&1
 EOF
     chmod 644 /etc/cron.d/certbot-renew
-    cron
 fi
 
 # Generate nginx SSL config - always generate at least self-signed so nginx can start
-# If we have Let's Encrypt certs, use those; otherwise self-signed.
 if [ -f "/etc/letsencrypt/live/$WILDCARD_DOMAIN/fullchain.pem" ]; then
     cat > /etc/nginx/ssl.conf <<EOF
 # Auto-generated SSL config for $WILDCARD_DOMAIN (Let's Encrypt)
@@ -123,7 +132,6 @@ ssl_session_timeout 10m;
 EOF
     echo "SSL config generated at /etc/nginx/ssl.conf (Let's Encrypt)"
 elif [ -n "$WILDCARD_DOMAIN" ]; then
-    # Generate self-signed cert as fallback so nginx can start
     echo "Generating self-signed certificate for $WILDCARD_DOMAIN..."
     mkdir -p /etc/ssl/selfsigned
     openssl req -x509 -nodes -newkey rsa:2048 -days 365 \
@@ -145,7 +153,6 @@ ssl_session_timeout 10m;
 EOF
     echo "Self-signed SSL config generated at /etc/nginx/ssl.conf"
 else
-    # No domain set - generate minimal dummy ssl.conf so nginx doesn't fail
     cat > /etc/nginx/ssl.conf <<'EOF'
 # Dummy SSL config - no WILDCARD_DOMAIN set
 ssl_certificate /etc/ssl/selfsigned/fullchain.pem;
@@ -156,7 +163,6 @@ ssl_prefer_server_ciphers on;
 ssl_session_cache shared:SSL:10m;
 ssl_session_timeout 10m;
 EOF
-    # Also generate a dummy self-signed cert for the dummy config
     mkdir -p /etc/ssl/selfsigned
     openssl req -x509 -nodes -newkey rsa:2048 -days 365 \
         -keyout /etc/ssl/selfsigned/privkey.pem \
@@ -167,5 +173,5 @@ EOF
     echo "Dummy SSL config generated at /etc/nginx/ssl.conf"
 fi
 
-# Hand off to supervisord (pidfile now lands in /run/supervisord/)
+# Hand off to supervisord
 exec /usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.conf
