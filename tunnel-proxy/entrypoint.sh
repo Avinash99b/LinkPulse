@@ -77,6 +77,10 @@ EOF
     CERT_PATH="/etc/letsencrypt/live/$WILDCARD_DOMAIN/fullchain.pem"
     NEED_RENEWAL=false
     if [ -f "$CERT_PATH" ]; then
+        # Ensure existing certs are readable by tunnelproxy
+        chmod -R 755 /etc/letsencrypt/live/$WILDCARD_DOMAIN 2>/dev/null || true
+        chmod -R 755 /etc/letsencrypt/archive/$WILDCARD_DOMAIN 2>/dev/null || true
+        
         if ! openssl x509 -checkend 2592000 -noout -in "$CERT_PATH" >/dev/null 2>&1; then
             echo "Certificate expires within 30 days, renewing..."
             NEED_RENEWAL=true
@@ -108,6 +112,13 @@ EOF
             echo "WARNING: Certificate provisioning failed. Check DNS credentials and logs."
             echo "Continuing with self-signed - external termination (Render/Cloudflare) expected."
         }
+
+        # Make Let's Encrypt certs readable by tunnelproxy user (nginx runs as this user)
+        if [ -d "/etc/letsencrypt/live/$WILDCARD_DOMAIN" ]; then
+            chmod -R 755 /etc/letsencrypt/live/$WILDCARD_DOMAIN
+            chmod -R 755 /etc/letsencrypt/archive/$WILDCARD_DOMAIN
+            echo "Made Let's Encrypt certs readable for tunnelproxy user"
+        fi
     fi
 
     # Set up auto-renewal cron (runs daily at 03:17)
