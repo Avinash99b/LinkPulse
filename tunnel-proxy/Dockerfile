@@ -25,15 +25,19 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Stage 2: Final runtime image
 FROM python:3.11-slim AS runtime
 
-# Install runtime dependencies: nginx + haproxy + supervisord + SSL libs
+# Install runtime dependencies: nginx + haproxy + supervisord + SSL libs + certbot + cron
 # libnginx-mod-stream provides the stream module (dynamic .so) used for
 # proxying the control channel; plain `nginx` only installs nginx-core.
-# haproxy is the single public entry point (sniffs control-vs-HTTP on :80).
+# haproxy is the HTTP front door.
+# certbot handles automatic wildcard SSL via Let's Encrypt (DNS challenge).
+# cron runs certbot auto-renewal.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     nginx \
     libnginx-mod-stream \
     haproxy \
     supervisor \
+    certbot \
+    cron \
     libssl3 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
@@ -85,9 +89,11 @@ ENV PYTHONUNBUFFERED=1 \
     MKL_NUM_THREADS=1
 
 # Expose ports externally:
-#   :80    - haproxy (HTTP tunnels + dashboard)
+#   :80    - haproxy (HTTP -> HTTPS redirect, health checks)
+#   :443   - nginx (HTTPS termination for tunnels + dashboard)
 #   :9000  - nginx stream (control channel) -> internal :9001
 EXPOSE 80
+EXPOSE 443
 EXPOSE 9000
 
 # Health check - hits the Python server directly (port 8080) so it fails if proxy_server.py dies
