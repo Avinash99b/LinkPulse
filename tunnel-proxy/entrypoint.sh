@@ -78,6 +78,9 @@ EOF
     NEED_RENEWAL=false
     if [ -f "$CERT_PATH" ]; then
         # Ensure existing certs are readable by tunnelproxy
+        chmod 755 /etc/letsencrypt 2>/dev/null || true
+        chmod 755 /etc/letsencrypt/archive 2>/dev/null || true
+        chmod 755 /etc/letsencrypt/live 2>/dev/null || true
         chmod -R 755 /etc/letsencrypt/live/$WILDCARD_DOMAIN 2>/dev/null || true
         chmod -R 755 /etc/letsencrypt/archive/$WILDCARD_DOMAIN 2>/dev/null || true
         
@@ -108,17 +111,25 @@ EOF
             CERTBOT_ARGS="$CERTBOT_ARGS --manual --manual-auth-hook /usr/local/bin/dns-auth-hook.sh --manual-cleanup-hook /usr/local/bin/dns-cleanup-hook.sh"
         fi
 
-        certbot $CERTBOT_ARGS 2>&1 | tee /var/log/certbot-init.log || {
+certbot $CERTBOT_ARGS 2>&1 | tee /var/log/certbot-init.log || {
             echo "WARNING: Certificate provisioning failed. Check DNS credentials and logs."
             echo "Continuing with self-signed - external termination (Render/Cloudflare) expected."
         }
 
         # Make Let's Encrypt certs readable by tunnelproxy user (nginx runs as this user)
+        # Fix entire chain: live/ -> archive/ needs readable parent dirs
         if [ -d "/etc/letsencrypt/live/$WILDCARD_DOMAIN" ]; then
-            chmod -R 755 /etc/letsencrypt/live/$WILDCARD_DOMAIN
-            chmod -R 755 /etc/letsencrypt/archive/$WILDCARD_DOMAIN
+            chmod -R 755 /etc/letsencrypt/live/$WILDCARD_DOMAIN 2>/dev/null || true
+            chmod -R 755 /etc/letsencrypt/archive/$WILDCARD_DOMAIN 2>/dev/null || true
+            # Also fix parent directories for traversal
+            chmod 755 /etc/letsencrypt 2>/dev/null || true
+            chmod 755 /etc/letsencrypt/archive 2>/dev/null || true
+            chmod 755 /etc/letsencrypt/live 2>/dev/null || true
+            chmod 755 /etc/letsencrypt/live/$WILDCARD_DOMAIN 2>/dev/null || true
+            chmod 755 /etc/letsencrypt/archive/$WILDCARD_DOMAIN 2>/dev/null || true
             echo "Made Let's Encrypt certs readable for tunnelproxy user"
         fi
+    fi
     fi
 
     # Set up auto-renewal cron (runs daily at 03:17)
