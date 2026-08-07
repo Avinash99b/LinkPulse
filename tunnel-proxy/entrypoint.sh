@@ -130,7 +130,6 @@ certbot $CERTBOT_ARGS 2>&1 | tee /var/log/certbot-init.log || {
             echo "Made Let's Encrypt certs readable for tunnelproxy user"
         fi
     fi
-    fi
 
     # Set up auto-renewal cron (runs daily at 03:17)
     cat > /etc/cron.d/certbot-renew <<'EOF'
