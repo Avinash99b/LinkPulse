@@ -1,19 +1,61 @@
 """
-protocol.py -- Canonical wire protocol for the tunnel proxy system.
+protocol.py -- Canonical message protocol for the WebSocket tunnel proxy.
 
-This module is the single source of truth for the framing format,
-frame types, and the HELLO authentication payload layout. Both the
-server (proxy_server.py) and any client implementation MUST use an
-identical copy of this logic (or a faithful re-implementation) to
+The WebSocket transport (see ws.py) provides framing, ordering, keep-alive
+and fragmentation, so this module defines everything that sits on top of
+it: JSON control-message constants, binary stream-data framing, flow
+control thresholds, and the HMAC-based HELLO authentication payload.
+
+Both the server (proxy_server.py) and any client implementation MUST use
+an identical copy of this logic (or a faithful re-implementation) to
 interoperate.
 
-See README.md / PROTOCOL section for the full prose specification.
+Transport model
+---------------
+Client and server exchange WebSocket messages on a single connection:
+
+  * text messages   = UTF-8 JSON control messages ({...})
+  * binary messages = stream data: [stream_id u32be][payload...]
+
+One WebSocket connection replaces the old custom binary TCP protocol and
+carries all control-plane traffic: authentication, tunnel lifecycle,
+per-stream multiplexing and flow control.
+
+Authentication
+--------------
+The first message a client sends MUST be a text message:
+
+    {"type": "hello", "sign": "<hex of 72-byte HMAC payload>"}
+
+where the 72-byte payload is built with build_hello_payload(secret,
+client_id).  It proves knowledge of the shared secret with replay
+protection, exactly like the previous protocol (see below).
+
+Control messages
+----------------
+client -> server:
+    {"type": "hello", "sign": <hex>}
+    {"type": "open_tunnel", "tunnel_id": <str>, "kind": "http"|"tcp",
+     "subdomain": <str|None>, "remote_port": <int|None>}
+    {"type": "close_tunnel", "tunnel_id": <str>}
+    {"type": "close_stream", "stream_id": <int>}
+    {"type": "window_update", "stream_id": <int>, "increment": <int>}
+    {"type": "error", "message": <str>}
+
+server -> client:
+    {"type": "hello_ok", "client_id": <hex>, "heartbeat_interval": <int>, "server_version": 1}
+    {"type": "hello_fail", "message": <str>}
+    {"type": "open_tunnel_response", "tunnel_id": <str>, "status": "ok"|"error",
+     "type": ..., "public_url": <str|None>, "remote_port": <int|None>, "error": <str|None>}
+    {"type": "stream_open", "stream_id": <int>, "tunnel_id": <str>,
+     "proto": "http"|"tcp", "remote_addr": <str>}
+    {"type": "close_stream", "stream_id": <int>}
+    {"type": "window_update", "stream_id": <int>, "increment": <int>}
+    {"type": "error", "message": <str>}
 """
 
 from __future__ import annotations
 
-import asyncio
-import enum
 import hashlib
 import hmac
 import secrets
@@ -22,133 +64,46 @@ import time
 import uuid
 
 # ---------------------------------------------------------------------------
-# Frame header
+# Endpoint / transport
 # ---------------------------------------------------------------------------
-#
-#   0        2      3      4                 8                 12
-#   +--------+------+------+-----------------+-----------------+
-#   | Magic  | Ver  | Type |    Stream ID     |     Length      |
-#   +--------+------+------+-----------------+-----------------+
-#   |                          Payload (Length bytes)           |
-#   +-------------------------------------------------------------+
-#
-#   Magic     : 2 bytes, ASCII "TN"           -- resync / sanity check
-#   Version   : 1 byte, protocol version (currently 1)
-#   Type      : 1 byte, FrameType enum value
-#   Stream ID : 4 bytes, unsigned big-endian. 0 == control channel.
-#   Length    : 4 bytes, unsigned big-endian, length of Payload in bytes.
-#   Payload   : Length bytes, meaning depends on Type (see below).
-#
-# Fixed header size is 12 bytes. This keeps parsing trivial and the header
-# cheap to scan through even on a loaded multiplexed connection.
 
-PROTO_MAGIC = b"TN"
-PROTO_VERSION = 1
+# Path the HTTP server exposes the WebSocket control-plane endpoint on.
+DEFAULT_WS_PATH = "/ws"
 
-_HEADER_FMT = "!2sBBII"
-HEADER_LEN = struct.calcsize(_HEADER_FMT)  # 12
+# Version reported to clients in hello_ok.
+SERVER_VERSION = 1
 
-# A single STREAM_DATA frame is capped so that no single frame can hog the
-# multiplexed connection and delay control frames / other streams
-# (head-of-line blocking). Larger writes are simply chunked into multiple
-# frames by the sender.
-MAX_FRAME_PAYLOAD = 64 * 1024  # 64 KiB
+# ---------------------------------------------------------------------------
+# Flow control / framing thresholds (kept from the binary protocol)
+# ---------------------------------------------------------------------------
 
-# Hard ceiling on any single incoming frame (defends against a malicious or
-# buggy peer claiming an enormous Length and exhausting memory).
-MAX_ALLOWED_LENGTH = 16 * 1024 * 1024  # 16 MiB
-
-CONTROL_STREAM_ID = 0
+# A single stream-data WebSocket binary message is capped so a burst can't
+# hog the connection and starve other streams (head-of-line blocking).
+MAX_FRAME_PAYLOAD = 64 * 1024  # 64 KiB per stream-data chunk
 
 # Initial per-stream flow-control window (bytes each side may send before
-# it must wait for a WINDOW_UPDATE). See FlowWindow in proxy_server.py.
+# it must wait for a window_update). See FlowWindow in proxy_server.py.
 INITIAL_WINDOW = 256 * 1024
 
+# If a stream-data binary message or a hand-rolled chunk exceeds this,
+# treat it as a protocol error instead of buffering unbounded memory.
+MAX_STREAM_MESSAGE = 16 * 1024 * 1024  # 16 MiB
 
-class FrameType(enum.IntEnum):
-    # --- connection / session lifecycle -----------------------------------
-    HELLO = 0x01                 # client -> server: authenticate
-    HELLO_OK = 0x02               # server -> client: auth accepted
-    HELLO_FAIL = 0x03             # server -> client: auth rejected (then close)
-    PING = 0x04                   # either direction: heartbeat
-    PONG = 0x05                   # either direction: heartbeat reply
-
-    # --- tunnel (logical forwarding rule) lifecycle ------------------------
-    TUNNEL_OPEN_REQUEST = 0x06    # client -> server: register a tunnel
-    TUNNEL_OPEN_RESPONSE = 0x07   # server -> client: result of registration
-    TUNNEL_CLOSE = 0x08           # either direction: unregister a tunnel
-
-    # --- per-connection multiplexed data streams ----------------------------
-    STREAM_OPEN = 0x09            # server -> client: new inbound connection
-    STREAM_DATA = 0x0A            # either direction: payload chunk
-    STREAM_CLOSE = 0x0B           # either direction: stream finished/aborted
-    STREAM_WINDOW_UPDATE = 0x0C   # either direction: flow-control credit
-
-    # --- misc ---------------------------------------------------------------
-    ERROR = 0x0D                  # either direction: generic error report
-
-
-class ProtocolError(Exception):
-    """Raised when a peer violates the framing protocol."""
-
-
-class Frame:
-    __slots__ = ("version", "type", "stream_id", "payload")
-
-    def __init__(self, version: int, type: int, stream_id: int, payload: bytes):
-        self.version = version
-        self.type = type
-        self.stream_id = stream_id
-        self.payload = payload
-
-    def __repr__(self):
-        return (f"Frame(v={self.version}, type={FrameType(self.type).name if self.type in FrameType._value2member_map_ else self.type}, "
-                f"stream={self.stream_id}, len={len(self.payload)})")
-
-
-def encode_frame(frame_type: int, stream_id: int, payload: bytes = b"", version: int = PROTO_VERSION) -> bytes:
-    if len(payload) > MAX_ALLOWED_LENGTH:
-        raise ValueError("payload exceeds MAX_ALLOWED_LENGTH")
-    header = struct.pack(_HEADER_FMT, PROTO_MAGIC, version, int(frame_type), stream_id, len(payload))
-    return header + payload
-
-
-async def read_frame(reader: asyncio.StreamReader) -> Frame:
-    """Read exactly one frame from an asyncio StreamReader.
-
-    Raises asyncio.IncompleteReadError on clean/unclean EOF and
-    ProtocolError on a malformed header (bad magic / oversized length).
-    """
-    header = await reader.readexactly(HEADER_LEN)
-    magic, version, ftype, stream_id, length = struct.unpack(_HEADER_FMT, header)
-    if magic != PROTO_MAGIC:
-        raise ProtocolError(f"bad magic bytes: {magic!r}")
-    if length > MAX_ALLOWED_LENGTH:
-        raise ProtocolError(f"frame length {length} exceeds maximum {MAX_ALLOWED_LENGTH}")
-    payload = await reader.readexactly(length) if length else b""
-    return Frame(version=version, type=ftype, stream_id=stream_id, payload=payload)
+# After how many received-but-unacknowledged bytes a side re-sends credit.
+WINDOW_UPDATE_THRESHOLD = INITIAL_WINDOW // 2
 
 
 # ---------------------------------------------------------------------------
-# HELLO authentication payload
+# HELLO authentication payload (binary, HMAC-SHA256)
 # ---------------------------------------------------------------------------
-#
-# The HELLO frame (stream_id = 0) proves knowledge of the shared secret
-# without ever sending the secret itself, and includes basic replay
-# protection. This does NOT replace transport security -- operators should
-# still run the control channel over TLS (supported natively, see
-# `control.tls` in config.json) or a private network (VPN / WireGuard /
-# SSH tunnel) for defense in depth, since HMAC alone does not give
-# confidentiality of the tunneled data's metadata.
 #
 #   client_id : 16 bytes. All-zero == "assign me a new identity".
-#               Otherwise the client's previously-assigned id, allowing
-#               it to reconnect and be recognised as the same client.
 #   timestamp : 8 bytes, unsigned big-endian unix time (seconds).
 #   nonce     : 16 bytes, random, single-use.
 #   hmac      : 32 bytes, HMAC-SHA256(secret, client_id || timestamp || nonce)
 #
-# Total payload size: 16 + 8 + 16 + 32 = 72 bytes.
+# Total payload size: 16 + 8 + 16 + 32 = 72 bytes. Serialized as lowercase
+# hex inside the `sign` JSON field so it can ride inside a text frame.
 
 _HELLO_FMT = "!16sQ16s32s"
 HELLO_PAYLOAD_LEN = struct.calcsize(_HELLO_FMT)
@@ -168,7 +123,11 @@ def build_hello_payload(secret: str, client_id_bytes: bytes = NULL_CLIENT_ID) ->
     return struct.pack(_HELLO_FMT, client_id_bytes, ts, nonce, mac)
 
 
-def verify_hello_payload(payload: bytes, secret: str, seen_nonces: dict) -> tuple[bool, str | None, str | None]:
+def _check_hello_len(payload: bytes) -> bool:
+    return len(payload) == HELLO_PAYLOAD_LEN
+
+
+def verify_hello_payload(payload: bytes, secret: str, seen_nonces: dict):
     """Validate a HELLO payload.
 
     `seen_nonces` is a dict of (client_id_bytes+nonce) -> timestamp used for
@@ -177,7 +136,7 @@ def verify_hello_payload(payload: bytes, secret: str, seen_nonces: dict) -> tupl
 
     Returns (ok, client_id_hex_or_None, error_reason_or_None).
     """
-    if len(payload) != HELLO_PAYLOAD_LEN:
+    if not _check_hello_len(payload):
         return False, None, "malformed HELLO payload"
 
     client_id_bytes, ts, nonce, mac = struct.unpack(_HELLO_FMT, payload)
@@ -186,11 +145,7 @@ def verify_hello_payload(payload: bytes, secret: str, seen_nonces: dict) -> tupl
     if abs(now - ts) > HELLO_TIMESTAMP_SKEW_SECONDS:
         return False, None, "timestamp outside allowed skew"
 
-    expected = hmac.new(
-        secret.encode("utf-8"),
-        client_id_bytes + struct.pack("!Q", ts) + nonce,
-        hashlib.sha256,
-    ).digest()
+    expected = _hmac(secret, client_id_bytes + struct.pack("!Q", ts) + nonce)
     if not hmac.compare_digest(mac, expected):
         return False, None, "invalid signature"
 
@@ -205,11 +160,34 @@ def verify_hello_payload(payload: bytes, secret: str, seen_nonces: dict) -> tupl
     return True, client_id_bytes.hex(), None
 
 
-def new_tunnel_id() -> str:
-    """A client-generated id identifying a tunnel across reconnects.
+def _hmac(secret: str, msg: bytes) -> bytes:
+    return hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).digest()
 
-    Clients should persist this locally (alongside their client_id) so
-    that re-requesting the same tunnel_id after a reconnect signals
-    intent to resume the same logical tunnel.
-    """
+
+# ---------------------------------------------------------------------------
+# Stream-data binary framing
+# ---------------------------------------------------------------------------
+
+_STREAM_DATA_FMT = "!I"
+_STREAM_DATA_HEADER = struct.calcsize(_STREAM_DATA_FMT)  # 4
+MAX_WINDOW_PAYLOAD = MAX_STREAM_MESSAGE - _STREAM_DATA_HEADER
+
+
+def encode_stream_data(stream_id: int, payload: bytes) -> bytes:
+    """Wrap one chunk of stream payload for a WebSocket binary message."""
+    if len(payload) > MAX_STREAM_MESSAGE:
+        raise ValueError("stream data chunk exceeds MAX_STREAM_MESSAGE")
+    return struct.pack(_STREAM_DATA_FMT, stream_id) + bytes(payload)
+
+
+def parse_stream_data(data: bytes):
+    """Unpack a binary WebSocket message into (stream_id, payload)."""
+    if len(data) < _STREAM_DATA_HEADER or len(data) > _STREAM_DATA_HEADER + MAX_WINDOW_PAYLOAD:
+        return None, None
+    stream_id = struct.unpack(_STREAM_DATA_FMT, data[:_STREAM_DATA_HEADER])[0]
+    return stream_id, data[_STREAM_DATA_HEADER:]
+
+
+def new_tunnel_id() -> str:
+    """A client-generated id identifying a tunnel across reconnects."""
     return uuid.uuid4().hex

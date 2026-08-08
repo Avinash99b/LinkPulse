@@ -25,19 +25,17 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Stage 2: Final runtime image
 FROM python:3.11-slim AS runtime
 
-# Install runtime dependencies: nginx + haproxy + supervisord + SSL libs + certbot + cron
-# libnginx-mod-stream provides the stream module (dynamic .so) used for
-# proxying the control channel; plain `nginx` only installs nginx-core.
-# haproxy is the HTTP front door.
-# certbot handles automatic wildcard SSL via Let's Encrypt (DNS challenge).
-# cron runs certbot auto-renewal.
+# Install runtime dependencies: nginx + haproxy + supervisord + SSL libs
+# haproxy is the single HTTP front door on port 80.
+# nginx routes /dashboard/ and /api/ to the dashboard and everything else
+# (HTTP tunnels + the /ws WebSocket control plane) to proxy_server.
+# TLS termination is handled externally (cloud LB/Cloudflare/own reverse
+# proxy), so certbot/cron and the old stream control channel are NOT needed
+# in the container.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     nginx \
-    libnginx-mod-stream \
     haproxy \
     supervisor \
-    certbot \
-    cron \
     libssl3 \
     ca-certificates \
     curl \
@@ -65,7 +63,7 @@ COPY examples/ ./examples/
 # Copy nginx config
 COPY nginx.conf /etc/nginx/nginx.conf
 
-# Copy haproxy config (protocol-sniffing front door)
+# Copy haproxy config (single HTTP front door)
 COPY haproxy.cfg /etc/haproxy/haproxy.cfg
 
 # Copy supervisord config
@@ -89,13 +87,10 @@ ENV PYTHONUNBUFFERED=1 \
     OMP_NUM_THREADS=1 \
     MKL_NUM_THREADS=1
 
-# Expose ports externally:
-#   :80    - haproxy (HTTP -> HTTPS redirect, health checks)
-#   :443   - nginx (HTTPS termination for tunnels + dashboard)
-#   :9000  - nginx stream (control channel) -> internal :9001
+# Expose a single external port:
+#   :80 - haproxy HTTP front door -> nginx -> proxy_server (HTTP tunnels,
+#         /ws WebSocket control plane, dashboard)
 EXPOSE 80
-EXPOSE 443
-EXPOSE 9000
 
 # Health check - hits the Python server directly (port 8080) so it fails if proxy_server.py dies
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
