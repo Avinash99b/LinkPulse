@@ -5,15 +5,16 @@ A minimal, self-hosted alternative to ngrok. One `proxy_server.py`, no external 
 ```
                                           ┌────────────────────────────────────┐
     HTTP  app.tunnel.example.com          │         Single container           │
-    ───────────────────────────────────▶  │  :80  haproxy (HTTP front door)    │
+    ───────────────────────────────────▶  │  :80  haproxy (HTTP only)          │
                                           │         │                          │
-    WebSocket control (/ws)               │         ▼                          │
-    ───────────────────────────────────▶  │   nginx :8088 (HTTP)               │
-                                          │         │                          │
-                                          │   proxy_server.py                  │◀───multiplexed───▶  client
-                                          │  - /ws control (auth)              │      connection     (your
-                                          │  - HTTP router                     │                       laptop /
-                                          │  - TCP listeners                  │                       server)
+    Control channel (client)              │  :9000 nginx stream (raw TCP)      │
+    ───────────────────────────────────▶  │         │                          │
+                                          │   nginx :8088 (HTTP)               │  persistent
+                                          │         │                          │◀───multiplexed───▶  client
+                                          │   proxy_server.py                 │      connection     (your
+                                          │  - control channel (auth)         │                       laptop /
+                                          │  - HTTP router                    │                       server)
+                                          │  - TCP listeners                  │
                                           │  - SQLite bookkeeping             │
                                           └────────────────────────────────────┘
 ```
@@ -23,9 +24,9 @@ A minimal, self-hosted alternative to ngrok. One `proxy_server.py`, no external 
 - **Authentication**: HMAC-SHA256 challenge-response (no shared secret sent over wire)
 - **HTTP routing**: Host header–based. `app.tunnel.example.com` → tunnels traffic to the registered client
 - **TCP routing**: Random port allocation (or preferred port, if free). Concurrent TCP listeners, one per tunnel
-- **Multiplexing**: One persistent WebSocket connection carries many logical streams. Each stream = one HTTP request-connection or one TCP connection
+- **Multiplexing**: One persistent connection carries many logical streams. Each stream = one HTTP request-connection or one TCP connection
 - **Flow control**: Per-stream, credit-based (HTTP/2 style). Backpressure-aware. Prevents one slow tunnel from stalling others
-- **Single public port**: Port 80 for HTTP tunnels, the dashboard, *and* the WebSocket control plane. Works with cloud platforms that terminate TLS at the edge and forward HTTP to the container.
+- **Two public ports**: Port 80 for HTTP tunnels/dashboard, port 9000 for raw TCP control channel. This avoids the issue of cloud platforms terminating TLS at the edge and forwarding only HTTP.
 - **SSL termination**: Handled externally (Render, Cloudflare, or your own nginx). Proxy server runs HTTP only.
 - **Dashboard**: Real-time client/tunnel status, bytes transferred, connection counts, uptime, logs, optional CPU/RAM
 - **SQLite**: Lightweight persistence for bookkeeping & observability
@@ -49,10 +50,11 @@ vim .env
 # Build
 docker build -t tunnel-proxy .
 
-# Run - port 80 (HTTP tunnels + dashboard + WebSocket control) exposed
+# Run - ports 80 (HTTP) and 9000 (control) exposed
 docker run -d \
   --name tunnel-proxy \
   -p 80:80 \
+  -p 9000:9000 \
   --env-file .env \
   -v tunnel-proxy-data:/data \
   -v tunnel-proxy-logs:/var/log/tunnel-proxy \
@@ -75,7 +77,7 @@ HTTP_PORT=8080 \
 python3 proxy_server.py
 ```
 
-> The dev run binds HTTP (tunnels + `/ws` control plane) on `:8080` and dashboard on `:8081` directly (no HAProxy/nginx in front).
+> The dev run binds control on `:9000`, HTTP on `:8080`, and dashboard on `:8081` directly (no HAProxy/nginx in front).
 
 ## Configuration
 
@@ -85,7 +87,9 @@ All configuration is via environment variables:
 |----------|----------|---------|-------------|
 | `SHARED_SECRET` | **Yes** | - | Authentication secret (generate with `openssl rand -hex 32`) |
 | `WILDCARD_DOMAIN` | **Yes** | - | Wildcard domain for tunnels (e.g., `tunnel.example.com`) |
-| `HTTP_HOST` | No | `0.0.0.0` | HTTP server bind host (tunnels + `/ws` control plane) |
+| `CONTROL_HOST` | No | `0.0.0.0` | Control channel bind host |
+| `CONTROL_PORT` | No | `9001` | Control channel port (internal; nginx stream fronts it at `:9000`) |
+| `HTTP_HOST` | No | `0.0.0.0` | HTTP server bind host |
 | `HTTP_PORT` | No | `8080` | HTTP server port |
 | `TCP_PORT_MIN` | No | `20000` | TCP port range minimum |
 | `TCP_PORT_MAX` | No | `20100` | TCP port range maximum |
@@ -105,20 +109,25 @@ All configuration is via environment variables:
 
 ## Container Architecture
 
-One public port, three internal processes under supervisord:
+Two public ports, three internal processes under supervisord:
 
 ```
-:80  (haproxy) ──────────────────────────── HTTP tunnels + dashboard + /ws control
+:80  (haproxy) ──────────────────────────── HTTP tunnels + dashboard
+  │  HTTP only (no protocol sniffing)
   └─ → nginx http :8088
         ├─ /dashboard/, /api/ → dashboard :8081
-        └─ everything else    → proxy_server :8080 (tunnel HTTP + WebSocket /ws)
+        └─ everything else    → proxy_server :8080 (tunnel HTTP)
+
+:9000 (nginx stream) ───────────────────── Control channel (client connection)
+  │  raw TCP, no TLS
+  └─ → proxy_server :9001 (control channel)
 ```
 
-- **haproxy** — HTTP front door on the single public port 80 (`haproxy.cfg`)
-- **nginx** — HTTP reverse proxy routing dashboard vs tunnel traffic (`nginx.conf`)
+- **haproxy** — HTTP reverse proxy for tunnels and dashboard (`haproxy.cfg`)
+- **nginx** — HTTP reverse proxy (dashboard + tunnels) + TCP stream for control (`nginx.conf`, `libnginx-mod-stream`)
 - **proxy_server.py** — the tunnel proxy itself (`supervisord.conf`)
 
-**Why one port?** The client control plane is a WebSocket that rides on the same HTTP listener as the tunnels, so port 80 carries everything. Render (and most cloud platforms) terminate HTTPS at the edge and forward HTTP to the container's port 80.
+**Why two ports?** Render (and most cloud platforms) terminate HTTPS at the edge and forward **HTTP** to the container. The control channel is a raw TCP protocol (`TN` magic bytes) that can't ride over HTTP/HTTPS. Separate port 9000 keeps the control channel as raw TCP while port 80 handles HTTP traffic.
 
 **Render / persistent disk note:** The container includes an `entrypoint.sh` that runs as root on startup, `chown`s all writable directories (`/data`, `/var/log/...`, `/run/...`) to the `tunnelproxy` user, then hands off to supervisord. This makes the container work with Render's persistent disks (which mount as root) without permission issues.
 
@@ -133,27 +142,27 @@ One public port, three internal processes under supervisord:
    - `SHARED_SECRET`
    - `WILDCARD_DOMAIN`
 5. Add persistent disk at `/data` (1GB)
-6. Set **Ports** to `80` (HTTP)
+6. Set **Ports** to `80` (HTTP) and `9000` (TCP control channel)
 7. Deploy
 
-**Note:** Render handles HTTPS termination automatically on port 443 and forwards HTTP to container port 80. The WebSocket control plane and all tunnels ride that same port. Point `*.yourdomain` and `yourdomain` at the service.
+**Note:** Render handles HTTPS termination automatically on port 443 and forwards HTTP to container port 80. The control channel uses a separate TCP port (9000) which Render exposes as a TCP load balancer target. Point `*.yourdomain` and `yourdomain` at the service.
 
 ## SSL/TLS
 
-**HTTPS termination is handled externally** (Render, Cloudflare, or your own reverse proxy). The container exposes HTTP on port 80 only. No SSL certificates, Let's Encrypt, or certbot needed.
+**HTTPS termination is handled externally** (Render, Cloudflare, or your own reverse proxy). The container exposes HTTP on port 80 only. The control channel uses raw TCP on port 9000 (no TLS). No SSL certificates, Let's Encrypt, or certbot needed.
 
 ## Client Usage
 
 ```bash
 # Using the reference client
 python3 examples/reference_client.py \
-  --server ws://your-server/ws \
+  --server your-server:9000 \
   --secret your-shared-secret \
   --local-http 127.0.0.1:3000 \
   --subdomain myapp
 ```
 
-> Point the client at the WebSocket endpoint on **port 80** (`/ws`). HTTP tunnels are automatically available on port 80 (via your HTTPS front). TCP tunnels allocate their ports from the configured `TCP_PORT_MIN`…`TCP_PORT_MAX` range.
+> Point the client at **port 9000** for the control channel. HTTP tunnels are automatically available on port 80 (via your HTTPS front).
 
 Your app will be available at `https://myapp.tunnel.example.com` (via your HTTPS-terminating front).
 
@@ -174,7 +183,7 @@ config.example.json   Config template (legacy)
 requirements.txt      Optional deps (psutil)
 examples/reference_client.py  Illustrative client implementation
 haproxy.cfg           HAProxy config: HTTP front door on :80
-nginx.conf            Nginx config: HTTP proxy (:8088)
+nginx.conf            Nginx config: HTTP proxy (:8088) + stream control (:9000)
 supervisord.conf      Runs proxy_server.py + nginx + haproxy in one container
 entrypoint.sh         Root entrypoint: chowns mounted volumes, starts supervisord
 Dockerfile            Single multi-stage build for everything
@@ -185,35 +194,37 @@ DEPLOYMENT.md         Detailed deployment guide
 
 ### Protocol at a Glance
 
-**Transport**: one RFC 6455 WebSocket per client (`protocol.py`, `ws.py`).
-- **text messages** = JSON control (`hello`, tunnel open/close, stream open/close, window updates)
-- **binary messages** = stream data: `[stream_id u32be][payload...]`
+**Frame format** (12-byte header + variable payload):
+```
+[Magic:2] [Ver:1] [Type:1] [StreamID:4] [Length:4] [Payload:...]
+  "TN"     1      enum      0 = control  bytes
+```
 
-**Authentication** (HELLO payload, 72 bytes, HMAC-SHA256):
+**Authentication** (binary HELLO payload, 72 bytes):
 ```
 [ClientID:16] [Timestamp:8] [Nonce:16] [HMAC-SHA256:32]
 ```
 Resists replay and proves knowledge of shared secret without sending it.
 
 **Multiplexing** (Stream ID):
-- A single WebSocket connection carries many logical streams; each stream = 1 HTTP request-connection or 1 TCP connection
-- Control traffic (auth, tunnel lifecycle) rides in JSON text messages
+- Stream 0: control (HELLO, PING, tunnel open/close, errors)
+- Stream 1+: individual tunneled connections (each stream = 1 HTTP request or 1 TCP conn)
 
 **Flow control**:
-- Per-stream, credit-based: both sides start with a 256 KiB send window
-- Sender consumes credit before sending stream data
-- Receiver sends back `window_update` after flushing (batched every 128 KiB)
+- Per-stream, credit-based: both sides start with 256 KiB send window
+- Sender consumes credit before sending `STREAM_DATA`
+- Receiver sends back `STREAM_WINDOW_UPDATE` after flushing (batched every 128 KiB)
 - Simple backpressure: slow consumer naturally throttles sender
 
 ### Key Design Principles
 
-1. **WebSocket + JSON control** — Framing/ordering/keep-alive handled by RFC 6455; JSON control messages on top; binary messages with a 4-byte stream id for stream data
+1. **Simple binary protocol** — No JSON for hot-path data, just 12-byte headers + carefully chosen payloads
 2. **No external services** — SQLite + local files only. Scales from laptop to modest production
 3. **Per-stream flow control** — Backpressure-aware, prevents one slow tunnel from starving others
 4. **Replay-protected auth** — HMAC-SHA256 + timestamp checks + nonce tracking; no secret sent over wire
 5. **Stable reconnect behavior** — Clients persist their ID, routes aren't "reserved" ahead of time (first-come first-served), allows graceful recovery without complex state sync
 6. **SSL termination externalized** — Handled by Render/Cloudflare/etc., keeps proxy server simple and focused
-7. **Single public port** — Port 80 carries HTTP tunnels, the dashboard, and the WebSocket control plane. Works with cloud platforms that terminate TLS at the edge.
+7. **Two public ports** — Port 80 for HTTP, port 9000 for raw TCP control. Works with cloud platforms that terminate TLS at the edge.
 8. **Observability, not governance** — SQLite bookkeeping, dashboard, and logs are for transparency; routing is purely in-memory and rebuilt on reconnect
 9. **Minimal dependencies** — Asyncio (stdlib), sqlite3 (stdlib), psutil (optional). Main server has zero required external packages
 10. **Environment-based config** — No config files, all via environment variables for container-friendly deployment
@@ -224,7 +235,7 @@ Resists replay and proves knowledge of shared secret without sending it.
 - [ ] Set `SHARED_SECRET` to a long random value (`openssl rand -hex 32`)
 - [ ] Set `WILDCARD_DOMAIN` to your actual domain
 - [ ] Ensure DNS has `*.yourdomain` and `yourdomain` pointing to the server
-- [ ] Expose port 80 (HTTP tunnels + WebSocket control plane); verify both work
+- [ ] Expose ports 80 (HTTP) and 9000 (control); verify both work
 - [ ] Configure custom domain / HTTPS termination in front (Render, Cloudflare, etc.)
 - [ ] Bind dashboard to `127.0.0.1` or put it behind reverse-proxy auth
 - [ ] Set `tcp.port_range` to your preferred allocation pool

@@ -1,9 +1,15 @@
 {
   "shared_secret": "REPLACE_WITH_A_LONG_RANDOM_SECRET",
 
+  "control": {
+    "host": "0.0.0.0",
+    "port": 9000,
+    "tls": false
+  },
+
   "http": {
     "host": "0.0.0.0",
-    "port": 8080
+    "port": 80
   },
 
   "wildcard_domain": "forwarding.example.com",
@@ -15,7 +21,7 @@
 
   "dashboard": {
     "host": "127.0.0.1",
-    "port": 8081
+    "port": 8080
   },
 
   "http_only": true,

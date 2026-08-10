@@ -2,49 +2,39 @@
 """
 proxy_server.py -- Self-hosted tunneling proxy server (ngrok-alike).
 
-The client talks to the server over a single WebSocket connection
-(RFC 6455, stdlib implementation in ws.py) which replaces the old custom
-binary TCP protocol. One authenticated, multiplexed WebSocket carries all
-control-plane traffic AND all tunneled stream data:
-
-    public HTTP(s)/TCP traffic  ->  proxy_server opens a stream on the
-                                    client's WebSocket connection; stream
-                                    data rides binary WebSocket messages.
-
-Public exposure is a single HTTP port (the WebSocket endpoint shares it):
-  * GET /ws          -> WebSocket control/data endpoint (for clients)
-  * GET /health      -> health check
-  * other requests   -> Host-header-routed HTTP tunnels
-TCP tunnels still allocate their own public TCP port (or a preferred one),
-one listener per registered tunnel, and any client may register multiple
-TCP (and multiple HTTP) tunnels concurrently.
+Accepts persistent, authenticated, multiplexed client connections and
+routes public HTTP(S)/TCP traffic to the appropriate client-side backend,
+without any external services (SQLite + local files only).
 
 Run:
     python3 proxy_server.py
 
 Configuration via environment variables:
     SHARED_SECRET        - Required, shared secret for client authentication
-    WILDCARD_DOMAIN      - Required, wildcard domain for tunnels
+    CONTROL_HOST         - Control channel host (default: 0.0.0.0)
+    CONTROL_PORT         - Control channel port (default: 9000)
     HTTP_HOST            - Public HTTP host (default: 0.0.0.0)
-    HTTP_PORT            - Public HTTP port (default: 8080)
-    WS_PATH              - WebSocket endpoint path (default: /ws)
+    HTTP_PORT            - Public HTTP port (default: 80)
+    WILDCARD_DOMAIN      - Required, wildcard domain for tunnels
     TCP_PORT_MIN         - TCP port range minimum (default: 20000)
     TCP_PORT_MAX         - TCP port range maximum (default: 20100)
     DASHBOARD_HOST       - Dashboard host (default: 0.0.0.0)
-    DASHBOARD_PORT       - Dashboard port (default: 8081)
+    DASHBOARD_PORT       - Dashboard port (default: 8080)
     HTTP_ONLY            - If true, use http:// URLs (default: true)
-    HEARTBEAT_INTERVAL   - Heartbeat (WS ping) interval in seconds (default: 20)
+    HEARTBEAT_INTERVAL   - Heartbeat interval in seconds (default: 20)
     HEARTBEAT_TIMEOUT    - Heartbeat timeout in seconds (default: 60)
     STALE_GRACE_SECONDS  - Stale client cleanup grace period (default: 300)
     DB_PATH              - SQLite database path (default: /data/tunnel_proxy.db)
     LOG_LEVEL            - Logging level (default: INFO)
     LOG_FILE             - Log file path (default: /var/log/tunnel-proxy/tunnel_proxy.log)
 
-See README.md for the full architecture / message protocol write-up.
+See README.md for the full architecture / protocol write-up and setup
+instructions.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import logging
@@ -61,22 +51,14 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from protocol import (
-    DEFAULT_WS_PATH,
-    HELLO_TIMESTAMP_SKEW_SECONDS,
+    CONTROL_STREAM_ID,
+    FrameType,
     INITIAL_WINDOW,
     MAX_FRAME_PAYLOAD,
-    SERVER_VERSION,
-    encode_stream_data,
-    new_tunnel_id,
-    parse_stream_data,
+    ProtocolError,
+    encode_frame,
+    read_frame,
     verify_hello_payload,
-)
-from ws import (
-    CLOSE_ABORTED,
-    CLOSE_PROTOCOL_ERROR,
-    WebSocketConnection,
-    WebSocketProtocolError,
-    build_accept,
 )
 from storage import Storage
 import dashboard as dashboard_mod
@@ -94,7 +76,7 @@ class FlowWindow:
     """Tracks remaining send credit for one direction of one stream.
 
     consume() is called before sending data; if the window is exhausted the
-    sender must await() until a window_update (replenish()) arrives from the
+    sender must await() until a WINDOW_UPDATE (replenish()) arrives from the
     peer. This gives simple, symmetric backpressure so a slow reader on
     either side of a tunnel can't cause unbounded buffering in the proxy.
     """
@@ -122,11 +104,10 @@ class FlowWindow:
 # Per-stream / per-tunnel / per-client state
 # =============================================================================
 
-
 @dataclass
 class StreamState:
     """One multiplexed logical connection (one HTTP request-connection or
-    one raw TCP connection) riding on a client's WebSocket control pipe."""
+    one raw TCP connection) riding on a client's control connection."""
     stream_id: int
     tunnel_id: str
     public_writer: asyncio.StreamWriter
@@ -150,17 +131,19 @@ class TunnelInfo:
 
 
 class ClientSession:
-    def __init__(self, client_id: str, ws: WebSocketConnection):
+    def __init__(self, client_id: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         self.client_id = client_id
-        self.ws = ws
+        self.reader = reader
+        self.writer = writer
         self.connected_at = time.time()
         self.last_seen = time.time()
         self.tunnels: dict[str, TunnelInfo] = {}
         self.streams: dict[int, StreamState] = {}
         self._next_stream_id = 1
+        self._write_lock = asyncio.Lock()
         self.alive = True
-        self.bytes_in = 0    # public -> client, aggregate
-        self.bytes_out = 0   # client -> public, aggregate
+        self.bytes_in = 0   # public -> client, aggregate
+        self.bytes_out = 0  # client -> public, aggregate
 
     def alloc_stream_id(self) -> int:
         sid = self._next_stream_id
@@ -169,32 +152,31 @@ class ClientSession:
             self._next_stream_id = 1
         return sid
 
-    async def send_json(self, msg: dict):
-        await self.ws.send_text(json.dumps(msg, ensure_ascii=True))
-
-    async def send_stream_binary(self, stream_id: int, payload: bytes):
-        await self.ws.send_binary(encode_stream_data(stream_id, payload))
+    async def send_frame(self, ftype: int, stream_id: int, payload: bytes = b""):
+        data = encode_frame(ftype, stream_id, payload)
+        async with self._write_lock:
+            self.writer.write(data)
+            await self.writer.drain()
 
 
 # =============================================================================
 # Server context (holds all shared state)
 # =============================================================================
 
-
 class ServerContext:
     def __init__(self, config: dict):
         self.config = config
         self.storage = Storage(config["storage"]["db_path"])
-        self.clients: dict[str, set][ClientSession] = {}
+        self.clients: dict[str, set[ClientSession]] = {}
         self.by_subdomain: dict[str, tuple[ClientSession, str]] = {}
         self.by_port: dict[int, tuple[ClientSession, str]] = {}
         self.seen_nonces: dict[bytes, int] = {}
         self.start_time = time.time()
         self.recent_logs: deque[str] = deque(maxlen=200)
-        self.session_tasks: set = set()  # in-flight WS session handlers
+        self._used_ports_lock = asyncio.Lock()
 
     def log_event(self, msg: str):
-        self.recent_logs.append("[%s] %s" % (time.strftime("%H:%M:%S"), msg))
+        self.recent_logs.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
 
 # =============================================================================
@@ -203,6 +185,7 @@ class ServerContext:
 
 DEFAULT_CONFIG = {
     "shared_secret": "CHANGE_ME",
+    "control": {"host": "0.0.0.0", "port": 9001, "tls": False},
     "http": {"host": "0.0.0.0", "port": 8080},
     "wildcard_domain": "forwarding.example.com",
     "tcp": {"port_range": [20000, 20100]},
@@ -211,7 +194,6 @@ DEFAULT_CONFIG = {
     "heartbeat_interval_seconds": 20,
     "heartbeat_timeout_seconds": 60,
     "stale_grace_seconds": 300,
-    "ws_path": DEFAULT_WS_PATH,
     "storage": {"db_path": "/data/tunnel_proxy.db"},
     "logging": {"level": "INFO", "file": "/var/log/tunnel-proxy/tunnel_proxy.log"},
 }
@@ -228,12 +210,14 @@ def load_config() -> dict:
         cfg["wildcard_domain"] = os.environ["WILDCARD_DOMAIN"]
 
     # Optional environment variables with defaults
+    if "CONTROL_HOST" in os.environ:
+        cfg["control"]["host"] = os.environ["CONTROL_HOST"]
+    if "CONTROL_PORT" in os.environ:
+        cfg["control"]["port"] = int(os.environ["CONTROL_PORT"])
     if "HTTP_HOST" in os.environ:
         cfg["http"]["host"] = os.environ["HTTP_HOST"]
     if "HTTP_PORT" in os.environ:
         cfg["http"]["port"] = int(os.environ["HTTP_PORT"])
-    if "WS_PATH" in os.environ:
-        cfg["ws_path"] = os.environ["WS_PATH"]
     if "TCP_PORT_MIN" in os.environ:
         cfg["tcp"]["port_range"][0] = int(os.environ["TCP_PORT_MIN"])
     if "TCP_PORT_MAX" in os.environ:
@@ -278,10 +262,14 @@ class DequeLogHandler(logging.Handler):
 # Port / subdomain allocation
 # =============================================================================
 
-
 def _port_is_bindable(port: int) -> bool:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     if sys.platform == "win32":
+        # On Windows, SO_REUSEADDR permits binding to a port that's already
+        # in LISTEN state elsewhere (unlike POSIX, where it only affects
+        # sockets stuck in TIME_WAIT) -- so using it here would make this
+        # probe report already-occupied ports as free. SO_EXCLUSIVEADDRUSE
+        # is the Windows-correct flag for an exclusive availability check.
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         except (AttributeError, OSError):
@@ -329,27 +317,19 @@ def allocate_subdomain(ctx: ServerContext, preferred: Optional[str]) -> Optional
 
 
 # =============================================================================
-# Stream data plumbing (public socket <-> WebSocket control pipe)
+# Stream data plumbing (public socket <-> multiplexed control connection)
 # =============================================================================
 
-
 async def send_stream_data(session: ClientSession, stream: StreamState, data: bytes):
-    """Chunk `data` into <= MAX_FRAME_PAYLOAD binary messages, respecting the
-    per-stream send window."""
+    """Chunk `data` into <= MAX_FRAME_PAYLOAD frames, respecting flow control."""
     view = memoryview(data)
     offset = 0
-    total = len(view)
-    while offset < total:
+    while offset < len(view):
         await stream.send_window.wait()
-        avail = stream.send_window.available
-        chunk_len = min(total - offset, MAX_FRAME_PAYLOAD)
-        if avail > 0:
-            chunk_len = min(chunk_len, avail)
-        if chunk_len <= 0:
-            chunk_len = 1
-        chunk = bytes(view[offset:offset + chunk_len])
+        chunk = view[offset: offset + MAX_FRAME_PAYLOAD]
+        chunk = chunk[: max(1, min(len(chunk), stream.send_window.available))] if stream.send_window.available > 0 else chunk
+        await session.send_frame(FrameType.STREAM_DATA, stream.stream_id, bytes(chunk))
         stream.send_window.consume(len(chunk))
-        await session.send_stream_binary(stream.stream_id, chunk)
         stream.bytes_in += len(chunk)
         session.bytes_in += len(chunk)
         tunnel = session.tunnels.get(stream.tunnel_id)
@@ -359,23 +339,22 @@ async def send_stream_data(session: ClientSession, stream: StreamState, data: by
 
 
 async def pump_public_to_client(session: ClientSession, stream: StreamState,
-                                pub_reader: asyncio.StreamReader, ctx: ServerContext):
-    """Read from the public-facing socket and forward as binary messages."""
+                                 pub_reader: asyncio.StreamReader, ctx: ServerContext):
+    """Read from the public-facing socket and forward as STREAM_DATA frames."""
     try:
         while True:
+            await stream.send_window.wait()
             chunk = await pub_reader.read(MAX_FRAME_PAYLOAD)
             if not chunk:
                 break
             await send_stream_data(session, stream, chunk)
     except (ConnectionError, asyncio.IncompleteReadError, OSError):
         pass
-    except asyncio.CancelledError:
-        pass
     finally:
         if not stream.closed:
             stream.closed = True
             try:
-                await session.send_json({"type": "close_stream", "stream_id": stream.stream_id})
+                await session.send_frame(FrameType.STREAM_CLOSE, stream.stream_id)
             except Exception:
                 pass
         session.streams.pop(stream.stream_id, None)
@@ -386,27 +365,24 @@ async def pump_public_to_client(session: ClientSession, stream: StreamState,
 
 
 async def open_new_stream(session: ClientSession, tunnel: TunnelInfo,
-                          pub_reader: asyncio.StreamReader, pub_writer: asyncio.StreamWriter,
-                          initial_data: bytes, proto: str, remote_addr: tuple, ctx: ServerContext):
+                           pub_reader: asyncio.StreamReader, pub_writer: asyncio.StreamWriter,
+                           initial_data: bytes, proto: str, remote_addr: tuple, ctx: ServerContext):
     """Register a new multiplexed stream for an inbound public connection,
-    tell the client about it (stream_open), then start pumping data."""
+    tell the client about it, and start pumping data in both directions."""
     stream_id = session.alloc_stream_id()
     stream = StreamState(stream_id=stream_id, tunnel_id=tunnel.tunnel_id, public_writer=pub_writer)
     session.streams[stream_id] = stream
     tunnel.connection_count += 1
-    log.debug("open stream=%s tunnel=%s proto=%s", stream_id, tunnel.tunnel_id[:8], proto)
 
+    meta = json.dumps({
+        "tunnel_id": tunnel.tunnel_id,
+        "proto": proto,
+        "remote_addr": f"{remote_addr[0]}:{remote_addr[1]}",
+    }).encode()
     try:
-        await session.send_json({
-            "type": "stream_open",
-            "stream_id": stream_id,
-            "tunnel_id": tunnel.tunnel_id,
-            "proto": proto,
-            "remote_addr": "%s:%s" % (remote_addr[0], remote_addr[1]),
-        })
+        await session.send_frame(FrameType.STREAM_OPEN, stream_id, meta)
     except Exception:
         session.streams.pop(stream_id, None)
-        tunnel.connection_count -= 1
         pub_writer.close()
         return
 
@@ -423,17 +399,22 @@ async def open_new_stream(session: ClientSession, tunnel: TunnelInfo,
 # HTTP(S) public listener
 # =============================================================================
 
-_HEALTH_RESPONSE = (
-    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 7\r\n"
-    b"Connection: close\r\n\r\nhealthy\n"
-)
+_HOST_RE = re.compile(rb"^Host:\s*([^\r\n]+)\r\n", re.IGNORECASE | re.MULTILINE)
 
 
-async def send_http_error(writer, status: int, reason: str):
-    body = ("<html><body><h1>%d %s</h1></body></html>" % (status, reason)).encode()
+def extract_host(header_bytes: bytes) -> Optional[str]:
+    m = _HOST_RE.search(header_bytes)
+    if not m:
+        return None
+    host = m.group(1).decode(errors="replace").strip()
+    return host.split(":")[0].lower()
+
+
+async def send_http_error(writer: asyncio.StreamWriter, status: int, reason: str):
+    body = f"<html><body><h1>{status} {reason}</h1></body></html>".encode()
     resp = (
-        "HTTP/1.1 %d %s\r\nContent-Type: text/html\r\n"
-        "Content-Length: %d\r\nConnection: close\r\n\r\n" % (status, reason, len(body))
+        f"HTTP/1.1 {status} {reason}\r\nContent-Type: text/html\r\n"
+        f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
     ).encode() + body
     try:
         writer.write(resp)
@@ -447,85 +428,27 @@ async def send_http_error(writer, status: int, reason: str):
             pass
 
 
-def _parse_request_head(head_block: bytes):
-    """Parse an HTTP request head into (method, path, headers_dict)."""
-    lines = head_block.decode("latin-1").split("\r\n")
-    parts = lines[0].split()
-    if len(parts) < 2:
-        return None, None, {}
-    method, path = parts[0], parts[1]
-    headers = {}
-    for line in lines[1:]:
-        if not line:
-            continue
-        name, sep, value = line.partition(":")
-        if sep:
-            headers[name.strip().lower()] = value.strip()
-    return method, path, headers
-
-
-async def handle_public_http_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
-                                  ctx: ServerContext):
+async def handle_public_http_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, ctx: ServerContext):
     peer = writer.get_extra_info("peername") or ("?", 0)
     try:
-        head_block = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=10)
+        header_bytes = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=10)
     except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError, OSError):
         writer.close()
         return
 
-    method, path, headers = _parse_request_head(head_block)
-    if method is None:
+    # Health check endpoint - respond before Host validation
+    if header_bytes.startswith(b"GET /health "):
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 7\r\n\r\nhealthy\n")
+        await writer.drain()
         writer.close()
         return
 
-    # WebSocket control-plane endpoint.
-    if method == "GET" and path.rstrip("/") == ctx.config["ws_path"].rstrip("/"):
-        upgrade = (headers.get("upgrade") or "").lower()
-        key = headers.get("sec-websocket-key")
-        if upgrade == "websocket" and key:
-            accept = build_accept(key)
-            resp = (
-                b"HTTP/1.1 101 Switching Protocols\r\n"
-                b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
-                b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n"
-            )
-            try:
-                writer.write(resp)
-                await writer.drain()
-            except Exception:
-                writer.close()
-                return
-            conn = WebSocketConnection(reader, writer, is_server=True)
-            task = asyncio.ensure_future(handle_ws_session(conn, peer, ctx))
-            ctx.session_tasks.add(task)
-            task.add_done_callback(ctx.session_tasks.discard)
-            return
-        else:
-            await send_http_error(writer, 400, "Bad Request (invalid WebSocket upgrade)")
-            return
-
-    # Health check endpoint.
-    if path == "/health" or path.startswith("/health"):
-        try:
-            writer.write(_HEALTH_RESPONSE)
-            await writer.drain()
-        except Exception:
-            pass
-        finally:
-            writer.close()
-        return
-
-    # Host-based HTTP tunnel routing.
-    host_hdr = headers.get("host")
-    if not host_hdr:
+    host = extract_host(header_bytes)
+    if not host:
         await send_http_error(writer, 400, "Bad Request (missing Host header)")
         return
-    host = host_hdr.split(":")[0].lower()
-    wildcard = ctx.config["wildcard_domain"]
-    if host.endswith(wildcard):
-        subdomain = host[: -(len(wildcard) + 1)] if host != wildcard else host
-    else:
-        subdomain = host
+
+    subdomain = host.split("." + ctx.config["wildcard_domain"])[0] if host.endswith(ctx.config["wildcard_domain"]) else host
 
     entry = ctx.by_subdomain.get(subdomain)
     if not entry:
@@ -540,15 +463,15 @@ async def handle_public_http_conn(reader: asyncio.StreamReader, writer: asyncio.
         await send_http_error(writer, 502, "Tunnel no longer registered")
         return
 
-    await open_new_stream(session, tunnel, reader, writer, head_block, "http", peer, ctx)
+    await open_new_stream(session, tunnel, reader, writer, header_bytes, "http", peer, ctx)
 
 
 # =============================================================================
 # TCP public listener (one per registered TCP tunnel)
 # =============================================================================
 
-
-async def handle_public_tcp_conn(reader, writer, ctx: ServerContext, port: int):
+async def handle_public_tcp_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+                                  ctx: ServerContext, port: int):
     peer = writer.get_extra_info("peername") or ("?", 0)
     entry = ctx.by_port.get(port)
     if not entry:
@@ -566,29 +489,32 @@ async def handle_public_tcp_conn(reader, writer, ctx: ServerContext, port: int):
 
 
 # =============================================================================
-# Control: tunnel lifecycle handlers (JSON control messages)
+# Control-connection: tunnel lifecycle handlers
 # =============================================================================
 
+async def handle_tunnel_open(session: ClientSession, frame, ctx: ServerContext):
+    try:
+        req = json.loads(frame.payload.decode())
+    except Exception:
+        await session.send_frame(FrameType.ERROR, CONTROL_STREAM_ID,
+                                  json.dumps({"error": "malformed TUNNEL_OPEN_REQUEST"}).encode())
+        return
 
-async def handle_tunnel_open(session: ClientSession, msg: dict, ctx: ServerContext):
-    tunnel_id = msg.get("tunnel_id") or new_tunnel_id()
-    ttype = msg.get("kind")
-
-    async def respond(**kw):
-        payload = {"type": "open_tunnel_response", "tunnel_id": tunnel_id}
-        payload.update(kw)
-        await session.send_json(payload)
+    tunnel_id = req.get("tunnel_id") or secrets.token_hex(8)
+    ttype = req.get("type")
 
     if ttype not in ("http", "tcp"):
-        await respond(status="error", error="type must be 'http' or 'tcp'")
+        resp = {"tunnel_id": tunnel_id, "status": "error", "error": "type must be 'http' or 'tcp'"}
+        await session.send_frame(FrameType.TUNNEL_OPEN_RESPONSE, CONTROL_STREAM_ID, json.dumps(resp).encode())
         return
 
     if ttype == "http":
-        requested = msg.get("subdomain")
+        requested = req.get("subdomain")
         subdomain = allocate_subdomain(ctx, requested)
         if subdomain is None:
             reason = "subdomain already in use" if requested else "could not allocate a subdomain"
-            await respond(status="error", error=reason)
+            resp = {"tunnel_id": tunnel_id, "status": "error", "error": reason}
+            await session.send_frame(FrameType.TUNNEL_OPEN_RESPONSE, CONTROL_STREAM_ID, json.dumps(resp).encode())
             return
 
         tunnel = TunnelInfo(tunnel_id=tunnel_id, type="http", subdomain=subdomain)
@@ -596,40 +522,38 @@ async def handle_tunnel_open(session: ClientSession, msg: dict, ctx: ServerConte
         ctx.by_subdomain[subdomain] = (session, tunnel_id)
         ctx.storage.save_tunnel(tunnel_id, session.client_id, "http", subdomain, None)
 
-        public_url = "http://%s.%s" % (subdomain, ctx.config["wildcard_domain"])
-        await respond(status="ok", kind="http", public_url=public_url)
-        ctx.log_event("Client %s opened HTTP tunnel %s" % (session.client_id[:8], public_url))
-        return
+        public_url = f"http://{subdomain}.{ctx.config['wildcard_domain']}"
+        resp = {"tunnel_id": tunnel_id, "status": "ok", "type": "http", "public_url": public_url}
+        ctx.log_event(f"Client {session.client_id[:8]} opened HTTP tunnel {public_url}")
 
-    # tcp
-    preferred = msg.get("remote_port")
-    if preferred is not None:
+    else:  # tcp
+        preferred = req.get("remote_port")
+        port = allocate_tcp_port(ctx, preferred)
+        if port is None:
+            resp = {"tunnel_id": tunnel_id, "status": "error", "error": "no TCP ports available"}
+            await session.send_frame(FrameType.TUNNEL_OPEN_RESPONSE, CONTROL_STREAM_ID, json.dumps(resp).encode())
+            return
+
         try:
-            preferred = int(preferred)
-        except (TypeError, ValueError):
-            preferred = None
-    port = allocate_tcp_port(ctx, preferred)
-    if port is None:
-        await respond(status="error", error="no TCP ports available")
-        return
+            tcp_server = await asyncio.start_server(
+                lambda r, w, p=port: handle_public_tcp_conn(r, w, ctx, p),
+                ctx.config["tcp"].get("bind_host", "0.0.0.0"), port,
+            )
+        except OSError as e:
+            resp = {"tunnel_id": tunnel_id, "status": "error", "error": f"bind failed: {e}"}
+            await session.send_frame(FrameType.TUNNEL_OPEN_RESPONSE, CONTROL_STREAM_ID, json.dumps(resp).encode())
+            return
 
-    try:
-        tcp_server = await asyncio.start_server(
-            lambda r, w, p=port: handle_public_tcp_conn(r, w, ctx, p),
-            ctx.config["tcp"].get("bind_host", "0.0.0.0"), port,
-        )
-    except OSError as e:
-        await respond(status="error", error="bind failed: %s" % e)
-        return
+        tunnel = TunnelInfo(tunnel_id=tunnel_id, type="tcp", remote_port=port, tcp_server=tcp_server)
+        session.tunnels[tunnel_id] = tunnel
+        ctx.by_port[port] = (session, tunnel_id)
+        ctx.storage.save_tunnel(tunnel_id, session.client_id, "tcp", None, port)
 
-    tunnel = TunnelInfo(tunnel_id=tunnel_id, type="tcp", remote_port=port, tcp_server=tcp_server)
-    session.tunnels[tunnel_id] = tunnel
-    ctx.by_port[port] = (session, tunnel_id)
-    ctx.storage.save_tunnel(tunnel_id, session.client_id, "tcp", None, port)
+        resp = {"tunnel_id": tunnel_id, "status": "ok", "type": "tcp",
+                "remote_port": port, "public_host": ctx.config["wildcard_domain"]}
+        ctx.log_event(f"Client {session.client_id[:8]} opened TCP tunnel on port {port}")
 
-    await respond(status="ok", kind="tcp", remote_port=port,
-                  public_url="tcp://%s:%s" % (ctx.config["wildcard_domain"], port))
-    ctx.log_event("Client session opened TCP tunnel on port %d" % port)
+    await session.send_frame(FrameType.TUNNEL_OPEN_RESPONSE, CONTROL_STREAM_ID, json.dumps(resp).encode())
 
 
 async def close_tunnel(session: ClientSession, tunnel_id: str, ctx: ServerContext):
@@ -656,41 +580,39 @@ async def close_tunnel(session: ClientSession, tunnel_id: str, ctx: ServerContex
             except Exception:
                 pass
             session.streams.pop(sid, None)
-    ctx.log_event("Tunnel %s closed" % tunnel_id[:8])
+    ctx.log_event(f"Tunnel {tunnel_id[:8]} closed")
 
 
-async def handle_tunnel_close(session: ClientSession, msg: dict, ctx: ServerContext):
-    tunnel_id = msg.get("tunnel_id")
-    if tunnel_id:
-        await close_tunnel(session, tunnel_id, ctx)
+async def handle_tunnel_close(session: ClientSession, frame, ctx: ServerContext):
+    try:
+        req = json.loads(frame.payload.decode())
+        tunnel_id = req["tunnel_id"]
+    except Exception:
+        return
+    await close_tunnel(session, tunnel_id, ctx)
 
 
 # =============================================================================
-# Control: stream data / close / window-update handlers
+# Control-connection: stream data / close / window-update handlers
 # =============================================================================
 
-
-async def handle_stream_data(session: ClientSession, payload: bytes, ctx: ServerContext):
-    stream_id, data = parse_stream_data(payload)
-    if stream_id is None:
-        return  # malformed: ignore
-    stream = session.streams.get(stream_id)
+async def handle_stream_data(session: ClientSession, frame, ctx: ServerContext):
+    stream = session.streams.get(frame.stream_id)
     if stream is None or stream.closed:
-        log.debug("stream %s gone; drop %d bytes", stream_id, len(data))
         return  # stream already gone on our side; ignore stray data
     try:
-        stream.public_writer.write(data)
+        stream.public_writer.write(frame.payload)
         await stream.public_writer.drain()
     except (ConnectionError, OSError):
         stream.closed = True
-        session.streams.pop(stream_id, None)
+        session.streams.pop(frame.stream_id, None)
         try:
-            await session.send_json({"type": "close_stream", "stream_id": stream_id})
+            await session.send_frame(FrameType.STREAM_CLOSE, frame.stream_id)
         except Exception:
             pass
         return
 
-    n = len(data)
+    n = len(frame.payload)
     stream.bytes_out += n
     session.bytes_out += n
     tunnel = session.tunnels.get(stream.tunnel_id)
@@ -702,14 +624,15 @@ async def handle_stream_data(session: ClientSession, payload: bytes, ctx: Server
         increment = stream.unacked_recv_bytes
         stream.unacked_recv_bytes = 0
         try:
-            await session.send_json({"type": "window_update", "stream_id": stream_id,
-                                     "increment": increment})
+            await session.send_frame(
+                FrameType.STREAM_WINDOW_UPDATE, frame.stream_id, increment.to_bytes(4, "big")
+            )
         except Exception:
             pass
 
 
-async def handle_close_stream_from_client(session: ClientSession, msg: dict, ctx: ServerContext):
-    stream = session.streams.pop(msg.get("stream_id"), None)
+async def handle_stream_close_from_client(session: ClientSession, frame, ctx: ServerContext):
+    stream = session.streams.pop(frame.stream_id, None)
     if stream is None:
         return
     stream.closed = True
@@ -719,175 +642,41 @@ async def handle_close_stream_from_client(session: ClientSession, msg: dict, ctx
         pass
 
 
-async def handle_window_update(session: ClientSession, msg: dict, ctx: ServerContext):
-    stream = session.streams.get(msg.get("stream_id"))
-    if stream is None:
+def handle_window_update(session: ClientSession, frame):
+    stream = session.streams.get(frame.stream_id)
+    if stream is None or len(frame.payload) != 4:
         return
-    try:
-        increment = int(msg.get("increment", 0))
-    except (TypeError, ValueError):
-        return
-    if increment > 0:
-        stream.send_window.replenish(increment)
+    increment = int.from_bytes(frame.payload, "big")
+    stream.send_window.replenish(increment)
 
 
 # =============================================================================
-# Control connection: WebSocket accept / auth / main dispatch loop
+# Control connection: accept / handshake / main dispatch loop
 # =============================================================================
-
-
-async def _wait_for_hello(ws: WebSocketConnection) -> dict:
-    """Wait for the first control message (must be a text `hello`)."""
-    while True:
-        kind, payload = await asyncio.wait_for(ws.recv(), timeout=10)
-        if kind in ("text", "binary"):
-            try:
-                msg = json.loads(payload) if isinstance(payload, str) else {}
-            except (ValueError, TypeError):
-                raise WebSocketProtocolError("hello must be a JSON object")
-            return msg
-        if kind in ("close", "error"):
-            raise WebSocketProtocolError("connection closed before hello")
-
-
-async def handle_ws_session(ws: WebSocketConnection, addr: tuple, ctx: ServerContext):
-    try:
-        hello = await _wait_for_hello(ws)
-    except (asyncio.TimeoutError, WebSocketProtocolError, ConnectionError, OSError):
-        try:
-            await ws.close(CLOSE_PROTOCOL_ERROR)
-        except Exception:
-            pass
-        return
-
-    if str(hello.get("type")) != "hello":
-        try:
-            await ws.send_text(json.dumps({"type": "hello_fail",
-                                           "message": "expected hello message"}))
-            await ws.close(CLOSE_PROTOCOL_ERROR)
-        except Exception:
-            pass
-        return
-
-    sign_hex = hello.get("sign")
-    if not isinstance(sign_hex, str):
-        try:
-            await ws.send_text(json.dumps({"type": "hello_fail",
-                                           "message": "missing sign"}))
-            await ws.close(CLOSE_PROTOCOL_ERROR)
-        except Exception:
-            pass
-        return
-    try:
-        sign = bytes.fromhex(sign_hex)
-    except ValueError:
-        try:
-            await ws.send_text(json.dumps({"type": "hello_fail",
-                                           "message": "malformed sign"}))
-            await ws.close(CLOSE_PROTOCOL_ERROR)
-        except Exception:
-            pass
-        return
-
-    ok, client_id, reason = verify_hello_payload(sign, ctx.config["shared_secret"],
-                                                 ctx.seen_nonces)
-    if not ok:
-        log.warning("Rejected WS HELLO from %s: %s", addr[0], reason)
-        try:
-            await ws.send_text(json.dumps({"type": "hello_fail", "message": reason}))
-            await ws.close(CLOSE_PROTOCOL_ERROR)
-        except Exception:
-            pass
-        return
-
-    # Client may hold multiple live sessions (per client_id).
-    existing = ctx.clients.get(client_id, set())
-    session = ClientSession(client_id, ws)
-    existing.add(session)
-    ctx.clients[client_id] = existing
-    ctx.storage.upsert_client(client_id)
-
-    try:
-        await session.send_json({
-            "type": "hello_ok",
-            "client_id": client_id,
-            "heartbeat_interval": ctx.config["heartbeat_interval_seconds"],
-            "server_version": SERVER_VERSION,
-        })
-    except Exception:
-        existing.discard(session)
-        if not existing:
-            ctx.clients.pop(client_id, None)
-        return
-
-    ctx.log_event("Client %s connected from %s" % (client_id[:8], addr[0]))
-    log.info("Client %s authenticated from %s", client_id[:8], addr[0])
-
-    hb_task = asyncio.create_task(heartbeat_loop(session, ctx))
-    try:
-        await client_loop(session, ctx)
-    except (asyncio.TimeoutError, ConnectionError, WebSocketProtocolError, OSError) as e:
-        log.info("Client %s connection ended: %s", client_id[:8], type(e).__name__)
-    except asyncio.CancelledError:
-        pass
-    except Exception:
-        log.exception("Unexpected error in client loop for %s", client_id[:8])
-    finally:
-        hb_task.cancel()
-        await cleanup_client(session, ctx)
-
 
 async def client_loop(session: ClientSession, ctx: ServerContext):
-    """Main message dispatch loop for an authenticated WebSocket session."""
-    timeout = ctx.config["heartbeat_timeout_seconds"]
     while True:
-        try:
-            kind, payload = await asyncio.wait_for(session.ws.recv(), timeout=timeout)
-        except asyncio.TimeoutError:
-            log.warning("Client %s heartbeat timeout; closing connection",
-                        session.client_id[:8])
-            break
+        frame = await read_frame(session.reader)
         session.last_seen = time.time()
 
-        if kind == "close":
-            break
-        if kind == "error":
-            log.warning("Client %s websocket error: %s", session.client_id[:8], payload)
-            break
-        if kind in ("ping", "pong"):
-            continue
-        if kind == "binary":
-            try:
-                await handle_stream_data(session, payload, ctx)
-            except (ConnectionError, OSError):
-                break
-            continue
-
-        # text control messages
-        try:
-            msg = json.loads(payload)
-        except (ValueError, TypeError):
-            log.warning("Client %s sent invalid JSON", session.client_id[:8])
-            continue
-        if not isinstance(msg, dict):
-            continue
-        mtype = msg.get("type")
-        if mtype == "open_tunnel":
-            await handle_tunnel_open(session, msg, ctx)
-        elif mtype == "close_tunnel":
-            await handle_tunnel_close(session, msg, ctx)
-        elif mtype == "close_stream":
-            await handle_close_stream_from_client(session, msg, ctx)
-        elif mtype == "window_update":
-            await handle_window_update(session, msg, ctx)
-        elif mtype == "error":
-            log.warning("Client %s reported error: %s", session.client_id[:8],
-                        str(msg.get("message"))[:200])
-        elif mtype == "heartbeat":
-            await session.send_json({"type": "heartbeat_ack"})
+        if frame.type == FrameType.PING:
+            await session.send_frame(FrameType.PONG, CONTROL_STREAM_ID)
+        elif frame.type == FrameType.PONG:
+            pass
+        elif frame.type == FrameType.TUNNEL_OPEN_REQUEST:
+            await handle_tunnel_open(session, frame, ctx)
+        elif frame.type == FrameType.TUNNEL_CLOSE:
+            await handle_tunnel_close(session, frame, ctx)
+        elif frame.type == FrameType.STREAM_DATA:
+            await handle_stream_data(session, frame, ctx)
+        elif frame.type == FrameType.STREAM_CLOSE:
+            await handle_stream_close_from_client(session, frame, ctx)
+        elif frame.type == FrameType.STREAM_WINDOW_UPDATE:
+            handle_window_update(session, frame)
+        elif frame.type == FrameType.ERROR:
+            log.warning("Client %s reported error: %s", session.client_id[:8], frame.payload[:200])
         else:
-            log.warning("Unknown message type %r from client %s", mtype,
-                        session.client_id[:8])
+            log.warning("Unknown frame type %s from client %s", frame.type, session.client_id[:8])
 
 
 async def heartbeat_loop(session: ClientSession, ctx: ServerContext):
@@ -896,15 +685,14 @@ async def heartbeat_loop(session: ClientSession, ctx: ServerContext):
     while session.alive:
         await asyncio.sleep(interval)
         if time.time() - session.last_seen > timeout:
-            log.warning("Client %s heartbeat timeout; closing connection",
-                        session.client_id[:8])
+            log.warning("Client %s heartbeat timeout; closing connection", session.client_id[:8])
             try:
-                await session.ws.close(CLOSE_ABORTED)
+                session.writer.close()
             except Exception:
                 pass
             return
         try:
-            await session.ws.ping()
+            await session.send_frame(FrameType.PING, CONTROL_STREAM_ID)
         except Exception:
             return
 
@@ -924,32 +712,85 @@ async def cleanup_client(session: ClientSession, ctx: ServerContext):
     if not sessions:
         ctx.clients.pop(session.client_id, None)
     try:
-        await session.ws.close(CLOSE_ABORTED)
+        session.writer.close()
     except Exception:
         pass
-    ctx.log_event("Client %s disconnected" % session.client_id[:8])
+    ctx.log_event(f"Client {session.client_id[:8]} disconnected")
     log.info("Client %s disconnected and cleaned up", session.client_id[:8])
 
 
-async def close_all_sessions(ctx: ServerContext):
-    """Gracefully tear down every live WebSocket session and wait for the
-    per-session cleanup (which touches SQLite) to finish."""
-    for sessions in ctx.clients.values():
-        for session in sessions:
-            try:
-                await session.ws.close(CLOSE_ABORTED)
-            except Exception:
-                pass
-    if ctx.session_tasks:
-        await asyncio.gather(*list(ctx.session_tasks), return_exceptions=True)
+async def handle_control_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, ctx: ServerContext):
+    addr = writer.get_extra_info("peername") or ("?", 0)
+    try:
+        frame = await asyncio.wait_for(read_frame(reader), timeout=10)
+    except Exception:
+        writer.close()
+        return
+
+    if frame.type != FrameType.HELLO:
+        try:
+            writer.write(encode_frame(FrameType.HELLO_FAIL, CONTROL_STREAM_ID,
+                                       json.dumps({"error": "expected HELLO"}).encode()))
+            await writer.drain()
+        except Exception:
+            pass
+        writer.close()
+        return
+
+    ok, client_id, reason = verify_hello_payload(frame.payload, ctx.config["shared_secret"], ctx.seen_nonces)
+    if not ok:
+        log.warning("Rejected HELLO from %s: %s", addr[0], reason)
+        try:
+            writer.write(encode_frame(FrameType.HELLO_FAIL, CONTROL_STREAM_ID,
+                                       json.dumps({"error": reason}).encode()))
+            await writer.drain()
+        except Exception:
+            pass
+        writer.close()
+        return
+
+    # If this client_id already has live sessions, keep them (support multiple connections per client_id)
+    existing_sessions = ctx.clients.get(client_id, set())
+
+    session = ClientSession(client_id, reader, writer)
+    existing_sessions.add(session)
+    ctx.clients[client_id] = existing_sessions
+    ctx.storage.upsert_client(client_id)
+
+    resp = json.dumps({
+        "client_id": client_id,
+        "heartbeat_interval": ctx.config["heartbeat_interval_seconds"],
+        "server_version": 1,
+    }).encode()
+    try:
+        await session.send_frame(FrameType.HELLO_OK, CONTROL_STREAM_ID, resp)
+    except Exception:
+        existing_sessions.discard(session)
+        if not existing_sessions:
+            ctx.clients.pop(client_id, None)
+        return
+
+    ctx.log_event(f"Client {client_id[:8]} connected from {addr[0]}")
+    log.info("Client %s authenticated from %s", client_id[:8], addr[0])
+
+    hb_task = asyncio.create_task(heartbeat_loop(session, ctx))
+    try:
+        await client_loop(session, ctx)
+    except (asyncio.IncompleteReadError, ConnectionError, ProtocolError, OSError) as e:
+        log.info("Client %s connection ended: %s", client_id[:8], e)
+    except Exception:
+        log.exception("Unexpected error in client loop for %s", client_id[:8])
+    finally:
+        hb_task.cancel()
+        await cleanup_client(session, ctx)
 
 
 # =============================================================================
 # Background maintenance tasks
 # =============================================================================
 
-
 async def nonce_and_stale_cleanup_loop(ctx: ServerContext):
+    from protocol import HELLO_TIMESTAMP_SKEW_SECONDS
     while True:
         await asyncio.sleep(60)
         cutoff = time.time() - HELLO_TIMESTAMP_SKEW_SECONDS - 5
@@ -963,20 +804,19 @@ async def nonce_and_stale_cleanup_loop(ctx: ServerContext):
 # Startup / main
 # =============================================================================
 
-
 def setup_logging(ctx: ServerContext):
     cfg = ctx.config["logging"]
     level = getattr(logging, cfg.get("level", "INFO").upper(), logging.INFO)
     root = logging.getLogger()
     root.setLevel(level)
-    fmt = logging.Formatter("%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-                            "%Y-%m-%d %H:%M:%S")
+    fmt = logging.Formatter("%(asctime)s %(levelname)-8s %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S")
 
     console = logging.StreamHandler()
     console.setFormatter(fmt)
     root.addHandler(console)
 
     if cfg.get("file"):
+        # Create log directory if it doesn't exist
         log_dir = os.path.dirname(cfg["file"])
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)
@@ -989,31 +829,10 @@ def setup_logging(ctx: ServerContext):
     root.addHandler(dq)
 
 
-async def start_services(ctx: ServerContext):
-    """Start all listener backends. Returns (tasks, http_server).
-
-    The single http_server entry point serves HTTP tunnels, /health and the
-    WebSocket control-plane endpoint (ctx.config["ws_path"]). The dashboard
-    listens on its own port; TCP tunnels bind their own allocated ports.
-    """
-    http_cfg = ctx.config["http"]
-    http_server = await asyncio.start_server(
-        lambda r, w: handle_public_http_conn(r, w, ctx), http_cfg["host"], http_cfg["port"]
-    )
-    log.info("Public HTTP + WebSocket (%s) listening on %s:%s",
-             ctx.config["ws_path"], http_cfg["host"], http_cfg["port"])
-
-    tasks = [
-        asyncio.create_task(http_server.serve_forever()),
-        asyncio.create_task(dashboard_mod.serve_dashboard(ctx)),
-        asyncio.create_task(nonce_and_stale_cleanup_loop(ctx)),
-    ]
-    return tasks, http_server
-
-
 async def run():
     config = load_config()
 
+    # Create database directory if it doesn't exist
     db_path = config["storage"]["db_path"]
     db_dir = os.path.dirname(db_path)
     if db_dir:
@@ -1023,10 +842,28 @@ async def run():
     setup_logging(ctx)
 
     if config["shared_secret"] == "CHANGE_ME":
-        log.warning("shared_secret is still the default placeholder -- "
-                    "set SHARED_SECRET environment variable!")
+        log.warning("shared_secret is still the default placeholder -- set SHARED_SECRET environment variable!")
 
-    tasks, http_server = await start_services(ctx)
+    control_cfg = config["control"]
+    control_server = await asyncio.start_server(
+        lambda r, w: handle_control_connection(r, w, ctx),
+        control_cfg["host"], control_cfg["port"],
+    )
+    log.info("Control channel listening on %s:%s (tls=%s)",
+              control_cfg["host"], control_cfg["port"], control_cfg.get("tls", False))
+
+    http_cfg = config["http"]
+    http_server = await asyncio.start_server(
+        lambda r, w: handle_public_http_conn(r, w, ctx), http_cfg["host"], http_cfg["port"]
+    )
+    log.info("Public HTTP listening on %s:%s", http_cfg["host"], http_cfg["port"])
+
+    tasks = [
+        asyncio.create_task(control_server.serve_forever()),
+        asyncio.create_task(http_server.serve_forever()),
+        asyncio.create_task(dashboard_mod.serve_dashboard(ctx)),
+        asyncio.create_task(nonce_and_stale_cleanup_loop(ctx)),
+    ]
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -1036,15 +873,23 @@ async def run():
         stop_event.set()
 
     def _signal_handler(signum, frame):
+        # Signal handlers run on the main thread but outside the event
+        # loop's normal scheduling; call_soon_threadsafe is the correct,
+        # safe way to wake up a waiting coroutine from here. This works
+        # identically on POSIX and Windows (unlike loop.add_signal_handler,
+        # which raises NotImplementedError on Windows).
         try:
             loop.call_soon_threadsafe(_request_stop)
         except RuntimeError:
-            pass
+            pass  # loop already closed/closing
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             signal.signal(sig, _signal_handler)
         except (ValueError, OSError, AttributeError):
+            # ValueError: not called from the main thread.
+            # AttributeError: signal doesn't exist on this platform
+            #   (defensive; SIGINT/SIGTERM both exist on Windows and POSIX).
             pass
 
     await stop_event.wait()
@@ -1052,8 +897,14 @@ async def run():
     log.info("Shutting down...")
     for t in tasks:
         t.cancel()
+    for sessions in ctx.clients.values():
+        for session in sessions:
+            try:
+                session.writer.close()
+            except Exception:
+                pass
+    control_server.close()
     http_server.close()
-    await close_all_sessions(ctx)
     await asyncio.gather(*tasks, return_exceptions=True)
     ctx.storage.close()
     log.info("Shutdown complete")
@@ -1065,7 +916,12 @@ def main():
     except KeyboardInterrupt:
         pass
     except RuntimeError as e:
-        print("\nStartup failed: %s" % e, file=sys.stderr)
+        # RuntimeErrors raised during startup (missing certbot, disabled
+        # auto_provision with no cert present, etc.) are deliberately
+        # written to be read directly by the operator -- show just the
+        # message, not a full traceback, so the actionable part isn't
+        # buried under stack frames.
+        print(f"\nStartup failed: {e}", file=sys.stderr)
         sys.exit(1)
 
 

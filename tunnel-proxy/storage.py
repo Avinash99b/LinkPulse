@@ -61,17 +61,12 @@ class Storage:
     def upsert_client(self, client_id: str):
         now = time.time()
         with self._lock, self._conn:
-            # Portable upsert: INSERT OR IGNORE keeps first_seen; the UPDATE
-            # refreshes last_seen. (ON CONFLICT ... DO UPDATE requires a
-            # newer SQLite than some Python 3.7 builds ship.)
             self._conn.execute(
-                "INSERT OR IGNORE INTO clients(client_id, first_seen, last_seen) "
-                "VALUES (?, ?, ?)",
+                """
+                INSERT INTO clients(client_id, first_seen, last_seen) VALUES (?, ?, ?)
+                ON CONFLICT(client_id) DO UPDATE SET last_seen=excluded.last_seen
+                """,
                 (client_id, now, now),
-            )
-            self._conn.execute(
-                "UPDATE clients SET last_seen=? WHERE client_id=?",
-                (now, client_id),
             )
 
     def touch_client(self, client_id: str):
@@ -84,16 +79,17 @@ class Storage:
                      subdomain: Optional[str], remote_port: Optional[int]):
         now = time.time()
         with self._lock, self._conn:
-            # Portable upsert preserving created_at on re-registration.
             self._conn.execute(
-                "INSERT OR IGNORE INTO tunnels(tunnel_id, client_id, type, subdomain, "
-                "remote_port, created_at, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                """
+                INSERT INTO tunnels(tunnel_id, client_id, type, subdomain, remote_port, created_at, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(tunnel_id) DO UPDATE SET
+                    client_id=excluded.client_id,
+                    subdomain=excluded.subdomain,
+                    remote_port=excluded.remote_port,
+                    last_seen=excluded.last_seen
+                """,
                 (tunnel_id, client_id, ttype, subdomain, remote_port, now, now),
-            )
-            self._conn.execute(
-                "UPDATE tunnels SET client_id=?, type=?, subdomain=?, remote_port=?, "
-                "last_seen=? WHERE tunnel_id=?",
-                (client_id, ttype, subdomain, remote_port, now, tunnel_id),
             )
 
     def delete_tunnel(self, tunnel_id: str):
