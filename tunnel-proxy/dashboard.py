@@ -153,6 +153,8 @@ def build_stats(ctx) -> dict:
             for tid, t in list(session.tunnels.items()):
                 if t.type == "http":
                     public_address = f"http://{t.subdomain}.{ctx.config['wildcard_domain']}"
+                elif t.type == "udp":
+                    public_address = f"udp://{ctx.config['wildcard_domain']}:{t.remote_port}"
                 else:
                     public_address = f"tcp://{ctx.config['wildcard_domain']}:{t.remote_port}"
                 tunnels.append({
@@ -193,6 +195,17 @@ def build_stats(ctx) -> dict:
     }
 
 
+def build_response(ctx, path: str) -> tuple[int, bytes, str]:
+    """Return (status_code, body, content_type) for a dashboard request path."""
+    if path == "/health":
+        return 200, b"healthy\n", "text/plain"
+    if path.startswith("/api"):
+        return 200, json.dumps(build_stats(ctx)).encode(), "application/json"
+    if path == "/" or path == "/dashboard" or path.startswith("/dashboard/") or path.startswith("/?"):
+        return 200, _HTML.encode(), "text/html; charset=utf-8"
+    return 200, _HTML.encode(), "text/html; charset=utf-8"
+
+
 async def handle_dashboard_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, ctx):
     try:
         request_line = await asyncio.wait_for(reader.readline(), timeout=5)
@@ -208,25 +221,11 @@ async def handle_dashboard_conn(reader: asyncio.StreamReader, writer: asyncio.St
             writer.close()
             return
 
-        if path.startswith("/api/stats"):
-            body = json.dumps(build_stats(ctx)).encode()
-            content_type = "application/json"
-        elif path == "/" or path.startswith("/?"):
-            body = _HTML.encode()
-            content_type = "text/html; charset=utf-8"
-        else:
-            body = b"not found"
-            header = (
-                f"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n"
-                f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
-            ).encode()
-            writer.write(header + body)
-            await writer.drain()
-            writer.close()
-            return
-
+        status, body, content_type = build_response(ctx, path)
         header = (
-            f"HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n"
+            f"HTTP/1.1 {status} {'OK' if status == 200 else 'Not Found'}\r\n"
+            f"Content-Type: {content_type}\r\n"
+            f"Access-Control-Allow-Origin: *\r\n"
             f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
         ).encode()
         writer.write(header + body)

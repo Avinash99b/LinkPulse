@@ -24,6 +24,11 @@
     {
       "type": "tcp",
       "local": "5432"
+    },
+    {
+      "type": "udp",
+      "local": "127.0.0.1:5353",
+      "remote_port": 15353
     }
   ]
 }

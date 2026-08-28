@@ -84,6 +84,9 @@ class FrameType(enum.IntEnum):
     STREAM_CLOSE = 0x0B           # either direction: stream finished/aborted
     STREAM_WINDOW_UPDATE = 0x0C   # either direction: flow-control credit
 
+    # --- datagram (UDP) traffic ---------------------------------------------
+    UDP_DATAGRAM = 0x0E           # either direction: one complete UDP datagram
+
     # --- misc ---------------------------------------------------------------
     ERROR = 0x0D                  # either direction: generic error report
 

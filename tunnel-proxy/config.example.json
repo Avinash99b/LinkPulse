@@ -12,19 +12,34 @@
     "port": 80
   },
 
-  "wildcard_domain": "forwarding.example.com",
+  "https": {
+    "host": "0.0.0.0",
+    "port": 443
+  },
+
+  "wildcard_domain": "linkpulse.avinash9.in",
 
   "tcp": {
-    "port_range": [20000, 20100],
+    "port_range": [10000, 65535],
     "bind_host": "0.0.0.0"
   },
 
-  "dashboard": {
-    "host": "127.0.0.1",
-    "port": 8080
+  "udp": {
+    "port_range": [10000, 65535],
+    "bind_host": "0.0.0.0"
   },
 
-  "http_only": true,
+  "tls": {
+    "cert_path": "/etc/letsencrypt/live/linkpulse.avinash9.in/fullchain.pem",
+    "key_path": "/etc/letsencrypt/live/linkpulse.avinash9.in/privkey.pem"
+  },
+
+  "dashboard": {
+    "host": "0.0.0.0",
+    "port": 8081
+  },
+
+  "http_only": false,
 
   "heartbeat_interval_seconds": 20,
   "heartbeat_timeout_seconds": 60,

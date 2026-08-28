@@ -82,6 +82,7 @@ class FrameType(enum.IntEnum):
     STREAM_DATA = 0x0A
     STREAM_CLOSE = 0x0B
     STREAM_WINDOW_UPDATE = 0x0C
+    UDP_DATAGRAM = 0x0E
     ERROR = 0x0D
 
 
@@ -189,11 +190,11 @@ class FlowWindow:
 @dataclasses.dataclass
 class TunnelSpec:
     tunnel_id: str
-    type: str            # "http" | "tcp"
+    type: str            # "http" | "tcp" | "udp"
     local_host: str
     local_port: int
     subdomain: Optional[str] = None    # http only, requested
-    remote_port: Optional[int] = None  # tcp only, requested
+    remote_port: Optional[int] = None  # tcp/udp only, requested
 
 
 @dataclasses.dataclass
@@ -219,6 +220,7 @@ class ClientStream:
     tunnel_id: str
     local_reader: asyncio.StreamReader
     local_writer: asyncio.StreamWriter
+    udp_transport: object = None   # asyncio.DatagramTransport for udp streams
     send_window: FlowWindow = dataclasses.field(default_factory=FlowWindow)
     unacked_recv_bytes: int = 0
     closed: bool = False
@@ -457,7 +459,7 @@ class TunnelClient:
         req = {"tunnel_id": spec.tunnel_id, "type": spec.type}
         if spec.type == "http" and spec.subdomain:
             req["subdomain"] = spec.subdomain
-        if spec.type == "tcp" and spec.remote_port:
+        if spec.type in ("tcp", "udp") and spec.remote_port:
             req["remote_port"] = spec.remote_port
         await self._send(FrameType.TUNNEL_OPEN_REQUEST, CONTROL_STREAM_ID, json.dumps(req).encode())
 
@@ -485,6 +487,8 @@ class TunnelClient:
                 await self._route_stream_close(frame)
             elif frame.type == FrameType.STREAM_WINDOW_UPDATE:
                 self._handle_window_update(frame)
+            elif frame.type == FrameType.UDP_DATAGRAM:
+                await self._route_udp_datagram(frame)
             elif frame.type == FrameType.ERROR:
                 self._log(logging.WARNING, "Server error: %s", frame.payload[:200])
             else:
@@ -528,10 +532,11 @@ class TunnelClient:
             else:
                 port = resp.get("remote_port")
                 host = resp.get("public_host", self.server_host)
-                runtime.public_url = f"tcp://{host}:{port}"
+                scheme = "udp" if resp.get("type") == "udp" else "tcp"
+                runtime.public_url = f"{scheme}://{host}:{port}"
                 runtime.spec.remote_port = port
-                self._log(logging.INFO, "TCP tunnel ready: %s -> %s:%s",
-                          runtime.public_url, runtime.spec.local_host, runtime.spec.local_port)
+                self._log(logging.INFO, "%s tunnel ready: %s -> %s:%s",
+                          scheme.upper(), runtime.public_url, runtime.spec.local_host, runtime.spec.local_port)
         else:
             runtime.status = "error"
             runtime.error = resp.get("error", "unknown error")
@@ -548,8 +553,12 @@ class TunnelClient:
             self._log(logging.WARNING, "Malformed STREAM_OPEN: %r", frame.payload[:200])
             return
         tunnel_id = meta.get("tunnel_id")
+        proto = meta.get("proto", "tcp")
         self.pending_streams[frame.stream_id] = PendingStream(tunnel_id=tunnel_id)
-        asyncio.create_task(self._establish_stream(frame.stream_id, tunnel_id))
+        if proto == "udp":
+            asyncio.create_task(self._establish_udp_stream(frame.stream_id, tunnel_id))
+        else:
+            asyncio.create_task(self._establish_stream(frame.stream_id, tunnel_id))
 
     async def _establish_stream(self, stream_id: int, tunnel_id: str):
         runtime = self.tunnels.get(tunnel_id)
@@ -587,6 +596,96 @@ class TunnelClient:
 
         await self._pump_local_to_server(stream)
 
+    async def _establish_udp_stream(self, stream_id: int, tunnel_id: str):
+        runtime = self.tunnels.get(tunnel_id)
+        if runtime is None:
+            self.pending_streams.pop(stream_id, None)
+            await self._safe_send(FrameType.STREAM_CLOSE, stream_id)
+            return
+
+        spec = runtime.spec
+        loop = asyncio.get_running_loop()
+
+        class _UdpProtocol(asyncio.DatagramProtocol):
+            def __init__(self, client, sid):
+                self.client = client
+                self.sid = sid
+
+            def connection_made(self, transport):
+                stream = self.client.streams.get(self.sid)
+                if stream is not None:
+                    stream.udp_transport = transport
+                pending = self.client.pending_streams.pop(self.sid, None)
+                if pending:
+                    for payload in pending.buffered:
+                        self.client._udp_send_now(self.sid, payload)
+                    if pending.closed:
+                        asyncio.create_task(self.client._route_stream_close_now(
+                            self.client.streams.get(self.sid)))
+
+            def datagram_received(self, data, addr):
+                asyncio.create_task(self.client._udp_send_to_server(self.sid, data))
+
+            def error_received(self, exc):
+                self.client._log(logging.WARNING, "Local UDP %s:%s error for tunnel %s: %s",
+                                 spec.local_host, spec.local_port, tunnel_id[:8], exc)
+
+            def connection_lost(self, exc):
+                stream = self.client.streams.get(self.sid)
+                if stream is not None and not stream.closed:
+                    asyncio.create_task(self.client._route_stream_close_now(stream))
+
+        stream = ClientStream(stream_id=stream_id, tunnel_id=tunnel_id,
+                               local_reader=None, local_writer=None)
+        self.streams[stream_id] = stream
+        runtime.connection_count += 1
+
+        try:
+            await asyncio.wait_for(
+                loop.create_datagram_endpoint(lambda: _UdpProtocol(self, stream_id),
+                                              remote_addr=(spec.local_host, spec.local_port)),
+                timeout=10)
+        except (OSError, asyncio.TimeoutError) as e:
+            self._log(logging.WARNING, "Local UDP %s:%s unreachable for tunnel %s: %s",
+                      spec.local_host, spec.local_port, tunnel_id[:8], e)
+            self.streams.pop(stream_id, None)
+            self.pending_streams.pop(stream_id, None)
+            await self._safe_send(FrameType.STREAM_CLOSE, stream_id)
+            return
+
+    def _udp_send_now(self, stream_id: int, payload: bytes):
+        stream = self.streams.get(stream_id)
+        if stream is None or stream.closed or stream.udp_transport is None:
+            return
+        try:
+            stream.udp_transport.sendto(payload)
+        except (OSError, ConnectionError):
+            pass
+        runtime = self.tunnels.get(stream.tunnel_id)
+        if runtime is not None:
+            runtime.bytes_out += len(payload)
+
+    async def _udp_send_to_server(self, stream_id: int, payload: bytes):
+        stream = self.streams.get(stream_id)
+        if stream is None or stream.closed:
+            return
+        if not await self._safe_send(FrameType.UDP_DATAGRAM, stream_id, payload):
+            return
+        runtime = self.tunnels.get(stream.tunnel_id)
+        if runtime is not None:
+            runtime.bytes_in += len(payload)
+            runtime.latencies_ms.append(max(1.0, (time.time() - stream.opened_at) * 1000))
+
+    async def _route_udp_datagram(self, frame):
+        stream = self.streams.get(frame.stream_id)
+        if stream is not None:
+            self._udp_send_now(frame.stream_id, frame.payload)
+            return
+        pending = self.pending_streams.get(frame.stream_id)
+        if pending is not None:
+            pending.buffered.append(frame.payload)
+        # else: stream unknown to us (already closed on our side) -- ignore.
+
     async def _route_stream_data(self, frame):
         stream = self.streams.get(frame.stream_id)
         if stream is not None:
@@ -609,6 +708,11 @@ class TunnelClient:
     async def _route_stream_close_now(self, stream: ClientStream):
         self.streams.pop(stream.stream_id, None)
         stream.closed = True
+        if stream.udp_transport is not None:
+            try:
+                stream.udp_transport.close()
+            except Exception:
+                pass
         try:
             stream.local_writer.close()
         except Exception:
@@ -695,11 +799,12 @@ class TunnelClient:
         increment = int.from_bytes(frame.payload, "big")
         stream.send_window.replenish(increment)
 
-    async def _safe_send(self, ftype: int, stream_id: int, payload: bytes = b""):
+    async def _safe_send(self, ftype: int, stream_id: int, payload: bytes = b"") -> bool:
         try:
             await self._send(ftype, stream_id, payload)
+            return True
         except Exception:
-            pass
+            return False
 
     # -- snapshot for the dashboard -------------------------------------------
 
@@ -928,7 +1033,7 @@ async def serve_dashboard(client: TunnelClient, host: str, port: int, log: loggi
 # CLI
 # =============================================================================
 
-DEFAULT_SERVER = "127.0.0.1:80"
+DEFAULT_SERVER = "127.0.0.1:9000"
 DEFAULT_DASHBOARD = "127.0.0.1:4040"
 DEFAULT_GRACE_TIME = 10.0
 DEFAULT_STATE_FILE = Path.home() / ".my_proxy" / "state.json"
@@ -1009,6 +1114,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     tcp_p.add_argument("target", help="local port (e.g. 22) or host:port")
     tcp_p.add_argument("--remote-port", type=int, help="request a specific public port")
 
+    udp_p = sub.add_parser("udp", parents=[common], help="expose a local UDP service")
+    udp_p.add_argument("target", help="local port (e.g. 53) or host:port")
+    udp_p.add_argument("--remote-port", type=int, help="request a specific public port")
+
     start_p = sub.add_parser("start", parents=[common],
                               help="open multiple tunnels at once from a config file")
     start_p.add_argument("config", help="path to a JSON file listing tunnels (see config.example.json)")
@@ -1046,6 +1155,10 @@ def _load_start_config(path: str, cli_args: argparse.Namespace) -> tuple[list[Tu
                                      subdomain=t.get("subdomain")))
         elif ttype == "tcp":
             specs.append(TunnelSpec(tunnel_id=new_tunnel_id(), type="tcp",
+                                     local_host=host, local_port=port,
+                                     remote_port=t.get("remote_port")))
+        elif ttype == "udp":
+            specs.append(TunnelSpec(tunnel_id=new_tunnel_id(), type="udp",
                                      local_host=host, local_port=port,
                                      remote_port=t.get("remote_port")))
         else:
@@ -1141,6 +1254,10 @@ async def _async_main(args: argparse.Namespace):
     elif args.command == "tcp":
         host, port = _parse_target(args.target)
         specs = [TunnelSpec(tunnel_id=new_tunnel_id(), type="tcp",
+                             local_host=host, local_port=port, remote_port=args.remote_port)]
+    elif args.command == "udp":
+        host, port = _parse_target(args.target)
+        specs = [TunnelSpec(tunnel_id=new_tunnel_id(), type="udp",
                              local_host=host, local_port=port, remote_port=args.remote_port)]
     elif args.command == "start":
         specs, args = _load_start_config(args.config, args)

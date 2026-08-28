@@ -44,6 +44,7 @@ import re
 import secrets
 import signal
 import socket
+import ssl
 import sys
 import time
 from collections import deque
@@ -107,10 +108,12 @@ class FlowWindow:
 @dataclass
 class StreamState:
     """One multiplexed logical connection (one HTTP request-connection or
-    one raw TCP connection) riding on a client's control connection."""
+    one raw TCP connection, or one UDP peer) riding on a client's control
+    connection."""
     stream_id: int
     tunnel_id: str
-    public_writer: asyncio.StreamWriter
+    public_writer: asyncio.StreamWriter  # None for UDP streams
+    udp_remote_addr: Optional[tuple] = None  # (ip, port) for UDP streams
     send_window: FlowWindow = field(default_factory=FlowWindow)
     unacked_recv_bytes: int = 0
     closed: bool = False
@@ -121,10 +124,12 @@ class StreamState:
 @dataclass
 class TunnelInfo:
     tunnel_id: str
-    type: str  # "http" | "tcp"
+    type: str  # "http" | "tcp" | "udp"
     subdomain: Optional[str] = None
     remote_port: Optional[int] = None
     tcp_server: Optional[asyncio.base_events.Server] = None
+    udp_sock: Optional[socket.socket] = None
+    udp_streams: Optional[dict] = None  # remote addr -> stream_id
     connection_count: int = 0
     bytes_in: int = 0
     bytes_out: int = 0
@@ -170,6 +175,7 @@ class ServerContext:
         self.clients: dict[str, set[ClientSession]] = {}
         self.by_subdomain: dict[str, tuple[ClientSession, str]] = {}
         self.by_port: dict[int, tuple[ClientSession, str]] = {}
+        self.by_udp_port: dict[int, tuple[ClientSession, str]] = {}
         self.seen_nonces: dict[bytes, int] = {}
         self.start_time = time.time()
         self.recent_logs: deque[str] = deque(maxlen=200)
@@ -185,12 +191,18 @@ class ServerContext:
 
 DEFAULT_CONFIG = {
     "shared_secret": "CHANGE_ME",
-    "control": {"host": "0.0.0.0", "port": 9001, "tls": False},
-    "http": {"host": "0.0.0.0", "port": 8080},
-    "wildcard_domain": "forwarding.example.com",
-    "tcp": {"port_range": [20000, 20100]},
+    "control": {"host": "0.0.0.0", "port": 9000, "tls": False},
+    "http": {"host": "0.0.0.0", "port": 80},
+    "https": {"host": "0.0.0.0", "port": 443},
+    "wildcard_domain": "linkpulse.avinash9.in",
+    "tcp": {"port_range": [10000, 65535], "bind_host": "0.0.0.0"},
+    "udp": {"port_range": [10000, 65535], "bind_host": "0.0.0.0"},
     "dashboard": {"host": "0.0.0.0", "port": 8081},
-    "http_only": True,
+    "http_only": False,
+    "tls": {
+        "cert_path": "/etc/letsencrypt/live/linkpulse.avinash9.in/fullchain.pem",
+        "key_path": "/etc/letsencrypt/live/linkpulse.avinash9.in/privkey.pem",
+    },
     "heartbeat_interval_seconds": 20,
     "heartbeat_timeout_seconds": 60,
     "stale_grace_seconds": 300,
@@ -202,13 +214,13 @@ DEFAULT_CONFIG = {
 def load_config() -> dict:
     """Load configuration from environment variables with defaults."""
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
-    
+
     # Required environment variables
     if "SHARED_SECRET" in os.environ:
         cfg["shared_secret"] = os.environ["SHARED_SECRET"]
     if "WILDCARD_DOMAIN" in os.environ:
         cfg["wildcard_domain"] = os.environ["WILDCARD_DOMAIN"]
-    
+
     # Optional environment variables with defaults
     if "CONTROL_HOST" in os.environ:
         cfg["control"]["host"] = os.environ["CONTROL_HOST"]
@@ -218,10 +230,22 @@ def load_config() -> dict:
         cfg["http"]["host"] = os.environ["HTTP_HOST"]
     if "HTTP_PORT" in os.environ:
         cfg["http"]["port"] = int(os.environ["HTTP_PORT"])
+    if "HTTPS_HOST" in os.environ:
+        cfg["https"]["host"] = os.environ["HTTPS_HOST"]
+    if "HTTPS_PORT" in os.environ:
+        cfg["https"]["port"] = int(os.environ["HTTPS_PORT"])
     if "TCP_PORT_MIN" in os.environ:
         cfg["tcp"]["port_range"][0] = int(os.environ["TCP_PORT_MIN"])
     if "TCP_PORT_MAX" in os.environ:
         cfg["tcp"]["port_range"][1] = int(os.environ["TCP_PORT_MAX"])
+    if "UDP_PORT_MIN" in os.environ:
+        cfg["udp"]["port_range"][0] = int(os.environ["UDP_PORT_MIN"])
+    if "UDP_PORT_MAX" in os.environ:
+        cfg["udp"]["port_range"][1] = int(os.environ["UDP_PORT_MAX"])
+    if "CERT_PATH" in os.environ:
+        cfg["tls"]["cert_path"] = os.environ["CERT_PATH"]
+    if "KEY_PATH" in os.environ:
+        cfg["tls"]["key_path"] = os.environ["KEY_PATH"]
     if "DASHBOARD_HOST" in os.environ:
         cfg["dashboard"]["host"] = os.environ["DASHBOARD_HOST"]
     if "DASHBOARD_PORT" in os.environ:
@@ -240,7 +264,12 @@ def load_config() -> dict:
         cfg["logging"]["level"] = os.environ["LOG_LEVEL"]
     if "LOG_FILE" in os.environ:
         cfg["logging"]["file"] = os.environ["LOG_FILE"]
-    
+
+    # Default TLS paths follow the wildcard domain if not overridden
+    if "CERT_PATH" not in os.environ:
+        cfg["tls"]["cert_path"] = f"/etc/letsencrypt/live/{cfg['wildcard_domain']}/fullchain.pem"
+        cfg["tls"]["key_path"] = f"/etc/letsencrypt/live/{cfg['wildcard_domain']}/privkey.pem"
+
     return cfg
 
 
@@ -262,8 +291,8 @@ class DequeLogHandler(logging.Handler):
 # Port / subdomain allocation
 # =============================================================================
 
-def _port_is_bindable(port: int) -> bool:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+def _port_is_bindable(port: int, socktype: int = socket.SOCK_STREAM) -> bool:
+    s = socket.socket(socket.AF_INET, socktype)
     if sys.platform == "win32":
         # On Windows, SO_REUSEADDR permits binding to a port that's already
         # in LISTEN state elsewhere (unlike POSIX, where it only affects
@@ -288,12 +317,25 @@ def _port_is_bindable(port: int) -> bool:
 def allocate_tcp_port(ctx: ServerContext, preferred: Optional[int] = None) -> Optional[int]:
     lo, hi = ctx.config["tcp"]["port_range"]
     if preferred is not None and lo <= preferred <= hi and preferred not in ctx.by_port:
-        if _port_is_bindable(preferred):
+        if _port_is_bindable(preferred, socket.SOCK_STREAM):
             return preferred
     candidates = [p for p in range(lo, hi + 1) if p not in ctx.by_port]
     random.shuffle(candidates)
     for p in candidates:
-        if _port_is_bindable(p):
+        if _port_is_bindable(p, socket.SOCK_STREAM):
+            return p
+    return None
+
+
+def allocate_udp_port(ctx: ServerContext, preferred: Optional[int] = None) -> Optional[int]:
+    lo, hi = ctx.config["udp"]["port_range"]
+    if preferred is not None and lo <= preferred <= hi and preferred not in ctx.by_udp_port:
+        if _port_is_bindable(preferred, socket.SOCK_DGRAM):
+            return preferred
+    candidates = [p for p in range(lo, hi + 1) if p not in ctx.by_udp_port]
+    random.shuffle(candidates)
+    for p in candidates:
+        if _port_is_bindable(p, socket.SOCK_DGRAM):
             return p
     return None
 
@@ -428,7 +470,35 @@ async def send_http_error(writer: asyncio.StreamWriter, status: int, reason: str
             pass
 
 
-async def handle_public_http_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, ctx: ServerContext):
+def is_root_domain(host: str, wildcard_domain: str) -> bool:
+    h = host.lower()
+    w = wildcard_domain.lower()
+    return h == w or h in ("localhost", "127.0.0.1")
+
+
+async def send_server_response(writer: asyncio.StreamWriter, ctx: ServerContext, req_path: str):
+    status, body, content_type = dashboard_mod.build_response(ctx, req_path)
+    status_text = "OK" if status == 200 else "Not Found"
+    resp = (
+        f"HTTP/1.1 {status} {status_text}\r\n"
+        f"Content-Type: {content_type}\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        f"Access-Control-Allow-Origin: *\r\n"
+        f"Connection: close\r\n\r\n"
+    ).encode() + body
+    try:
+        writer.write(resp)
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
+async def handle_public_http_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, ctx: ServerContext, is_https: bool = False):
     peer = writer.get_extra_info("peername") or ("?", 0)
     try:
         header_bytes = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=10)
@@ -436,19 +506,44 @@ async def handle_public_http_conn(reader: asyncio.StreamReader, writer: asyncio.
         writer.close()
         return
 
-    # Health check endpoint - respond before Host validation
-    if header_bytes.startswith(b"GET /health "):
-        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 7\r\n\r\nhealthy\n")
-        await writer.drain()
-        writer.close()
-        return
+    # Extract the request path for redirect/dashboard handling
+    try:
+        request_line = header_bytes.split(b"\r\n", 1)[0].decode(errors="replace")
+        parts = request_line.split()
+        req_path = parts[1] if len(parts) >= 2 else "/"
+        method = parts[0] if parts else "GET"
+    except Exception:
+        req_path = "/"
+        method = "GET"
 
     host = extract_host(header_bytes)
     if not host:
         await send_http_error(writer, 400, "Bad Request (missing Host header)")
         return
 
-    subdomain = host.split("." + ctx.config["wildcard_domain"])[0] if host.endswith(ctx.config["wildcard_domain"]) else host
+    # Only answer as proxy server/dashboard if request is targeting the root configured domain (or localhost/127.0.0.1).
+    if is_root_domain(host, ctx.config["wildcard_domain"]):
+        if not is_https and not ctx.config.get("http_only") and _load_ssl_context(ctx.config) is not None:
+            redirect = f"https://{host}{req_path}"
+            resp = (
+                f"HTTP/1.1 301 Moved Permanently\r\nLocation: {redirect}\r\n"
+                f"Content-Length: 0\r\nConnection: close\r\n\r\n"
+            ).encode()
+            try:
+                writer.write(resp)
+                await writer.drain()
+            except Exception:
+                pass
+            writer.close()
+            return
+        await send_server_response(writer, ctx, req_path)
+        return
+
+    wildcard = ctx.config["wildcard_domain"].lower()
+    if host.endswith("." + wildcard):
+        subdomain = host[:-len("." + wildcard)]
+    else:
+        subdomain = host
 
     entry = ctx.by_subdomain.get(subdomain)
     if not entry:
@@ -489,6 +584,72 @@ async def handle_public_tcp_conn(reader: asyncio.StreamReader, writer: asyncio.S
 
 
 # =============================================================================
+# UDP public listener (one per registered UDP tunnel)
+# =============================================================================
+
+async def handle_udp_public_datagram(session: ClientSession, tunnel: TunnelInfo,
+                                     data: bytes, remote_addr: tuple, ctx: ServerContext):
+    """Forward one inbound public UDP datagram to the owning client.
+
+    Each distinct public peer (remote_addr) gets its own multiplexed stream
+    so replies can be routed back to the correct address."""
+    sid = tunnel.udp_streams.get(remote_addr)
+    stream = session.streams.get(sid) if sid is not None else None
+
+    if sid is None or stream is None:
+        sid = session.alloc_stream_id()
+        stream = StreamState(stream_id=sid, tunnel_id=tunnel.tunnel_id, public_writer=None,
+                             udp_remote_addr=remote_addr)
+        session.streams[sid] = stream
+        tunnel.udp_streams[remote_addr] = sid
+        tunnel.connection_count += 1
+        meta = json.dumps({
+            "tunnel_id": tunnel.tunnel_id,
+            "proto": "udp",
+            "remote_addr": f"{remote_addr[0]}:{remote_addr[1]}",
+        }).encode()
+        try:
+            await session.send_frame(FrameType.STREAM_OPEN, sid, meta)
+        except Exception:
+            session.streams.pop(sid, None)
+            tunnel.udp_streams.pop(remote_addr, None)
+            return
+
+    if data:
+        try:
+            await send_stream_data(session, stream, data)
+        except Exception:
+            pass
+
+
+async def serve_udp_tunnel(session: ClientSession, tunnel: TunnelInfo, ctx: ServerContext,
+                           bind_host: str, port: int):
+    """Bind a UDP socket for a tunnel and pump datagrams to the client."""
+    loop = asyncio.get_running_loop()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setblocking(False)
+    try:
+        sock.bind((bind_host, port))
+    except OSError as e:
+        log.error("UDP bind failed on %s:%s: %s", bind_host, port, e)
+        return
+    tunnel.udp_sock = sock
+    try:
+        while session.alive and tunnel.tunnel_id in session.tunnels:
+            try:
+                data, remote_addr = await loop.sock_recvfrom(sock, MAX_FRAME_PAYLOAD)
+            except (OSError, ConnectionError):
+                break
+            await handle_udp_public_datagram(session, tunnel, data, remote_addr, ctx)
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+# =============================================================================
 # Control-connection: tunnel lifecycle handlers
 # =============================================================================
 
@@ -503,8 +664,8 @@ async def handle_tunnel_open(session: ClientSession, frame, ctx: ServerContext):
     tunnel_id = req.get("tunnel_id") or secrets.token_hex(8)
     ttype = req.get("type")
 
-    if ttype not in ("http", "tcp"):
-        resp = {"tunnel_id": tunnel_id, "status": "error", "error": "type must be 'http' or 'tcp'"}
+    if ttype not in ("http", "tcp", "udp"):
+        resp = {"tunnel_id": tunnel_id, "status": "error", "error": "type must be 'http', 'tcp' or 'udp'"}
         await session.send_frame(FrameType.TUNNEL_OPEN_RESPONSE, CONTROL_STREAM_ID, json.dumps(resp).encode())
         return
 
@@ -522,11 +683,12 @@ async def handle_tunnel_open(session: ClientSession, frame, ctx: ServerContext):
         ctx.by_subdomain[subdomain] = (session, tunnel_id)
         ctx.storage.save_tunnel(tunnel_id, session.client_id, "http", subdomain, None)
 
-        public_url = f"http://{subdomain}.{ctx.config['wildcard_domain']}"
+        scheme = "https" if not ctx.config.get("http_only") else "http"
+        public_url = f"{scheme}://{subdomain}.{ctx.config['wildcard_domain']}"
         resp = {"tunnel_id": tunnel_id, "status": "ok", "type": "http", "public_url": public_url}
         ctx.log_event(f"Client {session.client_id[:8]} opened HTTP tunnel {public_url}")
 
-    else:  # tcp
+    elif ttype == "tcp":
         preferred = req.get("remote_port")
         port = allocate_tcp_port(ctx, preferred)
         if port is None:
@@ -553,6 +715,26 @@ async def handle_tunnel_open(session: ClientSession, frame, ctx: ServerContext):
                 "remote_port": port, "public_host": ctx.config["wildcard_domain"]}
         ctx.log_event(f"Client {session.client_id[:8]} opened TCP tunnel on port {port}")
 
+    else:  # udp
+        preferred = req.get("remote_port")
+        port = allocate_udp_port(ctx, preferred)
+        if port is None:
+            resp = {"tunnel_id": tunnel_id, "status": "error", "error": "no UDP ports available"}
+            await session.send_frame(FrameType.TUNNEL_OPEN_RESPONSE, CONTROL_STREAM_ID, json.dumps(resp).encode())
+            return
+
+        tunnel = TunnelInfo(tunnel_id=tunnel_id, type="udp", remote_port=port, udp_streams={})
+        session.tunnels[tunnel_id] = tunnel
+        ctx.by_udp_port[port] = (session, tunnel_id)
+        ctx.storage.save_tunnel(tunnel_id, session.client_id, "udp", None, port)
+
+        bind_host = ctx.config["udp"].get("bind_host", "0.0.0.0")
+        asyncio.create_task(serve_udp_tunnel(session, tunnel, ctx, bind_host, port))
+
+        resp = {"tunnel_id": tunnel_id, "status": "ok", "type": "udp",
+                "remote_port": port, "public_host": ctx.config["wildcard_domain"]}
+        ctx.log_event(f"Client {session.client_id[:8]} opened UDP tunnel on port {port}")
+
     await session.send_frame(FrameType.TUNNEL_OPEN_RESPONSE, CONTROL_STREAM_ID, json.dumps(resp).encode())
 
 
@@ -571,6 +753,18 @@ async def close_tunnel(session: ClientSession, tunnel_id: str, ctx: ServerContex
                 await tunnel.tcp_server.wait_closed()
             except Exception:
                 pass
+    if tunnel.type == "udp":
+        if tunnel.remote_port is not None:
+            ctx.by_udp_port.pop(tunnel.remote_port, None)
+        if tunnel.udp_sock is not None:
+            try:
+                tunnel.udp_sock.close()
+            except Exception:
+                pass
+        # Abort any in-flight UDP streams belonging to this tunnel.
+        for sid, stream in list(session.streams.items()):
+            if stream.tunnel_id == tunnel_id:
+                session.streams.pop(sid, None)
     ctx.storage.delete_tunnel(tunnel_id)
     # Abort any in-flight streams belonging to this tunnel.
     for sid, stream in list(session.streams.items()):
@@ -636,9 +830,32 @@ async def handle_stream_close_from_client(session: ClientSession, frame, ctx: Se
     if stream is None:
         return
     stream.closed = True
+    if stream.udp_remote_addr is not None:
+        tunnel = session.tunnels.get(stream.tunnel_id)
+        if tunnel is not None and tunnel.udp_streams is not None:
+            tunnel.udp_streams.pop(stream.udp_remote_addr, None)
     try:
         stream.public_writer.close()
     except Exception:
+        pass
+
+
+async def handle_udp_datagram_from_client(session: ClientSession, frame, ctx: ServerContext):
+    """Client -> server: forward a datagram to the public UDP peer."""
+    stream = session.streams.get(frame.stream_id)
+    if stream is None or stream.udp_remote_addr is None:
+        return  # unknown stream or not a UDP stream; ignore
+    tunnel = session.tunnels.get(stream.tunnel_id)
+    if tunnel is None or tunnel.udp_sock is None:
+        return
+    n = len(frame.payload)
+    stream.bytes_out += n
+    session.bytes_out += n
+    if tunnel:
+        tunnel.bytes_out += n
+    try:
+        await asyncio.get_running_loop().sock_sendto(tunnel.udp_sock, frame.payload, stream.udp_remote_addr)
+    except (OSError, ConnectionError):
         pass
 
 
@@ -673,6 +890,8 @@ async def client_loop(session: ClientSession, ctx: ServerContext):
             await handle_stream_close_from_client(session, frame, ctx)
         elif frame.type == FrameType.STREAM_WINDOW_UPDATE:
             handle_window_update(session, frame)
+        elif frame.type == FrameType.UDP_DATAGRAM:
+            await handle_udp_datagram_from_client(session, frame, ctx)
         elif frame.type == FrameType.ERROR:
             log.warning("Client %s reported error: %s", session.client_id[:8], frame.payload[:200])
         else:
@@ -829,20 +1048,64 @@ def setup_logging(ctx: ServerContext):
     root.addHandler(dq)
 
 
+def _load_ssl_context(config: dict) -> Optional[ssl.SSLContext]:
+    """Load the TLS context from cert files. Returns None if unavailable."""
+    if config.get("http_only"):
+        return None
+    tls = config["tls"]
+    cert_path, key_path = tls.get("cert_path"), tls.get("key_path")
+    if not cert_path or not key_path:
+        return None
+    if not (os.path.isfile(cert_path) and os.path.isfile(key_path)):
+        log.warning("TLS certificates not found (%s / %s) -- serving HTTP only. "
+                    "Provision them with certbot or set HTTP_ONLY=true.",
+                    cert_path, key_path)
+        return None
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert_path, key_path)
+        return ctx
+    except (ssl.SSLError, OSError) as e:
+        log.warning("Could not load TLS certificates: %s -- serving HTTP only.", e)
+        return None
+
+
+async def cert_reload_loop(ctx: ServerContext, ssl_ctx: ssl.SSLContext):
+    """Reload TLS certs in place when certbot renews them."""
+    tls = ctx.config["tls"]
+    cert_path, key_path = tls.get("cert_path"), tls.get("key_path")
+    last_mtime = -1.0
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            m = max(os.path.getmtime(cert_path), os.path.getmtime(key_path))
+        except OSError:
+            continue
+        if m != last_mtime:
+            try:
+                ssl_ctx.load_cert_chain(cert_path, key_path)
+                last_mtime = m
+                log.info("TLS certificates reloaded (renewal)")
+            except (ssl.SSLError, OSError) as e:
+                log.warning("TLS cert reload failed: %s", e)
+
+
 async def run():
     config = load_config()
-    
+
     # Create database directory if it doesn't exist
     db_path = config["storage"]["db_path"]
     db_dir = os.path.dirname(db_path)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
-    
+
     ctx = ServerContext(config)
     setup_logging(ctx)
 
     if config["shared_secret"] == "CHANGE_ME":
         log.warning("shared_secret is still the default placeholder -- set SHARED_SECRET environment variable!")
+
+    ssl_ctx = _load_ssl_context(config)
 
     control_cfg = config["control"]
     control_server = await asyncio.start_server(
@@ -854,16 +1117,32 @@ async def run():
 
     http_cfg = config["http"]
     http_server = await asyncio.start_server(
-        lambda r, w: handle_public_http_conn(r, w, ctx), http_cfg["host"], http_cfg["port"]
+        lambda r, w: handle_public_http_conn(r, w, ctx, is_https=False), http_cfg["host"], http_cfg["port"]
     )
     log.info("Public HTTP listening on %s:%s", http_cfg["host"], http_cfg["port"])
 
     tasks = [
         asyncio.create_task(control_server.serve_forever()),
         asyncio.create_task(http_server.serve_forever()),
-        asyncio.create_task(dashboard_mod.serve_dashboard(ctx)),
         asyncio.create_task(nonce_and_stale_cleanup_loop(ctx)),
     ]
+
+    https_server = None
+    if ssl_ctx is not None:
+        https_cfg = config["https"]
+        https_server = await asyncio.start_server(
+            lambda r, w: handle_public_http_conn(r, w, ctx, is_https=True),
+            https_cfg["host"], https_cfg["port"], ssl=ssl_ctx,
+        )
+        log.info("Public HTTPS listening on %s:%s", https_cfg["host"], https_cfg["port"])
+        tasks.append(asyncio.create_task(https_server.serve_forever()))
+        tasks.append(asyncio.create_task(cert_reload_loop(ctx, ssl_ctx)))
+        log.info("Dashboard available at https://%s/ (apex domain only)",
+                 config["wildcard_domain"])
+    else:
+        log.info("Dashboard available at http://%s:%s (HTTP-only mode)",
+                 config["dashboard"]["host"], config["dashboard"]["port"])
+        tasks.append(asyncio.create_task(dashboard_mod.serve_dashboard(ctx)))
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -905,6 +1184,8 @@ async def run():
                 pass
     control_server.close()
     http_server.close()
+    if https_server is not None:
+        https_server.close()
     await asyncio.gather(*tasks, return_exceptions=True)
     ctx.storage.close()
     log.info("Shutdown complete")
