@@ -968,12 +968,19 @@ async def handle_control_connection(reader: asyncio.StreamReader, writer: asynci
         writer.close()
         return
 
-    # If this client_id already has live sessions, keep them (support multiple connections per client_id)
-    existing_sessions = ctx.clients.get(client_id, set())
+    # If this client_id already has live sessions, evict them first.
+    # This handles the reconnect race: the client reconnects (e.g. after a
+    # network blip) before the heartbeat timer has killed the old session,
+    # so the old session's tunnels/subdomains are still registered.  If we
+    # don't clean them up here, the client's TUNNEL_OPEN_REQUEST for the
+    # same subdomain will fail with "subdomain already in use".
+    existing_sessions = ctx.clients.pop(client_id, set())
+    for old_session in list(existing_sessions):
+        log.info("Evicting stale session for client %s (new connection arrived)", client_id[:8])
+        await cleanup_client(old_session, ctx)
 
     session = ClientSession(client_id, reader, writer)
-    existing_sessions.add(session)
-    ctx.clients[client_id] = existing_sessions
+    ctx.clients[client_id] = {session}
     ctx.storage.upsert_client(client_id)
 
     resp = json.dumps({
@@ -984,9 +991,7 @@ async def handle_control_connection(reader: asyncio.StreamReader, writer: asynci
     try:
         await session.send_frame(FrameType.HELLO_OK, CONTROL_STREAM_ID, resp)
     except Exception:
-        existing_sessions.discard(session)
-        if not existing_sessions:
-            ctx.clients.pop(client_id, None)
+        ctx.clients.pop(client_id, None)
         return
 
     ctx.log_event(f"Client {client_id[:8]} connected from {addr[0]}")

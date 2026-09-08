@@ -16,9 +16,26 @@ CF_API_TOKEN="${CF_API_TOKEN:-}"
 # Ensure all writable dirs exist and belong to tunnelproxy.
 mkdir -p /data \
     /var/log/tunnel-proxy \
-    /etc/letsencrypt \
     /var/lib/letsencrypt \
     /var/www/letsencrypt
+
+# Persist letsencrypt data on the mounted volume so certificates survive
+# container rebuilds/restarts.  /data is the persistent volume; we store
+# certs under /data/letsencrypt and symlink /etc/letsencrypt to it.
+mkdir -p /data/letsencrypt
+
+# If /etc/letsencrypt already exists as a real directory (first run after
+# image build), migrate any contents into the persistent location.
+if [ -d /etc/letsencrypt ] && [ ! -L /etc/letsencrypt ]; then
+    # Copy existing contents (e.g. from a prior certbot run inside the image)
+    cp -a /etc/letsencrypt/. /data/letsencrypt/ 2>/dev/null || true
+    rm -rf /etc/letsencrypt
+fi
+
+# Create symlink so certbot and the server both use the persistent path.
+if [ ! -L /etc/letsencrypt ]; then
+    ln -sf /data/letsencrypt /etc/letsencrypt
+fi
 
 chown -R tunnelproxy:tunnelproxy \
     /data \
@@ -88,6 +105,58 @@ EOF
     fi
 
     if [ "$NEED_RENEWAL" = "true" ]; then
+        # Verify DNS records are pointing correctly before spending a certbot
+        # attempt (avoids wasting Let's Encrypt rate-limit quota).
+        # Check that the apex domain resolves.  We can't resolve wildcard
+        # records directly from the shell, but if the apex resolves we know
+        # the DNS zone is configured; certbot's DNS challenge will handle
+        # the actual _acme-challenge TXT record via the plugin.
+        echo "Checking DNS records for $WILDCARD_DOMAIN..."
+        DNS_OK=true
+
+        # Use Python (always present) to resolve -- more portable than dig/nslookup
+        APEX_IP=$(python3 -c "
+import socket, sys
+try:
+    result = socket.getaddrinfo('$WILDCARD_DOMAIN', None)
+    print(result[0][4][0])
+except Exception:
+    sys.exit(1)
+" 2>/dev/null) || true
+
+        TEST_SUB_IP=$(python3 -c "
+import socket, sys
+try:
+    result = socket.getaddrinfo('_dns-check.$WILDCARD_DOMAIN', None)
+    print(result[0][4][0])
+except Exception:
+    sys.exit(1)
+" 2>/dev/null) || true
+
+        if [ -z "$APEX_IP" ]; then
+            echo "WARNING: $WILDCARD_DOMAIN does not resolve (no A/AAAA record found)."
+            echo "  -> Add an A record for $WILDCARD_DOMAIN pointing to this server's IP."
+            DNS_OK=false
+        else
+            echo "  $WILDCARD_DOMAIN -> $APEX_IP"
+        fi
+
+        if [ -z "$TEST_SUB_IP" ]; then
+            echo "WARNING: *.$WILDCARD_DOMAIN does not resolve (no wildcard DNS record found)."
+            echo "  -> Add a wildcard A record *.${WILDCARD_DOMAIN} pointing to this server's IP."
+            DNS_OK=false
+        else
+            echo "  *.$WILDCARD_DOMAIN -> $TEST_SUB_IP"
+        fi
+
+        if [ "$DNS_OK" = "false" ]; then
+            echo "WARNING: DNS records are not fully configured. Certbot will still attempt"
+            echo "  provisioning (the DNS plugin creates TXT records automatically), but"
+            echo "  tunnels won't work until the A/AAAA records point to this server."
+        else
+            echo "DNS records look good."
+        fi
+
         echo "Requesting/renewing certificate for *.$WILDCARD_DOMAIN and $WILDCARD_DOMAIN..."
 
         CERTBOT_ARGS="certonly --non-interactive --agree-tos --email $CERTBOT_EMAIL \

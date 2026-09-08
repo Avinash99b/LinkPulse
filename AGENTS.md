@@ -52,11 +52,11 @@ python3 my_proxy.py start tunnels.json --token <secret>
 
 - **Protocol**: Binary framed (12-byte header + payload), HMAC-SHA256 challenge-response auth, per-stream credit-based flow control (256 KiB windows), multiplexed over single TCP connection
 - **Server ports**: 
-  - `:80` (HAProxy → nginx :8088 → proxy_server :8080 for HTTP tunnels + dashboard)
-  - `:9000` (nginx stream → proxy_server :9001 for control channel)
-- **Container**: supervisord runs `proxy_server.py` + nginx + haproxy in one container
-- **entrypoint.sh** runs as root to `chown` mounted volumes, then drops to `tunnelproxy` user
-- **Certificates**: Handled externally (Render/Cloudflare/nginx) — container is HTTP-only on port 80
+  - `:80` (HTTP) / `:443` (HTTPS) for HTTP tunnels + dashboard
+  - `:9000` for control channel
+- **Container**: direct `proxy_server.py` execution managed by `entrypoint.sh`
+- **entrypoint.sh** runs as root to `chown` mounted volumes and handle certbot SSL provision, then runs `proxy_server.py`
+- **Certificates**: Handled directly by certbot (Cloudflare/DNS challenge) inside container or external SSL
 
 ---
 
@@ -90,8 +90,8 @@ curl https://<subdomain>.tunnel.example.com/
 
 ## Common Gotchas
 
-1. **Control channel port**: Client connects to **port 9000** (nginx stream), not the internal :9001
-2. **Two public ports**: 80 (HTTP) and 9000 (raw TCP control) — cloud platforms (Render) terminate HTTPS at edge and forward HTTP to :80; control channel needs raw TCP
+1. **Control channel port**: Client connects directly to **port 9000**
+2. **Two public ports**: 80/443 (HTTP/HTTPS) and 9000 (raw TCP control)
 3. **Shared secret mismatch** → "Authentication failed: invalid signature"
 4. **Windows Ctrl+C**: Fixed in current version (uses `signal.signal()` not `loop.add_signal_handler()`)
 5. **DNS**: Wildcard `*.WILDCARD_DOMAIN` must resolve to server IP
