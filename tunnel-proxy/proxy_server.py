@@ -672,6 +672,19 @@ async def handle_tunnel_open(session: ClientSession, frame, ctx: ServerContext):
     if ttype == "http":
         requested = req.get("subdomain")
         subdomain = allocate_subdomain(ctx, requested)
+        if subdomain is None and requested:
+            # The subdomain is taken -- but if it belongs to a *different
+            # session* of the SAME client_id, the old session is stale
+            # (the client reconnected).  Reclaim the tunnel from the old
+            # session so the new one can have it.
+            existing = ctx.by_subdomain.get(requested.lower())
+            if existing is not None:
+                old_session, old_tunnel_id = existing
+                if old_session.client_id == session.client_id and old_session is not session:
+                    log.info("Reclaiming subdomain '%s' from stale session of client %s",
+                             requested, session.client_id[:8])
+                    await close_tunnel(old_session, old_tunnel_id, ctx)
+                    subdomain = allocate_subdomain(ctx, requested)
         if subdomain is None:
             reason = "subdomain already in use" if requested else "could not allocate a subdomain"
             resp = {"tunnel_id": tunnel_id, "status": "error", "error": reason}
@@ -691,6 +704,16 @@ async def handle_tunnel_open(session: ClientSession, frame, ctx: ServerContext):
     elif ttype == "tcp":
         preferred = req.get("remote_port")
         port = allocate_tcp_port(ctx, preferred)
+        if port is None and preferred is not None:
+            # Port taken -- reclaim from stale session of same client_id
+            existing = ctx.by_port.get(preferred)
+            if existing is not None:
+                old_session, old_tunnel_id = existing
+                if old_session.client_id == session.client_id and old_session is not session:
+                    log.info("Reclaiming TCP port %s from stale session of client %s",
+                             preferred, session.client_id[:8])
+                    await close_tunnel(old_session, old_tunnel_id, ctx)
+                    port = allocate_tcp_port(ctx, preferred)
         if port is None:
             resp = {"tunnel_id": tunnel_id, "status": "error", "error": "no TCP ports available"}
             await session.send_frame(FrameType.TUNNEL_OPEN_RESPONSE, CONTROL_STREAM_ID, json.dumps(resp).encode())
@@ -718,6 +741,16 @@ async def handle_tunnel_open(session: ClientSession, frame, ctx: ServerContext):
     else:  # udp
         preferred = req.get("remote_port")
         port = allocate_udp_port(ctx, preferred)
+        if port is None and preferred is not None:
+            # Port taken -- reclaim from stale session of same client_id
+            existing = ctx.by_udp_port.get(preferred)
+            if existing is not None:
+                old_session, old_tunnel_id = existing
+                if old_session.client_id == session.client_id and old_session is not session:
+                    log.info("Reclaiming UDP port %s from stale session of client %s",
+                             preferred, session.client_id[:8])
+                    await close_tunnel(old_session, old_tunnel_id, ctx)
+                    port = allocate_udp_port(ctx, preferred)
         if port is None:
             resp = {"tunnel_id": tunnel_id, "status": "error", "error": "no UDP ports available"}
             await session.send_frame(FrameType.TUNNEL_OPEN_RESPONSE, CONTROL_STREAM_ID, json.dumps(resp).encode())
@@ -968,19 +1001,16 @@ async def handle_control_connection(reader: asyncio.StreamReader, writer: asynci
         writer.close()
         return
 
-    # If this client_id already has live sessions, evict them first.
-    # This handles the reconnect race: the client reconnects (e.g. after a
-    # network blip) before the heartbeat timer has killed the old session,
-    # so the old session's tunnels/subdomains are still registered.  If we
-    # don't clean them up here, the client's TUNNEL_OPEN_REQUEST for the
-    # same subdomain will fail with "subdomain already in use".
-    existing_sessions = ctx.clients.pop(client_id, set())
-    for old_session in list(existing_sessions):
-        log.info("Evicting stale session for client %s (new connection arrived)", client_id[:8])
-        await cleanup_client(old_session, ctx)
+    # If this client_id already has live sessions, keep them -- a single
+    # user may run multiple client processes from the same machine (they
+    # share a client_id via the persisted state file).  Conflicting
+    # tunnel resources (e.g. same subdomain) are reclaimed at tunnel-open
+    # time, not here.
+    existing_sessions = ctx.clients.get(client_id, set())
 
     session = ClientSession(client_id, reader, writer)
-    ctx.clients[client_id] = {session}
+    existing_sessions.add(session)
+    ctx.clients[client_id] = existing_sessions
     ctx.storage.upsert_client(client_id)
 
     resp = json.dumps({
@@ -991,7 +1021,9 @@ async def handle_control_connection(reader: asyncio.StreamReader, writer: asynci
     try:
         await session.send_frame(FrameType.HELLO_OK, CONTROL_STREAM_ID, resp)
     except Exception:
-        ctx.clients.pop(client_id, None)
+        existing_sessions.discard(session)
+        if not existing_sessions:
+            ctx.clients.pop(client_id, None)
         return
 
     ctx.log_event(f"Client {client_id[:8]} connected from {addr[0]}")
