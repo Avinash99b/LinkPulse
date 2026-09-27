@@ -1,0 +1,108 @@
+name: Build and Release Client
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: my_proxy
+            asset_name: my_proxy-linux-amd64
+          - os: macos-latest
+            artifact_name: my_proxy
+            asset_name: my_proxy-darwin-universal
+          - os: windows-latest
+            artifact_name: my_proxy.exe
+            asset_name: my_proxy-windows-amd64.exe
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+
+      - name: Build with PyInstaller (Linux/macOS)
+        if: runner.os != 'Windows'
+        working-directory: my_proxy_client
+        shell: bash
+        run: |
+          pyinstaller \
+            --onefile \
+            --name my_proxy \
+            --clean \
+            --noconfirm \
+            --strip \
+            --hidden-import=asyncio \
+            --hidden-import=json \
+            --hidden-import=logging \
+            --hidden-import=argparse \
+            --hidden-import=dataclasses \
+            --hidden-import=enum \
+            --hidden-import=hashlib \
+            --hidden-import=hmac \
+            --hidden-import=secrets \
+            --hidden-import=struct \
+            --hidden-import=uuid \
+            --hidden-import=collections \
+            --hidden-import=pathlib \
+            --hidden-import=signal \
+            --hidden-import=typing \
+            my_proxy.py
+
+      - name: Build with PyInstaller (Windows)
+        if: runner.os == 'Windows'
+        working-directory: my_proxy_client
+        shell: bash
+        run: |
+          pyinstaller \
+            --onefile \
+            --name my_proxy \
+            --clean \
+            --noconfirm \
+            --hidden-import=asyncio \
+            --hidden-import=json \
+            --hidden-import=logging \
+            --hidden-import=argparse \
+            --hidden-import=dataclasses \
+            --hidden-import=enum \
+            --hidden-import=hashlib \
+            --hidden-import=hmac \
+            --hidden-import=secrets \
+            --hidden-import=struct \
+            --hidden-import=uuid \
+            --hidden-import=collections \
+            --hidden-import=pathlib \
+            --hidden-import=signal \
+            --hidden-import=typing \
+            my_proxy.py
+
+      - name: Rename artifact
+        working-directory: my_proxy_client
+        shell: bash
+        run: |
+          mv dist/${{ matrix.artifact_name }} dist/${{ matrix.asset_name }}
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: my_proxy_client/dist/${{ matrix.asset_name }}
