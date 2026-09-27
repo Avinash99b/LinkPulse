@@ -16,7 +16,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-20.04
+          - os: ubuntu-latest
             artifact_name: my_proxy
             asset_name: my_proxy-linux-amd64
           - os: macos-latest
@@ -40,8 +40,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller
 
-      - name: Build with PyInstaller (Linux/macOS)
-        if: runner.os != 'Windows'
+      - name: Build with PyInstaller (macOS)
+        if: runner.os == 'macOS'
         working-directory: my_proxy_client
         shell: bash
         run: |
@@ -67,6 +67,39 @@ jobs:
             --hidden-import=signal \
             --hidden-import=typing \
             my_proxy.py
+
+      - name: Build with PyInstaller in Docker (Linux)
+        if: runner.os == 'Linux'
+        uses: addnab/docker-run-action@v3
+        with:
+          image: python:3.11-slim-buster
+          options: -v ${{ github.workspace }}:/work -w /work/my_proxy_client
+          run: |
+            apt-get update && apt-get install -y binutils
+            pip install pyinstaller
+            pyinstaller \
+              --onefile \
+              --name my_proxy \
+              --clean \
+              --noconfirm \
+              --strip \
+              --hidden-import=asyncio \
+              --hidden-import=json \
+              --hidden-import=logging \
+              --hidden-import=argparse \
+              --hidden-import=dataclasses \
+              --hidden-import=enum \
+              --hidden-import=hashlib \
+              --hidden-import=hmac \
+              --hidden-import=secrets \
+              --hidden-import=struct \
+              --hidden-import=uuid \
+              --hidden-import=collections \
+              --hidden-import=pathlib \
+              --hidden-import=signal \
+              --hidden-import=typing \
+              my_proxy.py
+            chown -R $(stat -c "%u:%g" .) dist build *.spec
 
       - name: Build with PyInstaller (Windows)
         if: runner.os == 'Windows'
