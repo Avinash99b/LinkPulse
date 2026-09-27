@@ -16,7 +16,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-20.04
             artifact_name: my_proxy
             asset_name: my_proxy-linux-amd64
           - os: macos-latest
@@ -94,15 +94,6 @@ jobs:
             --hidden-import=signal \
             --hidden-import=typing \
             my_proxy.py
-
-      - name: Make Linux binary fully static
-        if: runner.os == 'Linux'
-        working-directory: my_proxy_client
-        shell: bash
-        run: |
-          pip install staticx patchelf
-          staticx dist/my_proxy dist/my_proxy-static
-          mv dist/my_proxy-static dist/my_proxy
 
       - name: Rename artifact
         working-directory: my_proxy_client
