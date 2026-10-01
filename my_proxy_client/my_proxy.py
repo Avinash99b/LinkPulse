@@ -1486,7 +1486,11 @@ def _spawn_detached(args: argparse.Namespace, mode: str, target_str: str,
     log_file = Path(log_file_path) if log_file_path else (logs_dir / f"{client_id}.log")
 
     if getattr(sys, "frozen", False):
-        cmd = [sys.executable]
+        # PyInstaller --onefile: sys.executable points inside the ephemeral
+        # temp extraction dir (/tmp/_MEIxxxx/...) which is deleted when the
+        # parent exits. sys.argv[0] is the stable on-disk path the user
+        # actually invoked (e.g. /home/user/bin/linkpulse).
+        cmd = [os.path.abspath(sys.argv[0])]
     else:
         cmd = [sys.executable, str(Path(__file__).resolve())]
 
