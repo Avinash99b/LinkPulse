@@ -1470,6 +1470,76 @@ def _cli_clients_delete(client_id: str) -> None:
         print(f"Client {cid} (stopped) removed.")
 
 
+def _cli_clients_clear(force: bool = False) -> None:
+    """Remove all client state files.
+
+    Without --force: only removes idle (stopped / dead / corrupt) clients.
+    Connected clients are skipped with a warning.
+
+    With --force: stops all connected clients (SIGTERM -> SIGKILL) and
+    removes every state file.
+    """
+    clients_dir = _get_clients_dir()
+    if not clients_dir.exists():
+        print("No LinkPulse clients found.")
+        return
+
+    client_files = list(clients_dir.glob("*.json"))
+    if not client_files:
+        print("No LinkPulse clients found.")
+        return
+
+    removed = 0
+    skipped = 0
+
+    for f in client_files:
+        data = _read_client_state(f)
+        cid = data.get("client_id", f.stem)
+        pid = data.get("pid")
+        expected_start = data.get("start_time")
+        is_alive = (isinstance(pid, int) and pid > 0
+                     and _verify_client_process(pid, data))
+
+        if is_alive and not force:
+            raw_status = data.get("status", "unknown")
+            print(f"  Skipped  {cid}  (status: {raw_status}, PID {pid}) -- use -f to force")
+            skipped += 1
+            continue
+
+        if is_alive:
+            # --force: stop the running client
+            print(f"  Stopping {cid} (PID {pid})...")
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                if not _is_pid_alive(pid, expected_start):
+                    break
+                time.sleep(0.1)
+            if _is_pid_alive(pid, expected_start):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    time.sleep(0.2)
+                except OSError:
+                    pass
+
+        try:
+            f.unlink(missing_ok=True)
+        except OSError as e:
+            print(f"  Error removing {cid}: {e}", file=sys.stderr)
+            continue
+        label = "Stopped and removed" if is_alive else "Removed"
+        print(f"  {label}  {cid}")
+        removed += 1
+
+    parts = [f"{removed} client(s) removed"]
+    if skipped:
+        parts.append(f"{skipped} connected client(s) skipped")
+    print(" | ".join(parts) + ".")
+
+
 def _spawn_detached(args: argparse.Namespace, mode: str, target_str: str,
                     log_file_path: Optional[str] = None) -> None:
     """Spawn a background client process and return immediately."""
@@ -1659,6 +1729,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
   linkpulse clients list                            List running LinkPulse clients
   linkpulse clients info <client-id>                Show details for a client
   linkpulse clients delete <client-id>              Stop and remove a client
+  linkpulse clients clear                           Remove all idle clients
+  linkpulse clients clear -f                        Stop and remove ALL clients
   linkpulse authtoken <secret>                      Save authentication token
   linkpulse server proxy.example.com:9000           Save server address
 """)
@@ -1695,6 +1767,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     del_p = clients_sub.add_parser("delete", aliases=["stop", "rm", "kill"], help="stop a client and remove its state")
     del_p.add_argument("client_id", help="the client ID (or prefix)")
+
+    clear_p = clients_sub.add_parser("clear", aliases=["prune"], help="remove all idle clients; -f to also stop connected ones")
+    clear_p.add_argument("-f", "--force", action="store_true",
+                          help="also stop and remove connected clients")
 
     return parser
 
@@ -1795,6 +1871,8 @@ async def _async_main(args: argparse.Namespace):
             _cli_clients_info(args.client_id)
         elif cmd in ("delete", "stop", "rm", "kill"):
             _cli_clients_delete(args.client_id)
+        elif cmd in ("clear", "prune"):
+            _cli_clients_clear(force=getattr(args, "force", False))
         return
 
     # Handle authtoken command

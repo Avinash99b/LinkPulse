@@ -154,9 +154,15 @@ linkpulse clients info <client-id>
 
 # Gracefully stop a client and remove its local state
 linkpulse clients delete <client-id>
+
+# Remove all idle (stopped) clients
+linkpulse clients clear
+
+# Stop and remove ALL clients (including connected ones)
+linkpulse clients clear -f
 ```
 
-Aliases supported: `client` for `clients`, `ls` for `list`, `show`/`status` for `info`, `stop`/`rm`/`kill` for `delete`.
+Aliases supported: `client` for `clients`, `ls` for `list`, `show`/`status` for `info`, `stop`/`rm`/`kill` for `delete`, `prune` for `clear`.
 
 ### Global options
 

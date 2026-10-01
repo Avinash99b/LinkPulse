@@ -97,6 +97,8 @@ linkpulse tcp 22 -d --token secret --server proxy.example.com:9000
 linkpulse clients list
 linkpulse clients info <client-id>
 linkpulse clients delete <client-id>
+linkpulse clients clear          # remove idle clients
+linkpulse clients clear -f       # stop and remove ALL clients
 ```
 
 ---

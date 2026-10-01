@@ -337,6 +337,99 @@ class TestClientsCLICommands:
                 proc.kill()
 
 
+class TestClientsClearCommand:
+    """Tests for the clients clear subcommand."""
+
+    def test_clear_empty(self, temp_env, capsys):
+        my_proxy._cli_clients_clear(force=False)
+        captured = capsys.readouterr()
+        assert "No LinkPulse clients found." in captured.out
+
+    def test_clear_removes_only_idle_clients(self, temp_env, capsys):
+        state_dir = temp_env["state_dir"]
+        idle_cid = "idle111122223333"
+        alive_cid = "alive44445555666"
+
+        (state_dir / f"{idle_cid}.json").write_text(json.dumps({
+            "client_id": idle_cid,
+            "pid": 9999990,  # dead
+            "mode": "http",
+            "target": "8080",
+            "status": "stopped",
+        }))
+        (state_dir / f"{alive_cid}.json").write_text(json.dumps({
+            "client_id": alive_cid,
+            "pid": os.getpid(),
+            "start_time": my_proxy._proc_start_time(os.getpid()),
+            "mode": "tcp",
+            "target": "22",
+            "status": "connected",
+        }))
+
+        my_proxy._cli_clients_clear(force=False)
+        captured = capsys.readouterr()
+
+        # idle client removed
+        assert not (state_dir / f"{idle_cid}.json").exists()
+        assert idle_cid in captured.out
+        # alive client skipped
+        assert (state_dir / f"{alive_cid}.json").exists()
+        assert "Skipped" in captured.out
+        assert alive_cid in captured.out
+        assert "1 client(s) removed" in captured.out
+        assert "1 connected client(s) skipped" in captured.out
+
+    def test_clear_force_removes_all(self, temp_env, capsys):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            state_dir = temp_env["state_dir"]
+            idle_cid = "idleforce1234567"
+            live_cid = "liveforce7654321"
+
+            (state_dir / f"{idle_cid}.json").write_text(json.dumps({
+                "client_id": idle_cid,
+                "pid": 9999991,
+                "mode": "http",
+                "target": "3000",
+                "status": "stopped",
+            }))
+            (state_dir / f"{live_cid}.json").write_text(json.dumps({
+                "client_id": live_cid,
+                "pid": proc.pid,
+                "start_time": my_proxy._proc_start_time(proc.pid),
+                "mode": "tcp",
+                "target": "22",
+                "status": "connected",
+            }))
+
+            my_proxy._cli_clients_clear(force=True)
+            captured = capsys.readouterr()
+
+            assert not (state_dir / f"{idle_cid}.json").exists()
+            assert not (state_dir / f"{live_cid}.json").exists()
+            assert "2 client(s) removed" in captured.out
+            assert "skipped" not in captured.out.lower()
+            assert not my_proxy._is_pid_alive(proc.pid)
+        finally:
+            if my_proxy._is_pid_alive(proc.pid):
+                proc.kill()
+
+    def test_clear_cli_parse(self):
+        parser = my_proxy._build_arg_parser()
+        args = parser.parse_args(["clients", "clear"])
+        assert args.command == "clients"
+        assert args.clients_command == "clear"
+        assert args.force is False
+
+        args_f = parser.parse_args(["clients", "clear", "-f"])
+        assert args_f.force is True
+
+        args_prune = parser.parse_args(["client", "prune", "--force"])
+        assert args_prune.command == "client"
+        assert args_prune.clients_command == "prune"
+        assert args_prune.force is True
+
+
 class TestDetachedModeLifecycle:
     """Integration tests for detached mode process spawning and survival."""
 
