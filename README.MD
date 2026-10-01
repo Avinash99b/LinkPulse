@@ -88,6 +88,15 @@ my_proxy tcp 22 --token secret --server proxy.example.com:9000
 
 # Multiple services at once
 my_proxy start config.json --token secret --server proxy.example.com:9000
+
+# Detached / background mode (-d)
+linkpulse http 8080 -d --token secret --server proxy.example.com:9000
+linkpulse tcp 22 -d --token secret --server proxy.example.com:9000
+
+# Manage client processes
+linkpulse clients list
+linkpulse clients info <client-id>
+linkpulse clients delete <client-id>
 ```
 
 ---
