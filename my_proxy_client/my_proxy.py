@@ -38,10 +38,12 @@ import logging
 import os
 import secrets
 import signal
-import sys
 import struct
+import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 import uuid
 from collections import deque
 from pathlib import Path
@@ -245,8 +247,13 @@ class PendingStream:
 
 class TunnelClient:
     def __init__(self, specs: list[TunnelSpec], server_host: str, server_port: int,
-                 secret: str, grace_time: float, state_file: Path,
-                 log: logging.Logger, recent_logs: deque):
+                 secret: str, grace_time: float, state_file: Optional[Path],
+                 log: logging.Logger, recent_logs: deque,
+                 client_id: Optional[str] = None,
+                 mode: str = "http",
+                 target_str: str = "",
+                 dashboard_addr: Optional[str] = None,
+                 log_file_path: Optional[str] = None):
         self.specs = specs
         self.server_host = server_host
         self.server_port = server_port
@@ -255,13 +262,23 @@ class TunnelClient:
         self.state_file = state_file
         self.log = log
         self.recent_logs = recent_logs
+        self.mode = mode
+        self.target_str = target_str
+        self.dashboard_addr = dashboard_addr
+        self.log_file_path = log_file_path
 
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
         self._write_lock = asyncio.Lock()
 
-        self.client_id: Optional[str] = None
-        self._client_id_bytes: bytes = self._load_client_id()
+        if client_id:
+            self.client_id = client_id
+            self._client_id_bytes = bytes.fromhex(client_id)
+        else:
+            self.client_id = None
+            self._client_id_bytes = self._load_client_id()
+            if self._client_id_bytes != NULL_CLIENT_ID:
+                self.client_id = self._client_id_bytes.hex()
 
         self.tunnels: dict[str, TunnelRuntime] = {t.tunnel_id: TunnelRuntime(spec=t) for t in specs}
         self.streams: dict[int, ClientStream] = {}
@@ -274,22 +291,78 @@ class TunnelClient:
         self._first_failure_time: Optional[float] = None
         self._shutdown_requested = False
         self._heartbeat_interval = 20  # overwritten by server's HELLO_OK value
+        self._save_state("connecting")
 
     # -- persistence of client_id across reconnects/restarts -----------------
 
     def _load_client_id(self) -> bytes:
+        if not self.state_file or not self.state_file.exists():
+            return NULL_CLIENT_ID
         try:
             data = json.loads(self.state_file.read_text())
-            return bytes.fromhex(data["client_id"])
+            if "client_id" in data and data["client_id"]:
+                return bytes.fromhex(data["client_id"])
+            return NULL_CLIENT_ID
         except Exception:
             return NULL_CLIENT_ID
 
+    def _save_state(self, status: Optional[str] = None):
+        if status:
+            self.status = status
+        
+        cid_hex = self.client_id or (self._client_id_bytes.hex() if self._client_id_bytes != NULL_CLIENT_ID else None)
+        tunnels_info = []
+        public_urls = []
+        for runtime in self.tunnels.values():
+            info = {
+                "tunnel_id": runtime.spec.tunnel_id,
+                "type": runtime.spec.type,
+                "status": runtime.status,
+                "public_url": runtime.public_url,
+                "local_destination": f"{runtime.spec.local_host}:{runtime.spec.local_port}",
+            }
+            tunnels_info.append(info)
+            if runtime.public_url:
+                public_urls.append(runtime.public_url)
+
+        data = {
+            "client_id": cid_hex,
+            "pid": os.getpid(),
+            "status": self.status,
+            "mode": self.mode,
+            "target": self.target_str,
+            "server": f"{self.server_host}:{self.server_port}",
+            "dashboard": self.dashboard_addr if self.dashboard_addr else None,
+            "started_at": self.process_start_time,
+            "started_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.process_start_time)),
+            "log_file": str(self.log_file_path) if self.log_file_path else None,
+            "state_file": str(self.state_file) if self.state_file else None,
+            "public_urls": public_urls,
+            "tunnels": tunnels_info,
+        }
+
+        # Write to self.state_file if configured
+        target_files = []
+        if self.state_file:
+            target_files.append(self.state_file)
+        if cid_hex:
+            managed_file = _get_clients_dir() / f"{cid_hex}.json"
+            if not self.state_file or managed_file.resolve() != self.state_file.resolve():
+                target_files.append(managed_file)
+
+        for sf in target_files:
+            try:
+                sf.parent.mkdir(parents=True, exist_ok=True)
+                tmp = sf.with_suffix(".tmp")
+                tmp.write_text(json.dumps(data, indent=2))
+                tmp.replace(sf)
+            except OSError as e:
+                self.log.warning("Could not persist state to %s: %s", sf, e)
+
     def _save_client_id(self, client_id_hex: str):
-        try:
-            self.state_file.parent.mkdir(parents=True, exist_ok=True)
-            self.state_file.write_text(json.dumps({"client_id": client_id_hex}))
-        except OSError as e:
-            self.log.warning("Could not persist client id to %s: %s", self.state_file, e)
+        self.client_id = client_id_hex
+        self._client_id_bytes = bytes.fromhex(client_id_hex)
+        self._save_state()
 
     # -- logging helper (also feeds the dashboard's recent-logs list) --------
 
@@ -320,6 +393,7 @@ class TunnelClient:
 
         while not self._shutdown_requested:
             self.status = "connecting" if first_attempt else "reconnecting"
+            self._save_state()
             try:
                 await self._connect_and_serve(first_attempt)
                 # _connect_and_serve only returns normally on a clean, requested
@@ -330,6 +404,7 @@ class TunnelClient:
             except AuthError as e:
                 self._log(logging.ERROR, "Authentication failed: %s -- check --token. Exiting.", e)
                 self.status = "disconnected"
+                self._save_state("disconnected")
                 sys.exit(1)
             except (ConnectionError, OSError, asyncio.TimeoutError, ProtocolError,
                     asyncio.IncompleteReadError) as e:
@@ -339,6 +414,7 @@ class TunnelClient:
                     # connection failure and must not trigger a retry/backoff.
                     break
                 self.status = "reconnecting"
+                self._save_state("reconnecting")
                 now = time.time()
                 if self._first_failure_time is None:
                     self._first_failure_time = now
@@ -348,6 +424,7 @@ class TunnelClient:
                                "Server unreachable for %.0fs (grace period %.0fs) -- giving up.",
                                elapsed, self.grace_time)
                     self.status = "disconnected"
+                    self._save_state("disconnected")
                     sys.exit(1)
                 self._log(logging.WARNING, "Connection issue (%s); retrying in %.1fs "
                           "(unreachable for %.0fs / %.0fs grace period)",
@@ -362,11 +439,13 @@ class TunnelClient:
             first_attempt = False
 
         self.status = "stopped"
+        self._save_state("stopped")
 
     async def request_shutdown(self):
         """Called on SIGINT/SIGTERM: politely tell the server we're leaving,
         then unwind the connect/serve loop."""
         self._shutdown_requested = True
+        self._save_state("stopped")
         if self.writer is not None:
             for tunnel_id in list(self.tunnels.keys()):
                 try:
@@ -536,6 +615,7 @@ class TunnelClient:
             runtime.status = "error"
             runtime.error = resp.get("error", "unknown error")
             self._log(logging.ERROR, "Tunnel %s failed: %s", tunnel_id[:8], runtime.error)
+        self._save_state()
 
     def _handle_stream_open(self, frame):
         """Synchronous: register the pending stream immediately (so any
@@ -925,7 +1005,7 @@ async def serve_dashboard(client: TunnelClient, host: str, port: int, log: loggi
 
 
 # =============================================================================
-# CLI
+# CLI & Process Management
 # =============================================================================
 
 DEFAULT_SERVER = "127.0.0.1:80"
@@ -946,7 +1026,373 @@ def _get_config_dir() -> Path:
     return base / "linkpulse"
 
 
+def _get_clients_dir() -> Path:
+    """Directory for persisting managed client instance state."""
+    env_dir = os.environ.get("LINKPULSE_STATE_DIR")
+    if env_dir:
+        return Path(env_dir)
+    return _get_config_dir() / "clients"
+
+
+def _get_logs_dir() -> Path:
+    """Directory for storing detached client logs."""
+    env_dir = os.environ.get("LINKPULSE_LOGS_DIR")
+    if env_dir:
+        return Path(env_dir)
+    return _get_config_dir() / "logs"
+
+
 DEFAULT_TOKEN_FILE = _get_config_dir() / "authtoken.json"
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Check if process with given PID exists and is actively running (not zombie)."""
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+    proc_status = Path(f"/proc/{pid}/status")
+    if proc_status.exists():
+        try:
+            content = proc_status.read_text(encoding="utf-8", errors="ignore")
+            for line in content.splitlines():
+                if line.startswith("State:"):
+                    if "Z" in line or "zombie" in line.lower():
+                        return False
+                    break
+        except (OSError, PermissionError):
+            pass
+    return True
+
+
+def _verify_client_process(pid: int, state: dict) -> bool:
+    """Verify that the process with PID is actually a LinkPulse client
+    to prevent PID reuse from affecting unrelated processes."""
+    if not _is_pid_alive(pid):
+        return False
+    proc_cmdline = Path(f"/proc/{pid}/cmdline")
+    if proc_cmdline.exists():
+        try:
+            cmdline = proc_cmdline.read_bytes().decode("utf-8", errors="ignore").replace("\x00", " ")
+            if any(k in cmdline for k in ("my_proxy", "linkpulse", "python")):
+                cid = state.get("client_id", "")
+                if cid and cid in cmdline:
+                    return True
+                mode = state.get("mode", "")
+                if mode and mode in cmdline:
+                    return True
+                return True
+            return False
+        except (OSError, PermissionError):
+            pass
+    return True
+
+
+def _find_client_state_file(client_id_or_prefix: str) -> tuple[Optional[Path], Optional[str]]:
+    """Find the client state file matching client_id or unambiguous prefix.
+    Returns (Path, None) on match, (None, error_message) on failure."""
+    clients_dir = _get_clients_dir()
+    if not clients_dir.exists():
+        return None, f"Client '{client_id_or_prefix}' not found."
+
+    exact = clients_dir / f"{client_id_or_prefix}.json"
+    if exact.is_file():
+        return exact, None
+
+    matches = []
+    for f in clients_dir.glob("*.json"):
+        if f.stem.startswith(client_id_or_prefix):
+            matches.append(f)
+
+    if len(matches) == 1:
+        return matches[0], None
+    elif len(matches) > 1:
+        names = ", ".join(m.stem for m in matches[:5])
+        return None, f"Ambiguous client ID prefix '{client_id_or_prefix}' matches multiple clients: {names}"
+    else:
+        return None, f"Client '{client_id_or_prefix}' not found."
+
+
+def _format_uptime(seconds: Optional[float]) -> str:
+    if seconds is None or seconds < 0:
+        return "-"
+    s = int(seconds)
+    days, s = divmod(s, 86400)
+    hours, s = divmod(s, 3600)
+    minutes, s = divmod(s, 60)
+    parts = []
+    if days > 0:
+        parts.append(f"{days}d")
+    if hours > 0 or days > 0:
+        parts.append(f"{hours}h")
+    if minutes > 0 or hours > 0 or days > 0:
+        parts.append(f"{minutes}m")
+    parts.append(f"{s}s")
+    return " ".join(parts[:2]) if parts else "0s"
+
+
+def _read_client_state(state_file: Path) -> dict:
+    try:
+        data = json.loads(state_file.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {"client_id": state_file.stem, "status": "corrupt", "state_file": str(state_file)}
+        return data
+    except Exception:
+        return {"client_id": state_file.stem, "status": "corrupt", "state_file": str(state_file)}
+
+
+def _cli_clients_list() -> None:
+    clients_dir = _get_clients_dir()
+    if not clients_dir.exists():
+        print("No LinkPulse clients found.")
+        return
+
+    client_files = sorted(clients_dir.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
+    if not client_files:
+        print("No LinkPulse clients found.")
+        return
+
+    rows = []
+    for f in client_files:
+        data = _read_client_state(f)
+        cid = data.get("client_id", f.stem)
+        pid = data.get("pid", "-")
+        mode = data.get("mode", "-")
+        target = data.get("target", "-")
+        server = data.get("server", "-")
+        raw_status = data.get("status", "unknown")
+
+        if raw_status == "corrupt":
+            status = "corrupt"
+        elif isinstance(pid, int) and pid > 0:
+            if _verify_client_process(pid, data):
+                status = raw_status if raw_status != "stopped" else "running"
+            else:
+                status = "stopped"
+        else:
+            status = "stopped"
+
+        pid_str = str(pid) if isinstance(pid, int) and pid > 0 else "-"
+        rows.append((cid, pid_str, mode, target, server, status))
+
+    headers = ("CLIENT ID", "PID", "MODE", "TARGET", "SERVER", "STATUS")
+    col_widths = [len(h) for h in headers]
+    for r in rows:
+        for i, val in enumerate(r):
+            col_widths[i] = max(col_widths[i], len(str(val)))
+
+    fmt = "  ".join(f"{{:<{w}}}" for w in col_widths)
+    print(fmt.format(*headers))
+    for r in rows:
+        print(fmt.format(*r))
+
+
+def _cli_clients_info(client_id: str) -> None:
+    state_file, err = _find_client_state_file(client_id)
+    if err or not state_file:
+        print(f"Error: {err or 'Client not found.'}", file=sys.stderr)
+        sys.exit(1)
+
+    data = _read_client_state(state_file)
+    cid = data.get("client_id", state_file.stem)
+    pid = data.get("pid")
+    mode = data.get("mode", "-")
+    target = data.get("target", "-")
+    server = data.get("server", "-")
+    started_at = data.get("started_at")
+    started_at_iso = data.get("started_at_iso", "-")
+    log_file = data.get("log_file", "-")
+    dashboard = data.get("dashboard")
+    public_urls = data.get("public_urls", [])
+    raw_status = data.get("status", "unknown")
+
+    is_alive = False
+    if isinstance(pid, int) and pid > 0:
+        is_alive = _verify_client_process(pid, data)
+
+    live_stats = None
+    if is_alive and dashboard:
+        try:
+            req = urllib.request.Request(f"http://{dashboard}/api/stats")
+            with urllib.request.urlopen(req, timeout=0.3) as resp:
+                if resp.status == 200:
+                    live_stats = json.loads(resp.read().decode())
+        except Exception:
+            pass
+
+    if not is_alive:
+        status = "stopped"
+        uptime_str = "-"
+    else:
+        if live_stats:
+            status = live_stats.get("status", "running")
+            uptime_str = _format_uptime(live_stats.get("process_uptime_seconds"))
+            dash_tunnels = live_stats.get("tunnels", [])
+            if dash_tunnels:
+                urls = [t.get("public_url") for t in dash_tunnels if t.get("public_url")]
+                if urls:
+                    public_urls = urls
+        else:
+            status = raw_status if raw_status != "stopped" else "running"
+            uptime = (time.time() - started_at) if started_at else None
+            uptime_str = _format_uptime(uptime)
+
+    print(f"Client ID:       {cid}")
+    print(f"PID:             {pid if pid else '-'}")
+    print(f"Status:          {status}")
+    print(f"Mode:            {mode}")
+    print(f"Local target:    {target}")
+    if public_urls:
+        print(f"Public endpoint: {', '.join(public_urls)}")
+    print(f"Server:          {server}")
+    if dashboard:
+        print(f"Dashboard:       http://{dashboard}")
+    print(f"Started:         {started_at_iso}")
+    print(f"Uptime:          {uptime_str}")
+    if live_stats:
+        conn_count = sum(t.get("connections", 0) for t in live_stats.get("tunnels", []))
+        print(f"Connections:     {conn_count}")
+    print(f"Log file:        {log_file}")
+    print(f"State file:      {state_file}")
+
+
+def _cli_clients_delete(client_id: str) -> None:
+    state_file, err = _find_client_state_file(client_id)
+    if err or not state_file:
+        print(f"Error: {err or 'Client not found.'}", file=sys.stderr)
+        sys.exit(1)
+
+    data = _read_client_state(state_file)
+    cid = data.get("client_id", state_file.stem)
+    pid = data.get("pid")
+
+    if isinstance(pid, int) and pid > 0 and _verify_client_process(pid, data):
+        print(f"Stopping client {cid} (PID {pid})...")
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+        # Wait up to 3 seconds for graceful shutdown
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            if not _is_pid_alive(pid):
+                break
+            time.sleep(0.1)
+
+        # Escalate to SIGKILL if still running
+        if _is_pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+                time.sleep(0.2)
+            except OSError:
+                pass
+
+        try:
+            state_file.unlink(missing_ok=True)
+        except OSError as e:
+            print(f"Error removing state file: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Client {cid} stopped and removed.")
+    else:
+        try:
+            state_file.unlink(missing_ok=True)
+        except OSError as e:
+            print(f"Error removing state file: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Client {cid} (stopped) removed.")
+
+
+def _spawn_detached(args: argparse.Namespace, mode: str, target_str: str) -> None:
+    """Spawn a background client process and return immediately."""
+    clients_dir = _get_clients_dir()
+    logs_dir = _get_logs_dir()
+    clients_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    client_id = getattr(args, "client_id", None) or uuid.uuid4().hex
+    state_file = Path(args.state_file) if args.state_file else (clients_dir / f"{client_id}.json")
+    log_file = logs_dir / f"{client_id}.log"
+
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable]
+    else:
+        cmd = [sys.executable, str(Path(__file__).resolve())]
+
+    # Forward args without -d / --detach
+    child_args = []
+    for arg in sys.argv[1:]:
+        if arg in ("-d", "--detach"):
+            continue
+        child_args.append(arg)
+
+    child_args.extend([
+        "--daemon-child",
+        "--client-id", client_id,
+        "--state-file", str(state_file),
+    ])
+
+    initial_data = {
+        "client_id": client_id,
+        "pid": 0,
+        "status": "starting",
+        "mode": mode,
+        "target": target_str,
+        "server": args.server,
+        "dashboard": None if args.no_dashboard else args.dashboard,
+        "started_at": time.time(),
+        "started_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "log_file": str(log_file),
+        "state_file": str(state_file),
+        "public_urls": [],
+        "cmdline": [mode, target_str],
+    }
+    state_file.write_text(json.dumps(initial_data, indent=2))
+
+    log_fd = open(log_file, "a", encoding="utf-8")
+    try:
+        if sys.platform == "win32":
+            creationflags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            proc = subprocess.Popen(
+                cmd + child_args,
+                stdin=subprocess.DEVNULL,
+                stdout=log_fd,
+                stderr=subprocess.STDOUT,
+                creationflags=creationflags,
+                close_fds=True,
+            )
+        else:
+            proc = subprocess.Popen(
+                cmd + child_args,
+                stdin=subprocess.DEVNULL,
+                stdout=log_fd,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+    finally:
+        log_fd.close()
+
+    initial_data["pid"] = proc.pid
+    initial_data["status"] = "running"
+    state_file.write_text(json.dumps(initial_data, indent=2))
+
+    print("LinkPulse client started in background.")
+    print(f"  Client ID:   {client_id}")
+    print(f"  PID:         {proc.pid}")
+    print(f"  Mode:        {mode}")
+    print(f"  Target:      {target_str}")
+    print(f"  Server:      {args.server}")
+    print(f"  Log file:    {log_file}")
+    print(f"  State file:  {state_file}")
+    sys.exit(0)
 
 
 def _parse_host_port(s: str, default_host: str = "127.0.0.1", default_port: int = 9000) -> tuple[str, int]:
@@ -983,43 +1429,69 @@ def _parse_target(s: str) -> tuple[str, int]:
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("-d", "--detach", action="store_true",
+                        help="run client in background (detached mode)")
     common.add_argument("--server", default=os.environ.get("MY_PROXY_SERVER", DEFAULT_SERVER),
-                         help=f"proxy control server as host:port (default: {DEFAULT_SERVER}, "
-                              f"env MY_PROXY_SERVER)")
+                         help=f"proxy control server as host:port (default: {DEFAULT_SERVER}, env MY_PROXY_SERVER)")
     common.add_argument("--token", default=os.environ.get("MY_PROXY_TOKEN"),
                          help="shared secret for authentication (env MY_PROXY_TOKEN)")
     common.add_argument("--grace-time", type=float, default=DEFAULT_GRACE_TIME,
-                         help=f"seconds to keep retrying before giving up if the server is "
-                              f"unreachable (default: {DEFAULT_GRACE_TIME})")
+                         help=f"seconds to keep retrying before giving up if the server is unreachable (default: {DEFAULT_GRACE_TIME})")
     common.add_argument("--dashboard", default=os.environ.get("MY_PROXY_DASHBOARD", DEFAULT_DASHBOARD),
                          help=f"local dashboard address (default: {DEFAULT_DASHBOARD})")
     common.add_argument("--no-dashboard", action="store_true", help="disable the local dashboard")
-    common.add_argument("--state-file", default=str(DEFAULT_STATE_FILE),
-                         help=f"where to persist the client identity (default: {DEFAULT_STATE_FILE})")
-    common.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    common.add_argument("--state-file", default=None,
+                         help=f"path to persist client ID across restarts (default: {DEFAULT_STATE_FILE})")
+    common.add_argument("--client-id", default=None, help=argparse.SUPPRESS)
+    common.add_argument("--daemon-child", action="store_true", help=argparse.SUPPRESS)
+    common.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                         help="logging verbosity (default: INFO)")
 
-    parser = argparse.ArgumentParser(prog="my_proxy", description="Client for the self-hosted tunneling proxy.")
+    parser = argparse.ArgumentParser(
+        prog="linkpulse",
+        description="LinkPulse - Self-hosted tunneling client.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  linkpulse http 8080                               Expose localhost:8080 via HTTP tunnel
+  linkpulse http 8080 -d                            Expose localhost:8080 in background
+  linkpulse tcp 22 --remote-port 20022              Expose localhost:22 via TCP tunnel
+  linkpulse tcp 22 -d                               Expose localhost:22 in background
+  linkpulse start tunnels.json                      Open multiple tunnels from config
+  linkpulse clients list                            List running LinkPulse clients
+  linkpulse clients info <client-id>                Show details for a client
+  linkpulse clients delete <client-id>              Stop and remove a client
+  linkpulse authtoken <secret>                      Save authentication token
+  linkpulse server proxy.example.com:9000           Save server address
+""")
     sub = parser.add_subparsers(dest="command", required=True)
 
     http_p = sub.add_parser("http", parents=[common], help="expose a local HTTP service")
     http_p.add_argument("target", help="local port (e.g. 8080) or host:port (e.g. localhost:5173)")
-    http_p.add_argument("-u", "--subdomain", help="request a specific subdomain")
+    http_p.add_argument("-u", "--subdomain", help="requested subdomain for the public URL")
 
     tcp_p = sub.add_parser("tcp", parents=[common], help="expose a local TCP service")
     tcp_p.add_argument("target", help="local port (e.g. 22) or host:port")
-    tcp_p.add_argument("--remote-port", type=int, help="request a specific public port")
+    tcp_p.add_argument("--remote-port", type=int, help="requested public port (if available)")
 
-    start_p = sub.add_parser("start", parents=[common],
-                              help="open multiple tunnels at once from a config file")
-    start_p.add_argument("config", help="path to a JSON file listing tunnels (see config.example.json)")
+    start_p = sub.add_parser("start", parents=[common], help="open multiple tunnels from a JSON config file")
+    start_p.add_argument("config", help="path to JSON config file (see config.example.json)")
 
-    auth_p = sub.add_parser("authtoken", parents=[common],
-                            help="save the shared secret (auth token) to config file for future use")
+    auth_p = sub.add_parser("authtoken", parents=[common], help="save shared secret to config file")
     auth_p.add_argument("token", help="the shared secret to save")
 
-    server_p = sub.add_parser("server", parents=[common],
-                              help="save the proxy server address to config file for future use")
-    server_p.add_argument("address", help="the proxy server address (host:port) to save")
+    server_p = sub.add_parser("server", parents=[common], help="save proxy server address to config file")
+    server_p.add_argument("address", help="proxy server address (host:port)")
+
+    clients_p = sub.add_parser("clients", aliases=["client"], help="manage LinkPulse client instances")
+    clients_sub = clients_p.add_subparsers(dest="clients_command", required=True)
+
+    clients_sub.add_parser("list", aliases=["ls"], help="list running and managed clients")
+
+    info_p = clients_sub.add_parser("info", aliases=["show", "status"], help="show details for a client")
+    info_p.add_argument("client_id", help="the client ID (or prefix)")
+
+    del_p = clients_sub.add_parser("delete", aliases=["stop", "rm", "kill"], help="stop a client and remove its state")
+    del_p.add_argument("client_id", help="the client ID (or prefix)")
 
     return parser
 
@@ -1107,8 +1579,16 @@ def _setup_logging(level: str, recent_logs: deque) -> logging.Logger:
 
 
 async def _async_main(args: argparse.Namespace):
-    recent_logs: deque = deque(maxlen=200)
-    log = _setup_logging(args.log_level, recent_logs)
+    # Handle clients management commands
+    if args.command in ("clients", "client"):
+        cmd = args.clients_command
+        if cmd in ("list", "ls"):
+            _cli_clients_list()
+        elif cmd in ("info", "show", "status"):
+            _cli_clients_info(args.client_id)
+        elif cmd in ("delete", "stop", "rm", "kill"):
+            _cli_clients_delete(args.client_id)
+        return
 
     # Handle authtoken command
     if args.command == "authtoken":
@@ -1119,6 +1599,28 @@ async def _async_main(args: argparse.Namespace):
     if args.command == "server":
         _save_config(server=_normalize_server_address(args.address))
         return
+
+    # Determine mode and target string
+    if args.command == "http":
+        mode = "http"
+        target_str = args.target
+    elif args.command == "tcp":
+        mode = "tcp"
+        target_str = args.target
+    elif args.command == "start":
+        mode = "multi"
+        target_str = args.config
+    else:
+        mode = args.command
+        target_str = ""
+
+    # Check detached mode
+    if getattr(args, "detach", False) and not getattr(args, "daemon_child", False):
+        _spawn_detached(args, mode, target_str)
+        return
+
+    recent_logs: deque = deque(maxlen=200)
+    log = _setup_logging(args.log_level, recent_logs)
 
     # Load saved token if not provided via CLI or env
     if not args.token:
@@ -1131,8 +1633,9 @@ async def _async_main(args: argparse.Namespace):
             args.server = _normalize_server_address(saved_server)
 
     if not args.token:
-        log.error("No shared secret provided. Pass --token, set MY_PROXY_TOKEN, or run 'my_proxy authtoken <token>' to save it.")
-        sys.exit(2)
+        print("Error: No shared secret provided. Pass --token, set MY_PROXY_TOKEN, or run 'linkpulse authtoken <token>'.",
+              file=sys.stderr)
+        sys.exit(1)
 
     if args.command == "http":
         host, port = _parse_target(args.target)
@@ -1143,21 +1646,30 @@ async def _async_main(args: argparse.Namespace):
         specs = [TunnelSpec(tunnel_id=new_tunnel_id(), type="tcp",
                              local_host=host, local_port=port, remote_port=args.remote_port)]
     elif args.command == "start":
-        specs, args = _load_start_config(args.config, args)
+        try:
+            specs, args = _load_start_config(args.config, args)
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            print(f"Error loading config {args.config}: {e}", file=sys.stderr)
+            sys.exit(1)
     else:
         raise SystemExit(f"unknown command {args.command!r}")
 
     if not specs:
-        log.error("No tunnels to open.")
-        sys.exit(2)
+        print("Error: No tunnels to open.", file=sys.stderr)
+        sys.exit(1)
 
     server_host, server_port = _parse_host_port(args.server)
-    state_file = Path(args.state_file)
+    state_file = Path(args.state_file) if args.state_file else DEFAULT_STATE_FILE
+    dash_host, dash_port = _parse_host_port(args.dashboard, default_host="127.0.0.1", default_port=4040)
 
     client = TunnelClient(
         specs=specs, server_host=server_host, server_port=server_port,
         secret=args.token, grace_time=args.grace_time, state_file=state_file,
         log=log, recent_logs=recent_logs,
+        client_id=getattr(args, "client_id", None),
+        mode=mode,
+        target_str=target_str,
+        dashboard_addr=None if args.no_dashboard else f"{dash_host}:{dash_port}",
     )
 
     tasks = [asyncio.create_task(client.run())]
@@ -1178,8 +1690,8 @@ async def _async_main(args: argparse.Namespace):
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, _signal_handler)
-        except NotImplementedError:
-            pass  # e.g. Windows
+        except (NotImplementedError, RuntimeError):
+            pass
 
     try:
         await tasks[0]

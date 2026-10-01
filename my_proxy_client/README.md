@@ -121,18 +121,56 @@ Open multiple tunnels at once from a JSON config file.
 my_proxy start tunnels.json --token mysecret
 ```
 
+#### Detached Mode (`-d` / `--detach`)
+
+Run any port-forwarding command in background mode:
+
+```bash
+# Expose HTTP in background
+linkpulse http 8080 -d --token <secret> --server proxy.example.com:9000
+
+# Expose TCP in background
+linkpulse tcp 22 --remote-port 20022 -d --token <secret> --server proxy.example.com:9000
+
+# Expose multi-tunnel in background
+linkpulse start config.json -d
+```
+
+When detached mode is requested:
+- Spawns an independent background child process.
+- The parent process returns to the shell immediately.
+- Stdin/stdout/stderr are cleanly detached; child logs are written to `~/.config/linkpulse/logs/<client-id>.log`.
+
+#### Client Management (`clients`)
+
+Manage running and detached LinkPulse client instances:
+
+```bash
+# List all running and managed clients
+linkpulse clients list
+
+# View detailed information for a client (accepts full ID or prefix)
+linkpulse clients info <client-id>
+
+# Gracefully stop a client and remove its local state
+linkpulse clients delete <client-id>
+```
+
+Aliases supported: `client` for `clients`, `ls` for `list`, `show`/`status` for `info`, `stop`/`rm`/`kill` for `delete`.
+
 ### Global options
 
 All commands support:
 
 | Option | Env var | Default | Description |
 |--------|---------|---------|-------------|
+| `-d, --detach` | — | (off) | Run client in background (detached mode) |
 | `--server <host:port>` | `MY_PROXY_SERVER` | `127.0.0.1:9000` | Proxy server address |
 | `--token <secret>` | `MY_PROXY_TOKEN` | (required) | Shared authentication secret |
 | `--grace-time <seconds>` | — | `10` | How long to retry if server unreachable before giving up |
 | `--dashboard <host:port>` | `MY_PROXY_DASHBOARD` | `127.0.0.1:4040` | Local status dashboard |
 | `--no-dashboard` | — | (off) | Disable the dashboard |
-| `--state-file <path>` | — | `~/.my_proxy/state.json` | Where to persist client identity |
+| `--state-file <path>` | — | `~/.config/linkpulse/clients/<id>.json` | Custom state file path |
 | `--log-level <LEVEL>` | — | `INFO` | DEBUG, INFO, WARNING, ERROR |
 
 ### Examples
@@ -408,6 +446,24 @@ my_proxy http 8080 --dashboard 0.0.0.0:8888
 ```
 
 Bind dashboard to all interfaces on port 8888 (security: dashboard has no auth, only bind to trusted networks).
+
+---
+
+## Process Management & State Lifecycle
+
+### Local State Storage
+
+- Client state files are saved in `~/.config/linkpulse/clients/<client-id>.json` (or `$LINKPULSE_STATE_DIR`).
+- Detached process logs are saved in `~/.config/linkpulse/logs/<client-id>.log` (or `$LINKPULSE_LOGS_DIR`).
+- Auth token and saved server address are saved in `~/.config/linkpulse/authtoken.json` and `~/.config/linkpulse/server.json`.
+
+### How Detached Processes Are Managed
+
+- **Identification**: Each client is tracked with a unique `client_id` (UUID hex), PID, start timestamp, target mode, and server address.
+- **Liveness & PID Safety**: When checking or stopping a client, LinkPulse verifies whether the process is alive, not in a zombie state, and that the command line matches Python/LinkPulse. This prevents PID reuse from signaling unrelated processes.
+- **Graceful Termination**: `linkpulse clients delete <client-id>` sends `SIGTERM`, allows up to 3 seconds for graceful disconnection and tunnel closure, escalates to `SIGKILL` only if unresponsive, and removes the state file.
+- **After Reboot**: If the machine reboots, state entries whose PIDs no longer exist are cleanly shown as `stopped` and removed when `clients delete` is called.
+- **Multiple Clients**: Any number of independent client instances can run concurrently in detached mode without conflicting state files.
 
 ---
 
