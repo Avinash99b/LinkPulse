@@ -1527,7 +1527,24 @@ def _spawn_detached(args: argparse.Namespace, mode: str, target_str: str,
 
     env = os.environ.copy()
     if getattr(sys, "frozen", False):
-        env.pop("_MEIPASS2", None)
+        # PyInstaller --onefile bootloader pollutes the environment with
+        # variables that bind the child to the parent's ephemeral temp
+        # extraction directory.  When the parent exits it deletes that
+        # directory, so the child crashes importing base_library.zip.
+        #
+        # Strip every PyInstaller-internal variable so the child performs
+        # a completely independent extraction into its own temp dir.
+        for key in list(env):
+            if key.startswith("_PYI_") or key == "_MEIPASS2":
+                del env[key]
+        # The bootloader also prepends the temp dir to LD_LIBRARY_PATH.
+        # Restore the original value (saved by the bootloader) so the
+        # child's linker doesn't reference the now-deleted parent dir.
+        orig_ldpath = env.pop("LD_LIBRARY_PATH_ORIG", None)
+        if orig_ldpath is not None:
+            env["LD_LIBRARY_PATH"] = orig_ldpath
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
 
     log_fd = open(log_file, "a", encoding="utf-8")
     try:
