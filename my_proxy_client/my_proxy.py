@@ -1488,9 +1488,14 @@ def _spawn_detached(args: argparse.Namespace, mode: str, target_str: str,
     if getattr(sys, "frozen", False):
         # PyInstaller --onefile: sys.executable points inside the ephemeral
         # temp extraction dir (/tmp/_MEIxxxx/...) which is deleted when the
-        # parent exits. sys.argv[0] is the stable on-disk path the user
-        # actually invoked (e.g. /home/user/bin/linkpulse).
-        cmd = [os.path.abspath(sys.argv[0])]
+        # parent exits.  We need the stable on-disk path to the binary.
+        #
+        # sys.argv[0] may be a bare name found via PATH (e.g. "linkpulse"),
+        # so os.path.abspath() would wrongly resolve it relative to cwd.
+        # Use shutil.which() to honour PATH, falling back to abspath.
+        import shutil
+        binary = shutil.which(sys.argv[0]) or os.path.abspath(sys.argv[0])
+        cmd = [binary]
     else:
         cmd = [sys.executable, str(Path(__file__).resolve())]
 
