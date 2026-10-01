@@ -1521,6 +1521,10 @@ def _spawn_detached(args: argparse.Namespace, mode: str, target_str: str,
     }
     managed_state_file.write_text(json.dumps(initial_data, indent=2))
 
+    env = os.environ.copy()
+    if getattr(sys, "frozen", False):
+        env.pop("_MEIPASS2", None)
+
     log_fd = open(log_file, "a", encoding="utf-8")
     try:
         if sys.platform == "win32":
@@ -1532,6 +1536,7 @@ def _spawn_detached(args: argparse.Namespace, mode: str, target_str: str,
                 stderr=subprocess.STDOUT,
                 creationflags=creationflags,
                 close_fds=True,
+                env=env,
             )
         else:
             proc = subprocess.Popen(
@@ -1541,6 +1546,7 @@ def _spawn_detached(args: argparse.Namespace, mode: str, target_str: str,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
                 close_fds=True,
+                env=env,
             )
     finally:
         log_fd.close()
