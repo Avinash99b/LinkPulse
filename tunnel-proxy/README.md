@@ -28,7 +28,7 @@ A minimal, self-hosted alternative to ngrok. One `proxy_server.py`, no external 
 - **Flow control**: Per-stream, credit-based (HTTP/2 style). Backpressure-aware. Prevents one slow tunnel from stalling others
 - **Two public ports**: Port 80 for HTTP tunnels/dashboard, port 9000 for raw TCP control channel. This avoids the issue of cloud platforms terminating TLS at the edge and forwarding only HTTP.
 - **SSL termination**: Handled externally (Render, Cloudflare, or your own nginx). Proxy server runs HTTP only.
-- **Dashboard**: Real-time client/tunnel status, bytes transferred, connection counts, uptime, logs, optional CPU/RAM
+- **Private dashboard**: Server-validated password login, signed expiring HttpOnly session cookie, authenticated stats API, no wildcard CORS; dashboard listener defaults to loopback
 - **SQLite**: Lightweight persistence for bookkeeping & observability
 - **No external services**: Just the proxy binary + SQLite + local files
 - **Docker ready**: Single container (supervisord runs tunnel-proxy + nginx + haproxy), multi-stage build, resource limits optimized for 512MB RAM / 0.5 vCPU
@@ -44,7 +44,7 @@ A minimal, self-hosted alternative to ngrok. One `proxy_server.py`, no external 
 cp .env.example .env
 
 # Edit with your values
-# Required: SHARED_SECRET, WILDCARD_DOMAIN
+# Required: SHARED_SECRET, WILDCARD_DOMAIN, DASHBOARD_PASSWORD
 vim .env
 
 # Build
@@ -73,6 +73,7 @@ pip install -r requirements.txt
 # Run with environment variables
 SHARED_SECRET="your-secret" \
 WILDCARD_DOMAIN="tunnel.example.com" \
+DASHBOARD_PASSWORD="choose-a-long-unique-password" \
 HTTP_PORT=8080 \
 python3 proxy_server.py
 ```
@@ -87,13 +88,15 @@ All configuration is via environment variables:
 |----------|----------|---------|-------------|
 | `SHARED_SECRET` | **Yes** | - | Authentication secret (generate with `openssl rand -hex 32`) |
 | `WILDCARD_DOMAIN` | **Yes** | - | Wildcard domain for tunnels (e.g., `tunnel.example.com`) |
+| `DASHBOARD_PASSWORD` | **Yes for dashboard** | - | Password required to unlock dashboard |
+| `JWT_SECRET` | **Yes for dashboard** | - | High-entropy HS256 JWT signing secret |
 | `CONTROL_HOST` | No | `0.0.0.0` | Control channel bind host |
 | `CONTROL_PORT` | No | `9001` | Control channel port (internal; nginx stream fronts it at `:9000`) |
 | `HTTP_HOST` | No | `0.0.0.0` | HTTP server bind host |
 | `HTTP_PORT` | No | `8080` | HTTP server port |
 | `TCP_PORT_MIN` | No | `20000` | TCP port range minimum |
 | `TCP_PORT_MAX` | No | `20100` | TCP port range maximum |
-| `DASHBOARD_HOST` | No | `0.0.0.0` | Dashboard bind host |
+| `DASHBOARD_HOST` | No | `127.0.0.1` | Standalone dashboard bind host (loopback only by default) |
 | `DASHBOARD_PORT` | No | `8081` | Dashboard port |
 | `HTTP_ONLY` | No | `true` | Use http:// URLs |
 | `HEARTBEAT_INTERVAL` | No | `20` | Heartbeat interval (seconds) |
@@ -103,7 +106,7 @@ All configuration is via environment variables:
 | `LOG_LEVEL` | No | `INFO` | Logging level |
 | `LOG_FILE` | No | `/var/log/tunnel-proxy/tunnel_proxy.log` | Log file path |
 
-**Only `SHARED_SECRET` and `WILDCARD_DOMAIN` are required.** All other variables have sensible defaults.
+**`SHARED_SECRET` and `WILDCARD_DOMAIN` are required for the tunnel service. Set both `DASHBOARD_PASSWORD` and `JWT_SECRET`; the panel fails closed if either is unset. Generate `JWT_SECRET` with `openssl rand -hex 32`. Dashboard JWT sessions persist for 31 days. API clients may authenticate with `Authorization: Bearer <JWT>`. Use HTTPS whenever the dashboard is reachable beyond localhost.**
 
 **Directories are auto-created**: The server automatically creates `/data` and `/var/log/tunnel-proxy` directories if they don't exist.
 
@@ -141,6 +144,8 @@ Two public ports, three internal processes under supervisord:
 4. Add **required** environment variables:
    - `SHARED_SECRET`
    - `WILDCARD_DOMAIN`
+  - `DASHBOARD_PASSWORD` (long, unique secret)
+  - `JWT_SECRET` (random signing key, e.g. `openssl rand -hex 32`)
 5. Add persistent disk at `/data` (1GB)
 6. Set **Ports** to `80` (HTTP) and `9000` (TCP control channel)
 7. Deploy
@@ -168,8 +173,8 @@ Your app will be available at `https://myapp.tunnel.example.com` (via your HTTPS
 
 ## Monitoring
 
-- Dashboard: `http://your-server:80/dashboard/`
-- API: `http://your-server:80/api/stats`
+- Dashboard: `https://your-domain/dashboard/` (requires `DASHBOARD_PASSWORD` and `JWT_SECRET`)
+- Stats API: `/api/stats` (requires a valid dashboard session; no wildcard CORS)
 - Health: `http://your-server:80/health`
 
 ## Project Structure
@@ -237,10 +242,10 @@ Resists replay and proves knowledge of shared secret without sending it.
 - [ ] Ensure DNS has `*.yourdomain` and `yourdomain` pointing to the server
 - [ ] Expose ports 80 (HTTP) and 9000 (control); verify both work
 - [ ] Configure custom domain / HTTPS termination in front (Render, Cloudflare, etc.)
-- [ ] Bind dashboard to `127.0.0.1` or put it behind reverse-proxy auth
+- [x] Dashboard binds to `127.0.0.1` by default and enforces server-side password sessions
 - [ ] Set `tcp.port_range` to your preferred allocation pool
 - [ ] Set resource limits appropriate for your infrastructure
-- [ ] Monitor `tunnel_proxy.log` and the `/api/stats` dashboard
+- [ ] Monitor `tunnel_proxy.log` and the authenticated `/api/stats` dashboard
 
 ## Resource Optimization
 

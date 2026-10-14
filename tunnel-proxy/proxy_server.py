@@ -18,7 +18,9 @@ Configuration via environment variables:
     WILDCARD_DOMAIN      - Required, wildcard domain for tunnels
     TCP_PORT_MIN         - TCP port range minimum (default: 20000)
     TCP_PORT_MAX         - TCP port range maximum (default: 20100)
-    DASHBOARD_HOST       - Dashboard host (default: 0.0.0.0)
+    DASHBOARD_HOST       - Dashboard host (default: 127.0.0.1)
+    DASHBOARD_PASSWORD   - Required password for the private dashboard
+    JWT_SECRET           - Required high-entropy secret used to sign dashboard JWTs
     DASHBOARD_PORT       - Dashboard port (default: 8080)
     HTTP_ONLY            - If true, use http:// URLs (default: true)
     HEARTBEAT_INTERVAL   - Heartbeat interval in seconds (default: 20)
@@ -197,7 +199,9 @@ DEFAULT_CONFIG = {
     "wildcard_domain": "linkpulse.avinash9.in",
     "tcp": {"port_range": [10000, 65535], "bind_host": "0.0.0.0"},
     "udp": {"port_range": [10000, 65535], "bind_host": "0.0.0.0"},
-    "dashboard": {"host": "0.0.0.0", "port": 8081},
+    "dashboard": {"host": "127.0.0.1", "port": 8081},
+    "dashboard_password": "",
+    "jwt_secret": "",
     "http_only": False,
     "tls": {
         "cert_path": "/etc/letsencrypt/live/linkpulse.avinash9.in/fullchain.pem",
@@ -250,6 +254,10 @@ def load_config() -> dict:
         cfg["dashboard"]["host"] = os.environ["DASHBOARD_HOST"]
     if "DASHBOARD_PORT" in os.environ:
         cfg["dashboard"]["port"] = int(os.environ["DASHBOARD_PORT"])
+    if "DASHBOARD_PASSWORD" in os.environ:
+        cfg["dashboard_password"] = os.environ["DASHBOARD_PASSWORD"]
+    if "JWT_SECRET" in os.environ:
+        cfg["jwt_secret"] = os.environ["JWT_SECRET"]
     if "HTTP_ONLY" in os.environ:
         cfg["http_only"] = os.environ["HTTP_ONLY"].lower() in ("true", "1", "yes")
     if "HEARTBEAT_INTERVAL" in os.environ:
@@ -476,16 +484,24 @@ def is_root_domain(host: str, wildcard_domain: str) -> bool:
     return h == w or h in ("localhost", "127.0.0.1")
 
 
-async def send_server_response(writer: asyncio.StreamWriter, ctx: ServerContext, req_path: str):
-    status, body, content_type = dashboard_mod.build_response(ctx, req_path)
-    status_text = "OK" if status == 200 else "Not Found"
+async def send_server_response(writer: asyncio.StreamWriter, ctx: ServerContext, req_path: str,
+                              method: str = "GET", headers: dict | None = None, body: bytes = b""):
+    status, response_body, content_type, extra_headers = dashboard_mod.build_response(
+        ctx, req_path, method, headers or {}, body
+    )
+    status_text = {200: "OK", 303: "See Other", 401: "Unauthorized", 404: "Not Found",
+                   413: "Payload Too Large", 415: "Unsupported Media Type", 503: "Service Unavailable"}.get(status, "Error")
     resp = (
         f"HTTP/1.1 {status} {status_text}\r\n"
         f"Content-Type: {content_type}\r\n"
-        f"Content-Length: {len(body)}\r\n"
-        f"Access-Control-Allow-Origin: *\r\n"
+        f"X-Content-Type-Options: nosniff\r\n"
+        f"X-Frame-Options: DENY\r\n"
+        f"Referrer-Policy: no-referrer\r\n"
+        f"Content-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'\r\n"
+        f"Content-Length: {len(response_body)}\r\n"
+        f"{extra_headers}"
         f"Connection: close\r\n\r\n"
-    ).encode() + body
+    ).encode("latin-1") + response_body
     try:
         writer.write(resp)
         await writer.drain()
@@ -511,18 +527,27 @@ async def handle_public_http_conn(reader: asyncio.StreamReader, writer: asyncio.
         request_line = header_bytes.split(b"\r\n", 1)[0].decode(errors="replace")
         parts = request_line.split()
         req_path = parts[1] if len(parts) >= 2 else "/"
-        method = parts[0] if parts else "GET"
+        method = parts[0].upper() if parts else "GET"
     except Exception:
         req_path = "/"
         method = "GET"
 
     host = extract_host(header_bytes)
+    request_headers = {}
+    for header_line in header_bytes.split(b"\r\n")[1:]:
+        if not header_line:
+            break
+        if b":" in header_line:
+            key, value = header_line.decode("latin-1").split(":", 1)
+            request_headers[key.strip().lower()] = value.strip()
     if not host:
         await send_http_error(writer, 400, "Bad Request (missing Host header)")
         return
 
     # Only answer as proxy server/dashboard if request is targeting the root configured domain (or localhost/127.0.0.1).
     if is_root_domain(host, ctx.config["wildcard_domain"]):
+        # Cookie Secure is set from the actual listener TLS state, not request headers.
+        ctx.dashboard_secure_cookie = bool(is_https or (not ctx.config.get("http_only") and _load_ssl_context(ctx.config) is not None))
         if not is_https and not ctx.config.get("http_only") and _load_ssl_context(ctx.config) is not None:
             redirect = f"https://{host}{req_path}"
             resp = (
@@ -536,7 +561,24 @@ async def handle_public_http_conn(reader: asyncio.StreamReader, writer: asyncio.
                 pass
             writer.close()
             return
-        await send_server_response(writer, ctx, req_path)
+        # The dashboard login is POST-backed; read a bounded form body before
+        # authentication handling. Other public-root requests are dashboard-only.
+        request_body = b""
+        if method == "POST":
+            try:
+                body_size = int(request_headers.get("content-length", "0"))
+            except ValueError:
+                body_size = -1
+            if body_size < 0 or body_size > 8192:
+                await send_http_error(writer, 413, "Payload Too Large")
+                return
+            if body_size:
+                try:
+                    request_body = await asyncio.wait_for(reader.readexactly(body_size), timeout=5)
+                except (asyncio.TimeoutError, asyncio.IncompleteReadError):
+                    await send_http_error(writer, 400, "Bad Request")
+                    return
+        await send_server_response(writer, ctx, req_path, method, request_headers, request_body)
         return
 
     wildcard = ctx.config["wildcard_domain"].lower()

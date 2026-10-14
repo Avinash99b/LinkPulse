@@ -67,8 +67,7 @@ docker logs -f tunnel-proxy
 curl http://localhost/health
 
 # Test dashboard (via haproxy -> nginx -> dashboard)
-curl http://localhost/dashboard/
-curl http://localhost/api/stats
+curl -i http://localhost/dashboard/  # login screen only; dashboard data requires password login
 ```
 
 ## Environment Variables
@@ -77,13 +76,15 @@ curl http://localhost/api/stats
 |----------|----------|---------|-------------|
 | `SHARED_SECRET` | **Yes** | - | Authentication secret (generate with `openssl rand -hex 32`) |
 | `WILDCARD_DOMAIN` | **Yes** | - | Wildcard domain for tunnels (e.g., `tunnel.example.com`) |
+| `DASHBOARD_PASSWORD` | **Yes for dashboard** | - | Password required to unlock dashboard |
+| `JWT_SECRET` | **Yes for dashboard** | - | High-entropy HS256 JWT signing secret |
 | `CONTROL_HOST` | No | `0.0.0.0` | Control channel bind host |
 | `CONTROL_PORT` | No | `9001` | Control channel port (internal; nginx stream fronts it at `:9000`) |
 | `HTTP_HOST` | No | `0.0.0.0` | HTTP server bind host |
 | `HTTP_PORT` | No | `8080` | HTTP server port |
 | `TCP_PORT_MIN` | No | `20000` | TCP port range minimum |
 | `TCP_PORT_MAX` | No | `20100` | TCP port range maximum |
-| `DASHBOARD_HOST` | No | `0.0.0.0` | Dashboard bind host |
+| `DASHBOARD_HOST` | No | `127.0.0.1` | Standalone dashboard bind host (loopback only by default) |
 | `DASHBOARD_PORT` | No | `8081` | Dashboard port |
 | `HTTP_ONLY` | No | `true` | Use http:// URLs |
 | `HEARTBEAT_INTERVAL` | No | `20` | Heartbeat interval (seconds) |
@@ -93,7 +94,7 @@ curl http://localhost/api/stats
 | `LOG_LEVEL` | No | `INFO` | Logging level |
 | `LOG_FILE` | No | `/var/log/tunnel-proxy/tunnel_proxy.log` | Log file path |
 
-**Only `SHARED_SECRET` and `WILDCARD_DOMAIN` are required.** All other variables have sensible defaults.
+**`SHARED_SECRET` and `WILDCARD_DOMAIN` are required for the tunnel service. Set both `DASHBOARD_PASSWORD` and `JWT_SECRET`; the panel fails closed if either is unset. Generate `JWT_SECRET` with `openssl rand -hex 32`. Dashboard JWT sessions persist for 31 days. API clients may authenticate with `Authorization: Bearer <JWT>`. Use HTTPS whenever the dashboard is reachable beyond localhost.**
 
 > In the container, `CONTROL_PORT` is set to `9001` so that nginx's stream module (listening on `:9000`) can front the control channel. Do not change it back to `9000` in `.env` — that would collide with nginx's listener.
 
@@ -107,6 +108,8 @@ curl http://localhost/api/stats
 4. Add **required** environment variables:
    - `SHARED_SECRET`
    - `WILDCARD_DOMAIN`
+  - `DASHBOARD_PASSWORD` (long, unique secret)
+  - `JWT_SECRET` (random signing key, e.g. `openssl rand -hex 32`)
 5. Add persistent disk at `/data` (1GB)
 6. Set **Ports** to `80` (HTTP) and `9000` (TCP control channel)
 7. Deploy
@@ -140,8 +143,8 @@ deploy:
 
 ## Monitoring
 
-- Dashboard: `http://your-server:80/dashboard/`
-- API: `http://your-server:80/api/stats`
+- Dashboard: `https://your-domain/dashboard/` (requires `DASHBOARD_PASSWORD` and `JWT_SECRET`)
+- Stats API: `/api/stats` (requires a valid dashboard session; no wildcard CORS)
 - Health: `http://your-server:80/health`
 
 ## Client Usage
