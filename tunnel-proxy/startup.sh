@@ -139,7 +139,7 @@ detect() {
       "$DATA_DIR/letsencrypt/live/$DOMAIN/fullchain.pem" \
       "/etc/letsencrypt/live/$DOMAIN/fullchain.pem"; do
     [ -n "$DOMAIN" ] || break
-    if [ -e "$candidate" ]; then
+    if readable "$candidate"; then
       CERT_FILE=$candidate
       break
     fi
@@ -166,7 +166,7 @@ detect() {
   fi
 
   # Existing database (clients/tunnels bookkeeping)
-  if [ -e "$DATA_DIR/tunnel_proxy.db" ]; then
+  if readable "$DATA_DIR/tunnel_proxy.db"; then
     printf '  %-16s %s\n' "database" "$DATA_DIR/tunnel_proxy.db ($(run_readable du -h "$DATA_DIR/tunnel_proxy.db" 2>/dev/null | cut -f1))"
   else
     printf '  %-16s %s\n' "database" "not created yet ($DATA_DIR/tunnel_proxy.db)"
@@ -205,16 +205,14 @@ detect() {
 
   # DNS: apex + wildcard must both point here
   if [ -n "$DOMAIN" ]; then
-    PUBLIC_IP=$(curl -fsS --max-time 4 -H "Authorization: Bearer Oracle" \
-      http://169.254.169.254/opc/v2/vnics/ 2>/dev/null \
-      | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d[0].get("publicIp") or "")' 2>/dev/null)
-    if [ -n "$PUBLIC_IP" ]; then IS_ORACLE=1; else
-      PUBLIC_IP=$(curl -fsS --max-time 4 https://api.ipify.org 2>/dev/null || true)
-    fi
-    if [ -z "$PUBLIC_IP" ] && curl -fsS --max-time 3 -H "Authorization: Bearer Oracle" \
+    if curl -fsS --max-time 3 -H "Authorization: Bearer Oracle" \
         http://169.254.169.254/opc/v2/instance/ >/dev/null 2>&1; then
       IS_ORACLE=1
     fi
+    PUBLIC_IP=$(curl -fsS --max-time 4 -H "Authorization: Bearer Oracle" \
+      http://169.254.169.254/opc/v2/vnics/ 2>/dev/null \
+      | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d[0].get("publicIp") or "")' 2>/dev/null)
+    [ -n "$PUBLIC_IP" ] || PUBLIC_IP=$(curl -fsS --max-time 4 https://api.ipify.org 2>/dev/null || true)
     local apex wild
     apex=$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk 'NR==1{print $1}')
     wild=$(getent ahostsv4 "wildcard-probe.$DOMAIN" 2>/dev/null | awk 'NR==1{print $1}')
