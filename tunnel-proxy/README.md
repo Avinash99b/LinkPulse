@@ -4,17 +4,16 @@ A minimal, self-hosted alternative to ngrok. One `proxy_server.py`, no external 
 
 ```
                                           ┌────────────────────────────────────┐
-    HTTP  app.tunnel.example.com          │         Single container           │
-    ───────────────────────────────────▶  │  :80  haproxy (HTTP only)          │
+    HTTP(S) app.tunnel.example.com        │         Single container           │
+    ───────────────────────────────────▶  │  :80   HTTP (redirect + health)    │
+                                          │  :443  HTTPS (tunnels + dashboard) │
+    Control channel (client)              │  :9000 control channel (raw TCP)   │
+    ───────────────────────────────────▶  │  range TCP/UDP tunnel listeners    │
                                           │         │                          │
-    Control channel (client)              │  :9000 nginx stream (raw TCP)      │
-    ───────────────────────────────────▶  │         │                          │
-                                          │   nginx :8088 (HTTP)               │  persistent
-                                          │         │                          │◀───multiplexed───▶  client
-                                          │   proxy_server.py                 │      connection     (your
-                                          │  - control channel (auth)         │                       laptop /
-                                          │  - HTTP router                    │                       server)
-                                          │  - TCP listeners                  │
+                                          │   proxy_server.py                 │◀───multiplexed───▶  client
+                                          │  - control channel (auth)         │      connection     (your
+                                          │  - HTTP router by Host header     │                       laptop /
+                                          │  - TCP/UDP listeners per tunnel   │                       server)
                                           │  - SQLite bookkeeping             │
                                           └────────────────────────────────────┘
 ```
@@ -26,12 +25,13 @@ A minimal, self-hosted alternative to ngrok. One `proxy_server.py`, no external 
 - **TCP routing**: Random port allocation (or preferred port, if free). Concurrent TCP listeners, one per tunnel
 - **Multiplexing**: One persistent connection carries many logical streams. Each stream = one HTTP request-connection or one TCP connection
 - **Flow control**: Per-stream, credit-based (HTTP/2 style). Backpressure-aware. Prevents one slow tunnel from stalling others
-- **Two public ports**: Port 80 for HTTP tunnels/dashboard, port 9000 for raw TCP control channel. This avoids the issue of cloud platforms terminating TLS at the edge and forwarding only HTTP.
-- **SSL termination**: Handled externally (Render, Cloudflare, or your own nginx). Proxy server runs HTTP only.
-- **Private dashboard**: Server-validated password login, signed expiring HttpOnly session cookie, authenticated stats API, no wildcard CORS; dashboard listener defaults to loopback
+- **Tunnel ownership modes**: `handoff` (default — the newest client claiming a subdomain/port takes it over and the previous owner is told) or `lease` (the name is reserved and other clients are refused)
+- **TLS in the container**: certbot obtains/renews the wildcard certificate (DNS challenge) and `proxy_server.py` terminates HTTPS itself; `EXTERNAL_SSL=true` or `HTTP_ONLY=true` delegate TLS elsewhere
+- **Private dashboard**: Server-validated password login, signed expiring HttpOnly cookie, authenticated stats API, no wildcard CORS; listener defaults to loopback
 - **SQLite**: Lightweight persistence for bookkeeping & observability
-- **No external services**: Just the proxy binary + SQLite + local files
-- **Docker ready**: Single container (supervisord runs tunnel-proxy + nginx + haproxy), multi-stage build, resource limits optimized for 512MB RAM / 0.5 vCPU
+- **No external services**: Just the proxy process + SQLite + local files
+- **Docker ready**: Single container, single process (`entrypoint.sh` → `proxy_server.py`), multi-stage build, resource limits tuned for 512 MB RAM / 0.5 vCPU
+- **Deployment helper**: `startup.sh` detects existing state (container, image, certificates, DNS, ports) and restarts/redeploys/rebuilds accordingly
 - **Environment-based config**: No config files needed, all via environment variables
 - **Auto directory creation**: DB and log directories created automatically
 
@@ -48,31 +48,64 @@ vim .env
 ./startup.sh
 
 # Non-interactive equivalents:
-./startup.sh --action restart                                    # restart as-is (fastest)
-./startup.sh --action redeploy --mode 3 --range 20000-20100 -y   # http + tcp + udp
-./startup.sh --action rebuild  --mode 3 --range 20000-20100 -y   # rebuild, then swap
+./startup.sh --action restart                                  # restart as-is (fastest)
+./startup.sh --action redeploy --mode 4 --range 20000-20100 -y # host networking (recommended on a VPS)
+./startup.sh --action redeploy --mode 3 --range 20000-20004 -y # bridge + 5 mapped ports
+./startup.sh --action rebuild  --mode 4 --range 20000-20100 -y # rebuild, then swap
 ```
 
-Manual equivalent of the default layout (HTTP + TCP + UDP tunnels):
+> **On a small VPS (Oracle Cloud always-free, 1 vCPU / 1 GB) use host
+> networking (`--network host`, mode 4), not a wide `-p` port range.**
+> Mapping a whole range makes Docker create one iptables DNAT rule **and one
+> `docker-proxy` process per port** at container start. On a single vCPU that
+> starves the CPU, delays the listeners from binding and the container gets
+> marked `unhealthy` (the health check has a 15 s grace period and 3 retries).
+> Host networking binds the ports directly with no NAT rules and no proxy
+> processes, so the server is up in ~2 s. See
+> [Why port mapping is expensive](#why-port-mapping-is-expensive-on-small-instances).
+
+**Recommended on a VPS (host networking, no port mapping at all):**
 
 ```bash
 docker build -t tunnel-proxy .
 
 docker run -d --name tunnel-proxy --restart unless-stopped \
-  -p 80:80 \
-  -p 443:443 \
-  -p 9000:9000 \
-  -p 20000-20100:20000-20100 \
-  -p 20000-20100:20000-20100/udp \
+  --network host \
   -e TCP_PORT_MIN=20000 -e TCP_PORT_MAX=20100 \
   -e UDP_PORT_MIN=20000 -e UDP_PORT_MAX=20100 \
   --env-file .env \
   -v /data:/data \
   -v /var/log:/var/log \
   tunnel-proxy
+```
 
-# Check health
-curl http://localhost/health
+With `--network host` the container binds 80, 443, 9000 and the whole tunnel
+range directly on the host, so `-p` is unnecessary (and ignored). Open those
+ports in the host firewall and in the cloud security list/NSG instead:
+
+```bash
+sudo iptables -I INPUT 1 -p tcp -m multiport --dports 80,443,9000 -j ACCEPT
+sudo iptables -I INPUT 1 -p tcp --dport 20000:20100 -j ACCEPT
+sudo iptables -I INPUT 1 -p udp --dport 20000:20100 -j ACCEPT
+sudo netfilter-persistent save     # if iptables-persistent is installed
+```
+
+Bridge networking (port mapping) — only with a **small** range:
+
+```bash
+docker run -d --name tunnel-proxy --restart unless-stopped \
+  -p 80:80 \
+  -p 443:443 \
+  -p 9000:9000 \
+  -p 20000-20005:20000-20005 \
+  -e TCP_PORT_MIN=20000 -e TCP_PORT_MAX=20005 \
+  --env-file .env \
+  -v /data:/data \
+  -v /var/log:/var/log \
+  tunnel-proxy
+
+# Check health (301 is expected: HTTP redirects to HTTPS)
+curl -si http://localhost/health | head -1
 ```
 
 HTTP-only (two public ports plus the control channel — no raw TCP/UDP tunnels):
@@ -90,13 +123,13 @@ restarting the container keeps client history and reuses existing certificates.
 
 ### Ports and tunnel types
 
-| Port(s) | Needed for | Notes |
-|---------|------------|-------|
-| `80` | `/health`, HTTP tunnels, apex→HTTPS redirect | Always publish |
-| `443` | HTTPS tunnels + dashboard | Unless `HTTP_ONLY=true` / external TLS |
-| `9000` | Control channel (`CONTROL_PORT`) | Every client connects here |
-| `TCP_PORT_MIN..TCP_PORT_MAX` | raw `tcp` tunnels | Publish **1:1** (`-p 20000-20100:20000-20100`) |
-| `UDP_PORT_MIN..UDP_PORT_MAX` | raw `udp` tunnels | Same range with `/udp` |
+| Port(s) | Needed for | How to expose |
+|---------|------------|---------------|
+| `80` | `/health`, HTTP tunnels, apex→HTTPS redirect | Host networking, or `-p 80:80` |
+| `443` | HTTPS tunnels + dashboard | Host networking, or `-p 443:443` (unless `HTTP_ONLY=true` / external TLS) |
+| `9000` | Control channel (`CONTROL_PORT`) | Host networking, or `-p 9000:9000` — every client connects here |
+| `TCP_PORT_MIN..TCP_PORT_MAX` | raw `tcp` tunnels | Host networking (**recommended**), or `-p 20000-20100:20000-20100` |
+| `UDP_PORT_MIN..UDP_PORT_MAX` | raw `udp` tunnels | Host networking, or the same range with `/udp` |
 
 - **HTTP tunnels never need extra ports**: every `http` tunnel is routed by the
   `Host` header / subdomain through the shared 80/443 listener, so 80/443+9000
@@ -104,21 +137,66 @@ restarting the container keeps client history and reuses existing certificates.
   ones that consume a dedicated public port.
 - `EXPOSE` in the Dockerfile is documentation only; nothing is reachable from
   outside the container unless it is published with `-p` (or `--network host`).
-  Publishing must also be 1:1: the server advertises the container-side port
+  Mapping must also be 1:1: the server advertises the container-side port
   number, so `-p 30000:20000` would advertise a port nobody can reach.
 - The server only verifies that an allocated port is *bindable inside the
   container*. An unpublished port therefore shows up as a `ready` tunnel that is
-  unreachable from the internet — keep the published range and the
+  unreachable from the internet — keep the exposed range and the
   `TCP_PORT_MIN/MAX` (and `UDP_*`) values identical.
-- Keep the range small (~100 ports). Each published port costs an iptables DNAT
-  rule (and, with Docker's default userland proxy, a proxy listener); a range
-  like `10000-65535` is impractical and often rejected by cloud firewalls.
 - With bridge networking Docker routes published ports through its own
   DNAT/FORWARD rules, so a restrictive host `INPUT` chain does **not** block
   them. With `--network host` (or the direct Python run) the server binds the
   host directly and the host firewall must allow 80, 443, 9000 and the range.
 - On Oracle Cloud (and any cloud) the VCN security list / NSG must also allow
   those ports — that is outside the host.
+
+#### Why port mapping is expensive on small instances
+
+`docker run -p 20000-20100:20000-20100` does **not** open a range cheaply. For
+every single published port Docker adds an iptables DNAT rule **and**, with the
+default userland proxy, starts a `docker-proxy` process that listens on it. A
+100-port TCP range plus the same UDP range is ~200 rules and ~200 extra
+processes created in the few seconds the container starts.
+
+On a 1 vCPU / 1 GB instance (Oracle Cloud always-free `VM.Standard.E2.1.Micro`
+is exactly that) this saturates the CPU while the container is still starting:
+
+- the server's listeners bind late, so `docker run` looks like it hangs;
+- the health check (15 s start period, 3 retries, 30 s interval) can flip the
+  container to `unhealthy` before it ever answers — which is what makes a
+  redeploy appear to fail and roll back;
+- the whole host becomes unresponsive for tens of seconds, so existing tunnels
+  and even SSH sessions stutter (`thrashing`).
+
+Numbers to keep in mind: 3 published ports ≈ instant; 20 ports ≈ noticeably
+slow on 1 vCPU; 100+ ports per protocol can take long enough to fail the health
+check; a range like `10000-65535` is unusable (and usually rejected by cloud
+firewalls).
+
+**Recommendation for any VPS (and required on 1 vCPU): use host networking.**
+
+```bash
+docker run -d --name tunnel-proxy --restart unless-stopped \
+  --network host \
+  -e TCP_PORT_MIN=20000 -e TCP_PORT_MAX=20100 \
+  -e UDP_PORT_MIN=20000 -e UDP_PORT_MAX=20100 \
+  --env-file .env -v /data:/data -v /var/log:/var/log tunnel-proxy
+```
+
+No DNAT rules, no `docker-proxy` processes, no startup lag: the server binds
+80/443/9000 and the tunnel range directly and is up in ~2 s. The trade-off is
+that the host firewall (`INPUT`) and the cloud security list must allow those
+ports — see the `iptables` snippet above.
+
+If you must use bridge networking:
+
+- keep the mapped range as small as you can (5-20 ports covers most `tcp`/`udp`
+  needs; idle tunnels release their port);
+- or disable the userland proxy in `/etc/docker/daemon.json`
+  (`{"userland-proxy": false}`) and restart Docker — this removes the per-port
+  `docker-proxy` processes (DNAT rules remain, which is cheap);
+- do not map a protocol you do not use (skip the `/udp` flag if you only need
+  `http` and `tcp` tunnels).
 
 ### 2. Direct Python Run (Development)
 
@@ -134,7 +212,9 @@ HTTP_PORT=8080 \
 python3 proxy_server.py
 ```
 
-> The dev run binds control on `:9000`, HTTP on `:8080`, and dashboard on `:8081` directly (no HAProxy/nginx in front).
+> The dev run binds control on `:9000`, HTTP on `:8080` and dashboard on `:8081`
+> directly (override with `HTTP_PORT`/`DASHBOARD_PORT`). Add
+> `TCP_PORT_MIN`/`TCP_PORT_MAX` (and `UDP_*`) to enable raw TCP/UDP tunnels.
 
 ## Configuration
 
@@ -152,10 +232,10 @@ All configuration is via environment variables:
 | `HTTP_PORT` | No | `80` | HTTP server port |
 | `HTTPS_HOST` | No | `0.0.0.0` | HTTPS server bind host |
 | `HTTPS_PORT` | No | `443` | HTTPS server port |
-| `TCP_PORT_MIN` | No | `10000` | TCP tunnel port range minimum (publish it!) |
-| `TCP_PORT_MAX` | No | `65535` | TCP tunnel port range maximum (publish it!) |
-| `UDP_PORT_MIN` | No | `10000` | UDP tunnel port range minimum (publish it!) |
-| `UDP_PORT_MAX` | No | `65535` | UDP tunnel port range maximum (publish it!) |
+| `TCP_PORT_MIN` | No | `10000` | TCP tunnel range minimum — set it to the range you expose (e.g. `20000`) |
+| `TCP_PORT_MAX` | No | `65535` | TCP tunnel range maximum (e.g. `20100`) |
+| `UDP_PORT_MIN` | No | `10000` | UDP tunnel range minimum (e.g. `20000`) |
+| `UDP_PORT_MAX` | No | `65535` | UDP tunnel range maximum (e.g. `20100`) |
 | `DASHBOARD_HOST` | No | `127.0.0.1` | Standalone dashboard bind host (loopback only by default) |
 | `DASHBOARD_PORT` | No | `8081` | Dashboard port |
 | `HTTP_ONLY` | No | `true` | Use http:// URLs |
@@ -281,23 +361,23 @@ design intact.
 
 - Dashboard: `https://your-domain/dashboard/` (requires `DASHBOARD_PASSWORD` and `JWT_SECRET`)
 - Stats API: `/api/stats` (requires a valid dashboard session; no wildcard CORS)
-- Health: `http://your-server:80/health`
+- Health: `http://your-server/health` (an HTTPS-enabled deployment answers 301
+  on port 80 and serves the real `/health` on 443 — both count as up)
 
 ## Project Structure
 
 ```
-proxy_server.py       Main server (entry point)
+proxy_server.py       Main server (entry point; binds every port itself)
 protocol.py           Canonical wire protocol (frames, auth, constants)
 storage.py            SQLite persistence (clients/tunnels bookkeeping)
-dashboard.py          Read-only status dashboard (HTML + JSON API)
+dashboard.py          Status dashboard (password auth + JSON API)
+entrypoint.sh         Root entrypoint: volumes, certbot, then proxy_server.py
+startup.sh            Interactive deploy helper (detect, build, swap, rollback)
+Dockerfile            Single multi-stage build
+.env.example          Environment template
 config.example.json   Config template (legacy)
 requirements.txt      Optional deps (psutil)
 examples/reference_client.py  Illustrative client implementation
-haproxy.cfg           HAProxy config: HTTP front door on :80
-nginx.conf            Nginx config: HTTP proxy (:8088) + stream control (:9000)
-supervisord.conf      Runs proxy_server.py + nginx + haproxy in one container
-entrypoint.sh         Root entrypoint: chowns mounted volumes, starts supervisord
-Dockerfile            Single multi-stage build for everything
 DEPLOYMENT.md         Detailed deployment guide
 ```
 
