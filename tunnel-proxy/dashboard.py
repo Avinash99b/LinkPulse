@@ -133,6 +133,7 @@ _HTML = """<!doctype html>
   th { color:#8a90a2; font-weight:500; text-transform:uppercase; font-size:11px; letter-spacing:.04em; }
   .tag { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11px; background:#26314a; color:#8fb3ff; margin-right:4px; }
   .tag.tcp { background:#312a1a; color:#e8b96a; }
+  .tag.lease { background:#1f3326; color:#6ee7a0; }
   section { margin-bottom:28px; }
   h2 { font-size:15px; margin:0 0 10px; color:#c3c7d1; }
   #log { background:#0b0d11; border:1px solid #262b36; border-radius:10px; padding:10px 14px; height:220px; overflow-y:auto; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; white-space:pre-wrap; }
@@ -201,19 +202,20 @@ async function refresh() {
     clientsEl.innerHTML = data.clients.map(c => `
       <table style="margin-bottom:14px;">
         <thead><tr>
-          <th colspan="6">Client ${c.client_id.slice(0,12)}&hellip; &middot; connected ${fmtUptime(c.connected_for)} ago &middot; ${fmtBytes(c.bytes_in)} in / ${fmtBytes(c.bytes_out)} out</th>
+          <th colspan="7">Client ${c.client_id.slice(0,12)}&hellip; &middot; connected ${fmtUptime(c.connected_for)} ago &middot; ${fmtBytes(c.bytes_in)} in / ${fmtBytes(c.bytes_out)} out</th>
         </tr>
-        <tr><th>Tunnel</th><th>Type</th><th>Public address</th><th>Connections</th><th>Bytes in</th><th>Bytes out</th></tr></thead>
+        <tr><th>Tunnel</th><th>Type</th><th>Mode</th><th>Public address</th><th>Connections</th><th>Bytes in</th><th>Bytes out</th></tr></thead>
         <tbody>
         ${ c.tunnels.length ? c.tunnels.map(t => `
           <tr>
             <td>${t.tunnel_id.slice(0,8)}</td>
             <td><span class="tag ${t.type}">${t.type}</span></td>
+            <td><span class="tag ${t.mode === 'lease' ? 'lease' : ''}">${t.mode || 'handoff'}</span></td>
             <td>${t.public_address}</td>
             <td>${t.connections}</td>
             <td>${fmtBytes(t.bytes_in)}</td>
             <td>${fmtBytes(t.bytes_out)}</td>
-          </tr>`).join('') : '<tr><td colspan="6" class="empty">No active tunnels</td></tr>' }
+          </tr>`).join('') : '<tr><td colspan="7" class="empty">No active tunnels</td></tr>' }
         </tbody>
       </table>
     `).join('');
@@ -248,6 +250,9 @@ def build_stats(ctx) -> dict:
                 tunnels.append({
                     "tunnel_id": tid,
                     "type": t.type,
+                    # Duck-typed tunnel objects (and tunnels created by an
+                    # older server) may not carry an ownership mode.
+                    "mode": getattr(t, "mode", "handoff"),
                     "public_address": public_address,
                     "connections": t.connection_count,
                     "bytes_in": t.bytes_in,

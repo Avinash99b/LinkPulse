@@ -1,6 +1,6 @@
 # my_proxy — Project Index
 
-**1,098 lines of production-quality Python.** Zero external dependencies (uses only stdlib). Fully tested against the real `proxy_server.py` with authentic HTTP/TCP routing, reconnect behavior, and graceful shutdown verified.
+**~2,300 lines of production-quality Python.** Zero external dependencies (uses only stdlib). Fully tested against the real `proxy_server.py` with authentic HTTP/TCP routing, reconnect behavior, and graceful shutdown verified.
 
 ## What is this?
 
@@ -12,7 +12,7 @@ Think of it like ngrok, but self-hosted on your own infrastructure. `my_proxy` i
 
 | File | Purpose |
 |------|---------|
-| **my_proxy** | Single-file client (1,098 lines). Executable Python script. |
+| **my_proxy** | Single-file client (~2,300 lines). Executable Python script. |
 | **README.md** | Full documentation: CLI reference, config, troubleshooting, security notes. |
 | **QUICKSTART.md** | Quick start guide with examples and testing instructions. |
 | **PROTOCOL.md** | Wire protocol specification (for client/server implementers). |
@@ -20,7 +20,7 @@ Think of it like ngrok, but self-hosted on your own infrastructure. `my_proxy` i
 | **requirements.txt** | Python dependencies (intentionally empty — no external deps). |
 | **INDEX.md** | This file. |
 
-**Total: 1,098 lines, ~45 KB, zero dependencies.**
+**Total: ~2,300 lines, zero dependencies.**
 
 ## Quick start
 
@@ -67,7 +67,8 @@ Dashboard: http://127.0.0.1:4040
 
 ✅ **Single persistent connection** — All tunnels multiplexed over one TCP connection  
 ✅ **HTTP and TCP forwarding** — Host-based routing for HTTP; random ports for TCP  
-✅ **Automatic reconnect** — Exponential backoff with grace period (default 10s)  
+✅ **Reconnects forever** — Retries every 5s and never gives up (grace period only escalates log level)  
+✅ **Tunnel ownership modes** — handoff (default) or `--lease` for names that must not be taken over  
 ✅ **Local dashboard** — Real-time status, metrics, logs (default `127.0.0.1:4040`)  
 ✅ **Flow control** — Per-stream, credit-based, prevents stalling  
 ✅ **Graceful shutdown** — SIGINT/SIGTERM closes tunnels cleanly  
@@ -83,7 +84,7 @@ Dashboard: http://127.0.0.1:4040
 ✅ Multiplexing — multiple streams on one connection  
 ✅ Flow control — per-stream windows, backpressure working  
 ✅ Dashboard — stats JSON and HTML rendering correct  
-✅ Reconnect logic — exponential backoff, grace period exit  
+✅ Reconnect logic — retries indefinitely, recovers tunnels  
 ✅ Invalid auth — fails immediately, doesn't retry  
 ✅ Local service down — fails per-request, doesn't hang  
 ✅ Graceful shutdown (SIGINT) — clean disconnect, no spurious errors  
@@ -92,7 +93,7 @@ Dashboard: http://127.0.0.1:4040
 
 ```
 my_proxy_client/
-├── my_proxy                 # Main client (1,098 lines)
+├── my_proxy                 # Main client (single file, stdlib only)
 ├── README.md                # Full documentation
 ├── QUICKSTART.md            # Quick start examples
 ├── PROTOCOL.md              # Wire protocol spec
@@ -134,7 +135,9 @@ All commands support:
 ```
 --server HOST:PORT              Proxy server (default: 127.0.0.1:9000, env: MY_PROXY_SERVER)
 --token SECRET                  Shared secret (required, env: MY_PROXY_TOKEN)
---grace-time SECONDS            Retry timeout (default: 10s)
+--lease                         Lease the requested name instead of taking it over
+--retry-interval SECONDS        Delay between reconnect attempts (default: 5s)
+--grace-time SECONDS            Escalate retry logs to errors after this long (default: 10s)
 --dashboard HOST:PORT           Dashboard address (default: 127.0.0.1:4040, env: MY_PROXY_DASHBOARD)
 --no-dashboard                  Disable dashboard
 --state-file PATH               Persist client ID (default: ~/.my_proxy/state.json)
@@ -164,11 +167,17 @@ See [PROTOCOL.md](PROTOCOL.md) for the full wire protocol spec.
 
 ## Reliability features
 
-### Reconnect with backoff
+### Reconnect forever
 If the server becomes unreachable:
-- Retry with exponential backoff: 0.5s, 1s, 2s, 4s, 8s, ...
-- After `--grace-time` (default 10s) with no server, exit
+- Retry every `--retry-interval` seconds (default 5s), indefinitely
+- `--grace-time` only switches retry messages from warnings to errors; the client never exits on its own
 - Re-registers tunnels on reconnect (recovers same subdomains/ports if free)
+- A registration that fails (name in use/leased, no ports) is retried every `--retry-interval` seconds too
+
+### Tunnel ownership modes
+- `handoff` (default): the newest client claiming a name takes it over; the previous owner is told `Tunnel 'x' was handed off to a new client` and stops serving it (exiting if it has nothing left)
+- `lease` (`--lease`): the name is reserved — other clients are refused, and this client will not take over a name already in use
+- Two processes on one machine share the persisted client_id but send a distinct instance id, so they are treated as competitors rather than as a reconnect
 
 ### Local service failure
 If the backend is down (connection refused):

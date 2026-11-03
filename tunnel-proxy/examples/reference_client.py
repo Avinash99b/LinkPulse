@@ -13,6 +13,10 @@ Usage:
     python3 reference_client.py --server proxy.example.com:9000 \\
         --secret <shared_secret> --local-http 127.0.0.1:3000 --subdomain myapp
 
+Add --mode lease to reserve the requested name instead of letting a newer
+client take it over (the default is handoff mode, where the newest claimant
+wins and the previous owner is told why).
+
 Persists its client_id in .client_id.json next to this script so that
 restarts reconnect as the same client (and can request the same
 subdomain/port again).
@@ -23,6 +27,7 @@ import argparse
 import asyncio
 import json
 import os
+import secrets
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -56,6 +61,9 @@ class TunnelClient:
         self.write_lock = asyncio.Lock()
         self.local_writers = {}  # stream_id -> asyncio.StreamWriter (to local backend)
         self.send_windows = {}   # stream_id -> available credit toward the server
+        # One id per process: lets the server tell a reconnect (same client_id
+        # AND same instance_id) from a second competing process on this host.
+        self.instance_id = secrets.token_hex(8)
 
     async def connect(self):
         self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
@@ -74,17 +82,18 @@ class TunnelClient:
             self.writer.write(encode_frame(ftype, stream_id, payload))
             await self.writer.drain()
 
-    async def open_tunnels(self, http_subdomain, tcp_remote_port):
+    async def open_tunnels(self, http_subdomain, tcp_remote_port, mode="handoff"):
+        common = {"mode": mode, "instance_id": self.instance_id}
         if "http" in self.local_targets:
             tid = new_tunnel_id()
             self.local_targets[tid] = self.local_targets.pop("http")
             await self._send(FrameType.TUNNEL_OPEN_REQUEST, CONTROL_STREAM_ID, json.dumps(
-                {"tunnel_id": tid, "type": "http", "subdomain": http_subdomain}).encode())
+                {"tunnel_id": tid, "type": "http", "subdomain": http_subdomain, **common}).encode())
         if "tcp" in self.local_targets:
             tid = new_tunnel_id()
             self.local_targets[tid] = self.local_targets.pop("tcp")
             await self._send(FrameType.TUNNEL_OPEN_REQUEST, CONTROL_STREAM_ID, json.dumps(
-                {"tunnel_id": tid, "type": "tcp", "remote_port": tcp_remote_port}).encode())
+                {"tunnel_id": tid, "type": "tcp", "remote_port": tcp_remote_port, **common}).encode())
 
     async def run(self):
         while True:
@@ -93,6 +102,9 @@ class TunnelClient:
                 await self._send(FrameType.PONG, CONTROL_STREAM_ID)
             elif frame.type == FrameType.TUNNEL_OPEN_RESPONSE:
                 print("[client] tunnel:", frame.payload.decode())
+            elif frame.type == FrameType.TUNNEL_CLOSE:
+                # Server-initiated revocation: handoff, reclaim, shutdown.
+                print("[client] tunnel closed by server:", frame.payload.decode())
             elif frame.type == FrameType.STREAM_OPEN:
                 asyncio.create_task(self._handle_stream_open(frame))
             elif frame.type == FrameType.STREAM_DATA:
@@ -158,6 +170,9 @@ async def main():
     ap.add_argument("--subdomain", help="requested subdomain for the HTTP tunnel")
     ap.add_argument("--local-tcp", help="host:port of local TCP service to expose")
     ap.add_argument("--remote-port", type=int, help="preferred public TCP port")
+    ap.add_argument("--mode", choices=("handoff", "lease"), default="handoff",
+                    help="ownership mode for the requested names: handoff (default, newest "
+                         "client wins) or lease (reserve the name; refuse instead of taking over)")
     args = ap.parse_args()
 
     host, port = args.server.split(":")
@@ -171,7 +186,7 @@ async def main():
 
     client = TunnelClient(host, int(port), args.secret, targets)
     await client.connect()
-    await client.open_tunnels(args.subdomain, args.remote_port)
+    await client.open_tunnels(args.subdomain, args.remote_port, args.mode)
     await client.run()
 
 

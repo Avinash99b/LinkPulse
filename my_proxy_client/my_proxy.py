@@ -18,9 +18,27 @@ Usage:
     my_proxy http 8080
     my_proxy http localhost:5173
     my_proxy http 3000 -u api
+    my_proxy http 3000 -u api --lease
     my_proxy tcp 22
     my_proxy tcp 25565
     my_proxy start tunnels.json
+
+Tunnel names and ownership
+--------------------------
+A tunnel's public name (subdomain for HTTP, port for TCP/UDP) can be claimed
+by more than one client. Two ownership modes decide what happens then:
+
+    handoff (default)  the newest client wins. The previous owner's tunnel is
+                       revoked and it is told "Tunnel 'x' was handed off to a
+                       new client"; if that was its only tunnel it exits.
+
+    lease (--lease)    the name is reserved. Another client is refused with an
+                       error instead of taking the name over. Leases are bound
+                       to the client process, so a second process on the same
+                       machine asking for the same name is also refused.
+
+Reconnecting is never a conflict: the client keeps the same tunnel ids, so the
+server simply hands the name back to it.
 
 Run `my_proxy --help` / `my_proxy http --help` etc. for all options.
 """
@@ -147,6 +165,12 @@ def new_tunnel_id() -> str:
     return uuid.uuid4().hex
 
 
+# Tunnel ownership modes (mirrors protocol.py).
+TUNNEL_MODE_HANDOFF = "handoff"
+TUNNEL_MODE_LEASE = "lease"
+TUNNEL_MODES = (TUNNEL_MODE_HANDOFF, TUNNEL_MODE_LEASE)
+
+
 # =============================================================================
 # Small errors specific to this client
 # =============================================================================
@@ -197,23 +221,34 @@ class TunnelSpec:
     local_port: int
     subdomain: Optional[str] = None    # http only, requested
     remote_port: Optional[int] = None  # tcp/udp only, requested
+    mode: str = TUNNEL_MODE_HANDOFF    # ownership: "handoff" | "lease"
 
 
 @dataclasses.dataclass
 class TunnelRuntime:
     spec: TunnelSpec
-    status: str = "pending"     # pending | active | error
+    status: str = "pending"     # pending | active | error | handed_off | closed
     public_url: Optional[str] = None
     error: Optional[str] = None
     connection_count: int = 0
     bytes_in: int = 0    # local backend -> public internet
     bytes_out: int = 0   # public internet -> local backend
     latencies_ms: deque = dataclasses.field(default_factory=lambda: deque(maxlen=50))
+    failure_count: int = 0
+    last_error_notice: float = 0.0
 
     def avg_latency_ms(self) -> Optional[float]:
         if not self.latencies_ms:
             return None
         return sum(self.latencies_ms) / len(self.latencies_ms)
+
+    def label(self) -> str:
+        """Human-readable tunnel name for log messages."""
+        if self.spec.type == "http" and self.spec.subdomain:
+            return self.spec.subdomain
+        if self.spec.remote_port:
+            return f"{self.spec.type}:{self.spec.remote_port}"
+        return self.spec.tunnel_id[:8]
 
 
 @dataclasses.dataclass
@@ -255,12 +290,14 @@ class TunnelClient:
                  mode: str = "http",
                  target_str: str = "",
                  dashboard_addr: Optional[str] = None,
-                 log_file_path: Optional[str] = None):
+                 log_file_path: Optional[str] = None,
+                 retry_interval: float = 5.0):
         self.specs = specs
         self.server_host = server_host
         self.server_port = server_port
         self.secret = secret
         self.grace_time = grace_time
+        self.retry_interval = max(1.0, float(retry_interval))
         self.state_file = state_file
         self.log = log
         self.recent_logs = recent_logs
@@ -268,6 +305,12 @@ class TunnelClient:
         self.target_str = target_str
         self.dashboard_addr = dashboard_addr
         self.log_file_path = log_file_path
+
+        # Identifies *this process* to the server. client_id is shared by
+        # every client process on a machine (persisted state file), so
+        # without this the server cannot tell a reconnect (same instance)
+        # from a competing second client (different instance).
+        self.instance_id = secrets.token_hex(8)
 
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
@@ -286,11 +329,21 @@ class TunnelClient:
         self.streams: dict[int, ClientStream] = {}
         self.pending_streams: dict[int, PendingStream] = {}
 
+        # Tunnels the server took away (handoff / closed): never re-requested.
+        self._revoked_tunnel_ids: set[str] = set()
+        # Background retry loops for tunnel registrations that failed (name
+        # in use, lease held elsewhere, no ports free, ...).
+        self._retry_tasks: dict[str, asyncio.Task] = {}
+        # TUNNEL_OPEN_REQUESTs sent but not answered yet.
+        self._open_inflight: set[str] = set()
+
         self.process_start_time = time.time()
         self.connected_since: Optional[float] = None
-        self.status = "connecting"   # connecting | connected | reconnecting | disconnected | stopped
+        self.status = "connecting"   # connecting | connected | reconnecting | stopped
         self.reconnect_count = 0
         self._first_failure_time: Optional[float] = None
+        self._retry_log_count = 0
+        self._last_retry_log = 0.0
         self._shutdown_requested = False
         self._heartbeat_interval = 20  # overwritten by server's HELLO_OK value
         self._save_state("connecting")
@@ -319,6 +372,7 @@ class TunnelClient:
             info = {
                 "tunnel_id": runtime.spec.tunnel_id,
                 "type": runtime.spec.type,
+                "mode": runtime.spec.mode,
                 "status": runtime.status,
                 "public_url": runtime.public_url,
                 "local_destination": f"{runtime.spec.local_host}:{runtime.spec.local_port}",
@@ -329,6 +383,7 @@ class TunnelClient:
 
         data = {
             "client_id": cid_hex,
+            "instance_id": self.instance_id,
             "pid": os.getpid(),
             "start_time": _proc_start_time(os.getpid()),
             "status": self.status,
@@ -385,13 +440,17 @@ class TunnelClient:
             await self.writer.drain()
 
     # =========================================================================
-    # Top-level run loop: connect, serve, reconnect with backoff, or give up
-    # after the grace period elapses with the server still unreachable.
+    # Top-level run loop: connect, serve, reconnect -- forever.
+    #
+    # A dropped/refused/unresolvable server is retried every `retry_interval`
+    # seconds (default 5s) indefinitely: the client is meant to be left
+    # running on a laptop that sleeps, changes networks or boots before the
+    # network is up, so giving up after a grace period would just mean the
+    # tunnel silently disappears until the user notices. Only authentication
+    # failure (a wrong token, which retrying cannot fix) stops the process.
     # =========================================================================
 
     async def run(self):
-        backoff = 0.5
-        max_backoff = 10.0
         first_attempt = True
 
         while not self._shutdown_requested:
@@ -422,18 +481,25 @@ class TunnelClient:
                 if self._first_failure_time is None:
                     self._first_failure_time = now
                 elapsed = now - self._first_failure_time
-                if elapsed >= self.grace_time:
-                    self._log(logging.ERROR,
-                               "Server unreachable for %.0fs (grace period %.0fs) -- giving up.",
-                               elapsed, self.grace_time)
-                    self.status = "disconnected"
-                    self._save_state("disconnected")
-                    sys.exit(1)
-                self._log(logging.WARNING, "Connection issue (%s); retrying in %.1fs "
-                          "(unreachable for %.0fs / %.0fs grace period)",
-                          e, backoff, elapsed, self.grace_time)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, max_backoff)
+
+                # Log the first few failures verbosely, then at most once a
+                # minute, so a long outage doesn't flood the terminal or the
+                # log file while the client keeps retrying.
+                self._retry_log_count += 1
+                if self._retry_log_count <= 3 or now - self._last_retry_log >= 60:
+                    self._last_retry_log = now
+                    if elapsed < self.grace_time:
+                        self._log(logging.WARNING,
+                                  "Connection issue (%s); retrying in %.0fs "
+                                  "(disconnected for %.0fs)",
+                                  e, self.retry_interval, elapsed)
+                    else:
+                        self._log(logging.ERROR,
+                                  "Server unreachable for %.0fs (%s); retrying every %.0fs "
+                                  "-- press Ctrl+C to stop",
+                                  elapsed, e, self.retry_interval)
+
+                await asyncio.sleep(self.retry_interval)
                 first_attempt = False
                 continue
 
@@ -448,9 +514,12 @@ class TunnelClient:
         """Called on SIGINT/SIGTERM: politely tell the server we're leaving,
         then unwind the connect/serve loop."""
         self._shutdown_requested = True
+        self._cancel_all_retries_now()
         self._save_state("stopped")
         if self.writer is not None:
             for tunnel_id in list(self.tunnels.keys()):
+                if tunnel_id in self._revoked_tunnel_ids:
+                    continue
                 try:
                     await self._send(FrameType.TUNNEL_CLOSE, CONTROL_STREAM_ID,
                                       json.dumps({"tunnel_id": tunnel_id}).encode())
@@ -466,7 +535,11 @@ class TunnelClient:
     # =========================================================================
 
     async def _connect_and_serve(self, first_attempt: bool):
-        print("Connecting to %s:%s..." % (self.server_host, self.server_port), file=sys.stderr)
+        if first_attempt or self._retry_log_count <= 1:
+            # Plain stderr line (not a log record) so a foreground start always
+            # shows what it is doing; retries are covered by the throttled
+            # warning/error messages in run().
+            print("Connecting to %s:%s..." % (self.server_host, self.server_port), file=sys.stderr)
         self.reader, self.writer = await asyncio.wait_for(
             asyncio.open_connection(self.server_host, self.server_port), timeout=10
         )
@@ -500,6 +573,7 @@ class TunnelClient:
             self._log(logging.INFO, "Connected to %s:%s (client_id=%s...)",
                       self.server_host, self.server_port, self.client_id[:8])
         self._first_failure_time = None
+        self._retry_log_count = 0
 
         # Close out any stream state left over from a previous connection --
         # those streams cannot be resumed (see protocol reconnect semantics).
@@ -511,11 +585,21 @@ class TunnelClient:
         self.streams.clear()
         self.pending_streams.clear()
 
+        # Any in-flight registration from the previous connection is void, and
+        # so are its retry timers -- every tunnel is re-requested below.
+        self._open_inflight.clear()
+        await self._cancel_all_retries()
+
         # (Re-)register every configured tunnel. Re-requesting the same
         # tunnel_id/subdomain/remote_port after a reconnect is how a stable
         # public URL is recovered, per the protocol's reconnect semantics.
+        # Tunnels the server revoked (e.g. handed off to a newer client) stay
+        # revoked: re-requesting them would start a takeover ping-pong.
         for runtime in self.tunnels.values():
+            if runtime.spec.tunnel_id in self._revoked_tunnel_ids:
+                continue
             runtime.status = "pending"
+            runtime.error = None
             await self._request_tunnel_open(runtime.spec)
 
         watchdog_task = asyncio.create_task(self._inactivity_watchdog())
@@ -536,11 +620,13 @@ class TunnelClient:
                 pass
 
     async def _request_tunnel_open(self, spec: TunnelSpec):
-        req = {"tunnel_id": spec.tunnel_id, "type": spec.type}
+        req = {"tunnel_id": spec.tunnel_id, "type": spec.type,
+               "mode": spec.mode, "instance_id": self.instance_id}
         if spec.type == "http" and spec.subdomain:
             req["subdomain"] = spec.subdomain
         if spec.type in ("tcp", "udp") and spec.remote_port:
             req["remote_port"] = spec.remote_port
+        self._open_inflight.add(spec.tunnel_id)
         await self._send(FrameType.TUNNEL_OPEN_REQUEST, CONTROL_STREAM_ID, json.dumps(req).encode())
 
     # =========================================================================
@@ -559,6 +645,8 @@ class TunnelClient:
                 pass
             elif frame.type == FrameType.TUNNEL_OPEN_RESPONSE:
                 self._handle_tunnel_open_response(frame)
+            elif frame.type == FrameType.TUNNEL_CLOSE:
+                await self._handle_tunnel_close_from_server(frame)
             elif frame.type == FrameType.STREAM_OPEN:
                 self._handle_stream_open(frame)
             elif frame.type == FrameType.STREAM_DATA:
@@ -602,26 +690,170 @@ class TunnelClient:
         runtime = self.tunnels.get(tunnel_id)
         if runtime is None:
             return
+        self._open_inflight.discard(tunnel_id)
         if resp.get("status") == "ok":
             runtime.status = "active"
             runtime.error = None
+            runtime.failure_count = 0
+            self._cancel_retry(tunnel_id)
+            mode_note = " [lease]" if runtime.spec.mode == TUNNEL_MODE_LEASE else ""
             if resp.get("type") == "http":
                 runtime.public_url = resp.get("public_url")
-                self._log(logging.INFO, "HTTP tunnel ready: %s -> %s:%s",
-                          runtime.public_url, runtime.spec.local_host, runtime.spec.local_port)
+                self._log(logging.INFO, "HTTP tunnel ready%s: %s -> %s:%s",
+                          mode_note, runtime.public_url,
+                          runtime.spec.local_host, runtime.spec.local_port)
             else:
                 port = resp.get("remote_port")
                 host = resp.get("public_host", self.server_host)
                 scheme = "udp" if resp.get("type") == "udp" else "tcp"
                 runtime.public_url = f"{scheme}://{host}:{port}"
                 runtime.spec.remote_port = port
-                self._log(logging.INFO, "%s tunnel ready: %s -> %s:%s",
-                          scheme.upper(), runtime.public_url, runtime.spec.local_host, runtime.spec.local_port)
+                self._log(logging.INFO, "%s tunnel ready%s: %s -> %s:%s",
+                          scheme.upper(), mode_note, runtime.public_url,
+                          runtime.spec.local_host, runtime.spec.local_port)
         else:
             runtime.status = "error"
             runtime.error = resp.get("error", "unknown error")
-            self._log(logging.ERROR, "Tunnel %s failed: %s", tunnel_id[:8], runtime.error)
+            runtime.failure_count += 1
+
+            # Don't spam identical failures: log the first one and then at
+            # most one reminder a minute while the retry loop keeps trying.
+            now = time.time()
+            if runtime.failure_count == 1 or now - runtime.last_error_notice >= 60:
+                runtime.last_error_notice = now
+                attempt_note = "" if runtime.failure_count == 1 else \
+                    f" (attempt {runtime.failure_count})"
+                hint = ""
+                reason = resp.get("reason")
+                if reason == "leased":
+                    hint = ("\n  A lease protects that name. Pick a different -u value, or stop "
+                            "the client currently holding it.")
+                elif reason == "in_use" and runtime.spec.mode == TUNNEL_MODE_LEASE:
+                    hint = ("\n  --lease never takes over an existing tunnel. Reconnect without "
+                            "--lease to hand the name over to this client.")
+                self._log(logging.ERROR, "Tunnel '%s' failed: %s%s%s",
+                          runtime.label(), runtime.error, attempt_note, hint)
+            self._schedule_tunnel_retry(runtime)
         self._save_state()
+
+    def _schedule_tunnel_retry(self, runtime: TunnelRuntime):
+        tunnel_id = runtime.spec.tunnel_id
+        if tunnel_id in self._revoked_tunnel_ids:
+            return
+        existing = self._retry_tasks.get(tunnel_id)
+        if existing is not None and not existing.done():
+            return
+        self._retry_tasks[tunnel_id] = asyncio.create_task(self._tunnel_retry_loop(runtime))
+
+    def _cancel_retry(self, tunnel_id: str):
+        task = self._retry_tasks.pop(tunnel_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _cancel_all_retries(self):
+        tasks = [t for t in self._retry_tasks.values() if not t.done()]
+        self._retry_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _cancel_all_retries_now(self):
+        tasks = [t for t in self._retry_tasks.values() if not t.done()]
+        self._retry_tasks.clear()
+        for task in tasks:
+            task.cancel()
+
+    async def _tunnel_retry_loop(self, runtime: TunnelRuntime):
+        """Keep re-requesting a tunnel whose registration failed.
+
+        A name can be temporarily unavailable (leased by a client that is
+        still being cleaned up, no free ports, ...) and the situation can
+        change at any time, so the client keeps asking instead of leaving the
+        tunnel dead until someone restarts it."""
+        tunnel_id = runtime.spec.tunnel_id
+        try:
+            while (not self._shutdown_requested
+                   and runtime.status == "error"
+                   and tunnel_id not in self._revoked_tunnel_ids):
+                await asyncio.sleep(self.retry_interval)
+                if self._shutdown_requested or runtime.status != "error":
+                    break
+                if tunnel_id in self._revoked_tunnel_ids:
+                    break
+                if self.status != "connected" or self.writer is None:
+                    continue
+                if tunnel_id in self._open_inflight:
+                    continue
+                try:
+                    await self._request_tunnel_open(runtime.spec)
+                except (ConnectionError, OSError) as e:
+                    self.log.debug("Retry of tunnel %s failed to send: %s", runtime.label(), e)
+                    break
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._retry_tasks.get(tunnel_id) is asyncio.current_task():
+                self._retry_tasks.pop(tunnel_id, None)
+
+    async def _handle_tunnel_close_from_server(self, frame):
+        """Server-initiated tunnel removal (handoff, reclaim, shutdown)."""
+        try:
+            info = json.loads(frame.payload.decode() or "{}")
+        except Exception:
+            info = {}
+        tunnel_id = info.get("tunnel_id")
+        runtime = self.tunnels.get(tunnel_id) if tunnel_id else None
+        if runtime is None:
+            return
+        reason = info.get("reason") or "closed"
+        message = info.get("message") or f"Tunnel '{runtime.label()}' was closed by the server"
+
+        self._cancel_retry(tunnel_id)
+        self._open_inflight.discard(tunnel_id)
+
+        if reason == "reclaimed":
+            # Same client re-claiming its own registration during a
+            # reconnect; the tunnel is re-opened by the matching response.
+            runtime.status = "pending"
+            return
+
+        self._revoked_tunnel_ids.add(tunnel_id)
+
+        # Tear down any local sockets belonging to the revoked tunnel.
+        for stream in list(self.streams.values()):
+            if stream.tunnel_id == tunnel_id:
+                await self._route_stream_close_now(stream)
+        for stream_id in [sid for sid, p in self.pending_streams.items() if p.tunnel_id == tunnel_id]:
+            self.pending_streams.pop(stream_id, None)
+
+        if reason == "handoff":
+            runtime.status = "handed_off"
+            runtime.error = None
+            self._log(logging.WARNING,
+                      "%s -- this client stops serving it. That is normal when another client "
+                      "claims the same name (handoff mode).", message)
+        else:
+            runtime.status = "closed"
+            self._log(logging.WARNING, "%s (reason: %s)", message, reason)
+
+        self._save_state()
+
+        if all(r.status in ("handed_off", "closed") for r in self.tunnels.values()):
+            self._log(logging.INFO, "No tunnels left to serve; exiting.")
+            await self._begin_exit()
+
+    async def _begin_exit(self):
+        """Leave without treating the closed connection as a failure."""
+        self._shutdown_requested = True
+        self.status = "stopped"
+        self._save_state("stopped")
+        self._cancel_all_retries_now()
+        if self.writer is not None:
+            try:
+                self.writer.close()
+            except Exception:
+                pass
 
     def _handle_stream_open(self, frame):
         """Synchronous: register the pending stream immediately (so any
@@ -897,6 +1129,7 @@ class TunnelClient:
             tunnels.append({
                 "tunnel_id": runtime.spec.tunnel_id,
                 "type": spec.type,
+                "mode": spec.mode,
                 "status": runtime.status,
                 "public_url": runtime.public_url,
                 "error": runtime.error,
@@ -952,6 +1185,7 @@ _DASHBOARD_HTML = """<!doctype html>
   th { color:#8a90a2; font-weight:500; text-transform:uppercase; font-size:11px; letter-spacing:.04em; }
   .tag { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11px; background:#26314a; color:#8fb3ff; margin-right:4px; }
   .tag.tcp { background:#312a1a; color:#e8b96a; }
+  .tag.lease { background:#1f3326; color:#6ee7a0; }
   .tag.error { background:#3a1e22; color:#f87171; }
   .tag.pending { background:#2c2a1e; color:#e8d96a; }
   a { color:#8fb3ff; text-decoration:none; }
@@ -1025,7 +1259,7 @@ async function refresh() {
     tunnelsEl.innerHTML = `
       <table>
         <thead><tr>
-          <th>Status</th><th>Protocol</th><th>Public URL</th><th>Local destination</th>
+          <th>Status</th><th>Protocol</th><th>Mode</th><th>Public URL</th><th>Local destination</th>
           <th>Connections</th><th>Bytes in</th><th>Bytes out</th><th>Avg latency</th>
         </tr></thead>
         <tbody>
@@ -1033,6 +1267,7 @@ async function refresh() {
           <tr>
             <td><span class="tag ${t.status === 'error' ? 'error' : (t.status === 'pending' ? 'pending' : '')}">${t.status}</span></td>
             <td><span class="tag ${t.type}">${t.type}</span></td>
+            <td><span class="tag ${t.mode === 'lease' ? 'lease' : ''}">${t.mode || 'handoff'}</span></td>
             <td>${t.public_url ? `<a href="${t.public_url}" target="_blank">${t.public_url}</a>` : (t.error || '-')}</td>
             <td>${t.local_destination}</td>
             <td>${t.connections}</td>
@@ -1117,6 +1352,7 @@ async def serve_dashboard(client: TunnelClient, host: str, port: int, log: loggi
 DEFAULT_SERVER = "127.0.0.1:9000"
 DEFAULT_DASHBOARD = "127.0.0.1:4040"
 DEFAULT_GRACE_TIME = 10.0
+DEFAULT_RETRY_INTERVAL = 5.0
 DEFAULT_STATE_FILE = Path.home() / ".my_proxy" / "state.json"
 
 
@@ -1408,6 +1644,12 @@ def _cli_clients_info(client_id: str) -> None:
     print(f"Status:          {status}")
     print(f"Mode:            {mode}")
     print(f"Local target:    {target}")
+    modes = []
+    for t in ((live_stats or {}).get("tunnels") or data.get("tunnels", [])):
+        if t.get("mode") and t["mode"] not in modes:
+            modes.append(t["mode"])
+    if modes:
+        print(f"Tunnel modes:    {', '.join(modes)}")
     if public_urls:
         print(f"Public endpoint: {', '.join(public_urls)}")
     print(f"Server:          {server}")
@@ -1704,7 +1946,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     common.add_argument("--token", default=os.environ.get("MY_PROXY_TOKEN"),
                          help="shared secret for authentication (env MY_PROXY_TOKEN)")
     common.add_argument("--grace-time", type=float, default=DEFAULT_GRACE_TIME,
-                         help=f"seconds to keep retrying before giving up if the server is unreachable (default: {DEFAULT_GRACE_TIME})")
+                         help=f"after this many seconds without a server connection, retries are logged "
+                              f"as errors instead of warnings (default: {DEFAULT_GRACE_TIME}); the client "
+                              f"always keeps retrying and never gives up")
+    common.add_argument("--retry-interval", type=float,
+                         default=float(os.environ.get("MY_PROXY_RETRY_INTERVAL", DEFAULT_RETRY_INTERVAL)),
+                         help=f"seconds between reconnect attempts (default: {DEFAULT_RETRY_INTERVAL}, "
+                              f"env MY_PROXY_RETRY_INTERVAL); retries continue indefinitely")
+    common.add_argument("--lease", action="store_true",
+                         help="lease the requested name instead of taking it over: refuse to start that "
+                              "tunnel if another client already holds the subdomain/port (default is "
+                              "handoff mode, where the newest client wins)")
     common.add_argument("--dashboard", default=os.environ.get("MY_PROXY_DASHBOARD", DEFAULT_DASHBOARD),
                          help=f"local dashboard address (default: {DEFAULT_DASHBOARD})")
     common.add_argument("--no-dashboard", action="store_true", help="disable the local dashboard")
@@ -1723,6 +1975,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         epilog="""examples:
   linkpulse http 8080                               Expose localhost:8080 via HTTP tunnel
   linkpulse http 8080 -d                            Expose localhost:8080 in background
+  linkpulse http 8080 -u api                        Request the public name "api"
+  linkpulse http 8080 -u api --lease                Lease "api": never hand it off to other clients
   linkpulse tcp 22 --remote-port 20022              Expose localhost:22 via TCP tunnel
   linkpulse tcp 22 -d                               Expose localhost:22 in background
   linkpulse start tunnels.json                      Open multiple tunnels from config
@@ -1733,6 +1987,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
   linkpulse clients clear -f                        Stop and remove ALL clients
   linkpulse authtoken <secret>                      Save authentication token
   linkpulse server proxy.example.com:9000           Save server address
+
+Tunnel names are shared: by default a newer client claiming the same
+subdomain/port hands the name off to itself (handoff mode). Use --lease to
+reserve a name for this client instead. The client never gives up reconnecting
+to the server; it retries every 5 seconds until stopped.
 """)
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1775,6 +2034,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _normalize_mode(value, where: str = "config") -> str:
+    mode = str(value or TUNNEL_MODE_HANDOFF).strip().lower()
+    if mode not in TUNNEL_MODES:
+        raise ValueError(f"invalid mode {value!r} in {where}; expected 'handoff' or 'lease'")
+    return mode
+
+
 def _load_start_config(path: str, cli_args: argparse.Namespace) -> tuple[list[TunnelSpec], argparse.Namespace]:
     with open(path) as f:
         cfg = json.load(f)
@@ -1787,22 +2053,29 @@ def _load_start_config(path: str, cli_args: argparse.Namespace) -> tuple[list[Tu
     if cfg.get("token") and cli_args.token is None:
         cli_args.token = cfg["token"]
 
+    # Ownership mode: --lease forces every tunnel to lease, otherwise the
+    # file's top-level "mode" sets the default and each tunnel may override it.
+    cli_lease = bool(getattr(cli_args, "lease", False))
+    default_mode = (TUNNEL_MODE_LEASE if cli_lease
+                    else _normalize_mode(cfg.get("mode", TUNNEL_MODE_HANDOFF), path))
+
     specs = []
     for t in cfg.get("tunnels", []):
         ttype = t["type"]
         host, port = _parse_target(str(t["local"]))
+        mode = default_mode if cli_lease else _normalize_mode(t.get("mode", default_mode), path)
         if ttype == "http":
             specs.append(TunnelSpec(tunnel_id=new_tunnel_id(), type="http",
                                      local_host=host, local_port=port,
-                                     subdomain=t.get("subdomain")))
+                                     subdomain=t.get("subdomain"), mode=mode))
         elif ttype == "tcp":
             specs.append(TunnelSpec(tunnel_id=new_tunnel_id(), type="tcp",
                                      local_host=host, local_port=port,
-                                     remote_port=t.get("remote_port")))
+                                     remote_port=t.get("remote_port"), mode=mode))
         elif ttype == "udp":
             specs.append(TunnelSpec(tunnel_id=new_tunnel_id(), type="udp",
                                      local_host=host, local_port=port,
-                                     remote_port=t.get("remote_port")))
+                                     remote_port=t.get("remote_port"), mode=mode))
         else:
             raise ValueError(f"unknown tunnel type in config: {ttype!r}")
     return specs, cli_args
@@ -1921,12 +2194,15 @@ async def _async_main(args: argparse.Namespace):
             print(f"Error: invalid target {args.target!r}; expected PORT or HOST:PORT.",
                   file=sys.stderr)
             sys.exit(1)
+        tunnel_mode = TUNNEL_MODE_LEASE if args.lease else TUNNEL_MODE_HANDOFF
         if args.command == "http":
             specs = [TunnelSpec(tunnel_id=new_tunnel_id(), type="http",
-                                 local_host=host, local_port=port, subdomain=args.subdomain)]
+                                 local_host=host, local_port=port,
+                                 subdomain=args.subdomain, mode=tunnel_mode)]
         else:
             specs = [TunnelSpec(tunnel_id=new_tunnel_id(), type=args.command,
-                                 local_host=host, local_port=port, remote_port=args.remote_port)]
+                                 local_host=host, local_port=port,
+                                 remote_port=args.remote_port, mode=tunnel_mode)]
     elif args.command == "start":
         try:
             specs, args = _load_start_config(args.config, args)
@@ -1960,6 +2236,7 @@ async def _async_main(args: argparse.Namespace):
         target_str=target_str,
         dashboard_addr=None if args.no_dashboard else f"{dash_host}:{dash_port}",
         log_file_path=getattr(args, "log_file", None),
+        retry_interval=getattr(args, "retry_interval", DEFAULT_RETRY_INTERVAL),
     )
 
     tasks = [asyncio.create_task(client.run())]

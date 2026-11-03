@@ -82,6 +82,9 @@ More examples:
 # HTTP tunnel with custom subdomain
 my_proxy http 3000 -u myapp --token secret --server proxy.example.com:9000
 
+# Same, but keep the name to yourself (refuse to share/hand it over)
+my_proxy http 3000 -u myapp --lease --token secret --server proxy.example.com:9000
+
 # Raw TCP tunnel (e.g., SSH)
 my_proxy tcp 22 --token secret --server proxy.example.com:9000
 # Public access: ssh -p 20022 user@proxy.example.com
@@ -131,6 +134,13 @@ See `PROTOCOL.md` in either project for the full spec.
 **TCP tunnels** (port-based):
 - Public port (e.g., `20022`) → routed to client that registered it → forwarded to local backend
 
+**Ownership of a public name** (subdomain or TCP/UDP port):
+- `handoff` (default): the newest client claiming the name wins; the previous owner is told
+  `Tunnel 'x' was handed off to a new client`, stops serving it, and exits if it had nothing else
+- `lease` (`--lease`): the name is reserved to the client that created it; other clients are refused
+  with an explanatory error, and a lease never takes over a name that is already in use
+- Reconnects are not conflicts: the same client process gets its own names back automatically
+
 ### Authentication & security
 
 - **Shared secret** (configured in config.json): all clients must know it
@@ -144,9 +154,12 @@ No traffic inspection, no logging, no data collection beyond what you configure.
 
 If the server or network becomes unavailable:
 - **Client detects disconnect** immediately
-- **Exponential backoff retry**: 0.5s → 1s → 2s → 4s → 8s → ...
-- **Grace period**: exits cleanly after ~10s (configurable) with no server
+- **Retries forever**: one attempt every `--retry-interval` seconds (default 5s), indefinitely —
+  a sleeping laptop or a server restart heals itself with no manual intervention
+- **`--grace-time`** only controls when retry messages switch from warnings to errors; the client never exits on its own
 - **Persistent identity**: client_id saved locally, re-registers same tunnels on reconnect
+- **Failed registrations are retried**: a name that is in use/leased or an exhausted port range is
+  re-requested every `--retry-interval` seconds until it succeeds
 - **Per-request failure handling**: local backend down? Connection refused, no hang
 
 ### Dashboard
@@ -320,7 +333,9 @@ $ curl http://server:8080/api/stats | jq .
 |--------|---------|---------|---------|
 | `--server HOST:PORT` | `MY_PROXY_SERVER` | `127.0.0.1:9000` | Proxy server address |
 | `--token SECRET` | `MY_PROXY_TOKEN` | (required) | Shared authentication secret |
-| `--grace-time SECONDS` | — | `10` | How long to retry before giving up if server is unreachable |
+| `--lease` | — | — | Lease the requested name instead of taking it over (default is handoff mode) |
+| `--retry-interval SECONDS` | `MY_PROXY_RETRY_INTERVAL` | `5` | Delay between reconnect attempts (retries are indefinite) |
+| `--grace-time SECONDS` | — | `10` | Escalate retry logs from warnings to errors after this long (the client never gives up) |
 | `--dashboard HOST:PORT` | `MY_PROXY_DASHBOARD` | `127.0.0.1:4040` | Local status dashboard |
 | `--no-dashboard` | — | — | Disable the dashboard |
 | `--state-file PATH` | — | `~/.my_proxy/state.json` | Persist client identity across restarts |
@@ -338,7 +353,8 @@ $ curl http://server:8080/api/stats | jq .
 - **Lightweight** — server ~35 KB, client ~45 KB, zero external dependencies (Python stdlib only)
 - **Cross-platform** — Windows, macOS, Linux all fully supported (Windows Proactor event loop, SO_EXCLUSIVEADDRUSE, signal.signal all handled)
 - **Multiplexed** — one connection carries all tunnels; independent flow control prevents stalling
-- **Resilient** — automatic reconnect with exponential backoff, graceful shutdown, per-request error handling
+- **Resilient** — reconnects forever (every 5s, never gives up), retries failed registrations, graceful shutdown, per-request error handling
+- **Exclusive names on demand** — `--lease` keeps a subdomain/port yours, while the default handoff mode passes it to the newest client and tells the previous one why
 - **Observable** — real-time dashboard, detailed logs, byte counts and latency tracking
 
 ### ⚠️ What's not included
@@ -505,8 +521,9 @@ curl -X POST https://ci-uploads.forwarding.example.com/upload \
 ```bash
 cat > local.json <<EOF
 {
+  "mode": "handoff",
   "tunnels": [
-    {"type": "http", "local": "3000", "subdomain": "api"},
+    {"type": "http", "local": "3000", "subdomain": "api", "mode": "lease"},
     {"type": "http", "local": "8080", "subdomain": "web"},
     {"type": "tcp", "local": "5432", "remote_port": 20432}
   ]

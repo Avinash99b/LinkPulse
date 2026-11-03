@@ -1,11 +1,13 @@
 {
   "server": "proxy.example.com:9000",
   "token": "shared-secret-here",
+  "mode": "handoff",
   "tunnels": [
     {
       "type": "http",
       "local": "127.0.0.1:3000",
-      "subdomain": "api"
+      "subdomain": "api",
+      "mode": "lease"
     },
     {
       "type": "http",

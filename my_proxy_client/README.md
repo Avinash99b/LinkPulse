@@ -1,8 +1,8 @@
 # my_proxy — Client for the self-hosted tunneling proxy
 
-A production-quality client for the `proxy_server.py` tunneling proxy. Exposes local HTTP and TCP services on public URLs/ports via a single persistent, multiplexed connection. Handles reconnects with exponential backoff, graceful shutdown, and automatic recovery.
+A production-quality client for the `proxy_server.py` tunneling proxy. Exposes local HTTP and TCP services on public URLs/ports via a single persistent, multiplexed connection. Handles reconnects indefinitely (every 5 seconds, never gives up), graceful shutdown, tunnel handoff/lease, and automatic recovery.
 
-**1,098 lines, zero external dependencies** (uses only Python stdlib: asyncio, ssl, sqlite3, struct, json, etc.).
+**Zero external dependencies** (uses only Python stdlib: asyncio, ssl, sqlite3, struct, json, etc.).
 
 ## Quick start
 
@@ -11,6 +11,9 @@ A production-quality client for the `proxy_server.py` tunneling proxy. Exposes l
 my_proxy http 8080
 my_proxy http localhost:3000
 my_proxy http 5173 -u myapp
+
+# Keep a name to yourself (refuse to share/take it over)
+my_proxy http 5173 -u myapp --lease
 
 # Expose local TCP service
 my_proxy tcp 22
@@ -31,8 +34,10 @@ my_proxy http 8080
 
 ✅ **Single persistent connection** — All tunnels multiplexed over one authenticated TCP connection  
 ✅ **HTTP and TCP forwarding** — Host header–based routing for HTTP; random port allocation for TCP  
-✅ **Automatic reconnect** — Exponential backoff (0.5s → 1s → 2s → 4s → 8s) with grace period (default 10s)  
-✅ **Local dashboard** — Real-time tunnel status, bytes/connection counts, latency, logs (default `127.0.0.1:4040`)  
+✅ **Reconnects forever** — Retries every 5 s (`--retry-interval`) and never gives up, so a sleeping laptop or a server restart heals itself  
+✅ **Tunnel ownership modes** — `handoff` (default: the newest client takes the name) or `--lease` (the name is reserved; other clients are refused)  
+✅ **Failed registrations retried** — a name that is in use/unavailable is retried every 5 s, not left dead  
+✅ **Local dashboard** — Real-time tunnel status, mode, bytes/connection counts, latency, logs (default `127.0.0.1:4040`)  
 ✅ **Flow control** — Per-stream credit-based backpressure (256 KiB windows), prevents stalling  
 ✅ **Graceful shutdown** — SIGINT/SIGTERM cleanly closes tunnels and disconnects  
 ✅ **Persistent identity** — Client ID saved across restarts for stable public URLs  
@@ -41,7 +46,7 @@ my_proxy http 8080
 ## Project structure
 
 ```
-my_proxy                    Single-file client (1,098 lines)
+my_proxy                    Single-file client
 README.md                   This file
 config.example.json         Multi-tunnel config template
 requirements.txt            Python dependencies (empty — stdlib only)
@@ -84,11 +89,13 @@ Expose a local HTTP service on a public HTTPS URL.
 
 **Options:**
 - `-u, --subdomain <subdomain>` — request a specific subdomain (e.g., `myapp` → `https://myapp.forwarding.example.com`)
+- `--lease` — lease the name: another client cannot take it over, and this client refuses to take over a name that is already in use
 
 **Example:**
 ```bash
 my_proxy http 8080
 my_proxy http localhost:5173 -u frontend
+my_proxy http localhost:5173 -u frontend --lease
 my_proxy http 127.0.0.1:3000 --token mysecret
 ```
 
@@ -101,11 +108,13 @@ Expose a local TCP service on a random public port.
 
 **Options:**
 - `--remote-port <port>` — request a specific public port
+- `--lease` — lease the requested port (see above)
 
 **Example:**
 ```bash
 my_proxy tcp 22
 my_proxy tcp 25565 --remote-port 20000
+my_proxy tcp 25565 --remote-port 20000 --lease
 my_proxy tcp localhost:5432 --token mysecret
 ```
 
@@ -173,7 +182,9 @@ All commands support:
 | `-d, --detach` | — | (off) | Run client in background (detached mode) |
 | `--server <host:port>` | `MY_PROXY_SERVER` | `127.0.0.1:9000` | Proxy server address |
 | `--token <secret>` | `MY_PROXY_TOKEN` | (required) | Shared authentication secret |
-| `--grace-time <seconds>` | — | `10` | How long to retry if server unreachable before giving up |
+| `--lease` | — | (off) | Lease the requested name instead of taking it over |
+| `--retry-interval <seconds>` | `MY_PROXY_RETRY_INTERVAL` | `5` | Delay between reconnect attempts (retries are indefinite) |
+| `--grace-time <seconds>` | — | `10` | After this long without a connection, retries are logged as errors (the client still never gives up) |
 | `--dashboard <host:port>` | `MY_PROXY_DASHBOARD` | `127.0.0.1:4040` | Local status dashboard |
 | `--no-dashboard` | — | (off) | Disable the dashboard |
 | `--state-file <path>` | — | `~/.my_proxy/state.json` (foreground) / `~/.config/linkpulse/clients/<id>.json` (detached) | Custom state file path |
@@ -210,11 +221,13 @@ Create a JSON file to configure multiple tunnels:
 {
   "server": "proxy.example.com:9000",
   "token": "shared-secret-or-use-CLI-flag",
+  "mode": "handoff",
   "tunnels": [
     {
       "type": "http",
       "local": "127.0.0.1:3000",
-      "subdomain": "api"
+      "subdomain": "api",
+      "mode": "lease"
     },
     {
       "type": "http",
@@ -236,11 +249,13 @@ Create a JSON file to configure multiple tunnels:
 **Fields:**
 - `server` (optional) — proxy server address (overridden by `--server` CLI flag)
 - `token` (optional) — shared secret (overridden by `--token` CLI flag)
+- `mode` (optional) — default ownership mode for every tunnel: `"handoff"` (default) or `"lease"`; the `--lease` flag forces `"lease"` for all tunnels
 - `tunnels` (required) — array of tunnel specs:
-  - `type` — `"http"` or `"tcp"`
+  - `type` — `"http"`, `"tcp"` or `"udp"`
   - `local` — port or `host:port` string
   - `subdomain` (http only, optional) — requested subdomain
-  - `remote_port` (tcp only, optional) — requested public port
+  - `remote_port` (tcp/udp only, optional) — requested public port
+  - `mode` (optional) — per-tunnel override of the top-level `mode`
 
 Run with:
 ```bash
@@ -254,12 +269,13 @@ my_proxy start config.json --token mysecret
 A lightweight read-only status page accessible at `http://127.0.0.1:4040` (or configured `--dashboard` address).
 
 **Shows:**
-- Connection status (connecting, connected, reconnecting, disconnected, stopped)
+- Connection status (connecting, connected, reconnecting, stopped)
 - Process uptime
 - Server address and client ID
 - Reconnect count
 - Per-tunnel info:
-  - Type (http/tcp), status (pending/active/error)
+  - Type (http/tcp/udp), status (pending/active/error/handed_off/closed)
+  - Ownership mode (handoff/lease)
   - Public URL
   - Local destination (host:port)
   - Connection count
@@ -297,11 +313,30 @@ No authentication, no request inspection, no replay, no packet capture.
 - Subdomains are first-come, first-served across all clients
 - If you reconnect and request the same subdomain, you get it back (if no one else claimed it in the meantime)
 
+### Tunnel ownership modes (handoff vs. lease)
+
+Public names are shared, so a second client asking for the same subdomain/port
+has to be resolved somehow. Each tunnel declares how:
+
+| mode | who wins |
+|------|----------|
+| `handoff` (default) | The newest client wins. The previous owner's tunnel is revoked, it is told `Tunnel 'x' was handed off to a new client`, stops serving that tunnel, and exits if it has no tunnels left. |
+| `lease` (`--lease`) | The name is reserved. Other clients are refused with a clear error, and this client also refuses to take over a name someone else already uses. |
+
+Details worth knowing:
+
+- Modes are per tunnel. In `start` config files, set a top-level `"mode"` and/or a per-tunnel `"mode"`; the `--lease` flag forces lease mode for every tunnel.
+- Reconnecting is never a conflict: the client keeps its tunnel ids and its process identity, so the server hands its own names straight back (even a leased one) after a blip.
+- Two processes on the same machine share the persisted `client_id`, but each one sends a distinct per-process `instance_id`. The server therefore treats them as two competing clients, not as one client reconnecting: in lease mode the second process is refused, in handoff mode it takes the name over.
+- A failed registration is retried every `--retry-interval` seconds while connected, so a name that frees up later is picked up automatically.
+- A lease is held for as long as the owning client's session lives. If the client is unreachable for the server's `heartbeat_timeout_seconds` the server drops the session and the name returns to the pool (no permanent reservations).
+
 ### Public ports (TCP)
 
 - Allocated randomly from the server's configured range (e.g., 20000–20100)
 - Can request a preferred port with `--remote-port PORT`
 - Ports are freed when the tunnel closes and reusable by other clients
+- Requested ports follow the same handoff/lease rules as subdomains
 - The server logs/dashboard show the assigned port after `TUNNEL_OPEN_RESPONSE`
 
 ---
@@ -313,9 +348,18 @@ No authentication, no request inspection, no replay, no packet capture.
 If the server becomes unreachable:
 1. Client detects the disconnect (read error or inactivity timeout)
 2. Enters reconnecting mode, logs a warning
-3. Retries with exponential backoff: 0.5s, 1s, 2s, 4s, 8s, ...
-4. If server is unreachable for > `--grace-time` seconds (default 10s), gives up and exits
+3. Retries every `--retry-interval` seconds (default 5s) **indefinitely** — reconnect messages are logged on the first attempts and then at most once a minute, so a long outage doesn't flood the log
+4. Past `--grace-time` seconds the messages switch from warnings to errors; the client still keeps retrying and only stops on Ctrl+C
 5. All reconnects attempt to re-register the same tunnels (same subdomain/port if possible)
+
+Authentication failure is the only error that exits the process (see below).
+
+### Registration retry
+
+If a tunnel cannot be registered (name in use or leased, no ports free, ...):
+- The client keeps the process (and its other tunnels) running
+- It re-requests that tunnel every `--retry-interval` seconds until it succeeds
+- The failure is logged once, then at most once a minute until it is resolved
 
 ### Local service failure
 
@@ -437,13 +481,29 @@ my_proxy http 8080 --state-file /tmp/my_proxy_state.json
 
 By default, client ID is persisted in `~/.my_proxy/state.json`. Useful for testing or running multiple instances.
 
-### Longer grace period
+### Log retry noise escalation
 
 ```bash
 my_proxy http 8080 --grace-time 60
 ```
 
-Wait up to 60 seconds for server to come back before giving up (default 10s).
+After 60 seconds without a connection, retry messages are logged as errors instead of warnings (default 10s). The client keeps retrying either way — it never gives up on the server.
+
+### Different retry cadence
+
+```bash
+my_proxy http 8080 --retry-interval 15
+```
+
+Retry the server (and any tunnel registration that failed) every 15 seconds instead of the default 5.
+
+### Tunnels that keep a name to themselves
+
+```bash
+my_proxy http 8080 -u api --lease
+```
+
+Refuse to share or take over the name `api`. Without `--lease`, the default handoff mode gives the name to whichever client asked for it most recently.
 
 ### Custom dashboard port
 

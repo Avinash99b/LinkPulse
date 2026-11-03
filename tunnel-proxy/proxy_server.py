@@ -59,6 +59,9 @@ from protocol import (
     INITIAL_WINDOW,
     MAX_FRAME_PAYLOAD,
     ProtocolError,
+    TUNNEL_MODE_HANDOFF,
+    TUNNEL_MODE_LEASE,
+    TUNNEL_MODES,
     encode_frame,
     read_frame,
     verify_hello_payload,
@@ -127,6 +130,8 @@ class StreamState:
 class TunnelInfo:
     tunnel_id: str
     type: str  # "http" | "tcp" | "udp"
+    mode: str = TUNNEL_MODE_HANDOFF  # ownership policy: "handoff" | "lease"
+    instance_id: Optional[str] = None  # client-process identity (reconnect vs. competitor)
     subdomain: Optional[str] = None
     remote_port: Optional[int] = None
     tcp_server: Optional[asyncio.base_events.Server] = None
@@ -182,6 +187,10 @@ class ServerContext:
         self.start_time = time.time()
         self.recent_logs: deque[str] = deque(maxlen=200)
         self._used_ports_lock = asyncio.Lock()
+        # Serialises name claims (subdomain / port reservation, lease checks,
+        # evictions) so two clients racing for the same name can never both
+        # win or both evict each other.
+        self.claim_lock = asyncio.Lock()
 
     def log_event(self, msg: str):
         self.recent_logs.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
@@ -695,6 +704,134 @@ async def serve_udp_tunnel(session: ClientSession, tunnel: TunnelInfo, ctx: Serv
 # Control-connection: tunnel lifecycle handlers
 # =============================================================================
 
+async def _send_tunnel_open_response(session: ClientSession, payload: dict):
+    try:
+        await session.send_frame(FrameType.TUNNEL_OPEN_RESPONSE, CONTROL_STREAM_ID,
+                                  json.dumps(payload).encode())
+    except Exception:
+        pass
+
+
+async def _reject_tunnel_claim(session: ClientSession, tunnel_id: str, error: str,
+                                reason: Optional[str] = None):
+    resp = {"tunnel_id": tunnel_id, "status": "error", "error": error}
+    if reason:
+        resp["reason"] = reason
+    await _send_tunnel_open_response(session, resp)
+
+
+def _entry_owner(entry, session: ClientSession, tunnel_id: str) -> bool:
+    """True if `entry` (session, tunnel_id) still belongs to that exact pair."""
+    return entry is not None and entry[0] is session and entry[1] == tunnel_id
+
+
+async def resolve_claim_conflict(session: ClientSession, ctx: ServerContext, entry,
+                                 label: str, kind: str, mode: str,
+                                 instance_id: Optional[str]):
+    """Decide what to do when `label` (a public name: subdomain or port) is
+    already registered to `entry` = (other_session, other_tunnel_id).
+
+    Ownership follows the mode stored on the *existing* tunnel:
+
+      lease   -> the newcomer is refused, nothing else changes.
+      handoff -> the newcomer takes the name; the previous owner's tunnel is
+                 revoked and it is told why ("handed off to a new client").
+
+    Exception: a reconnect of the *same client process* (same client_id and
+    same instance id) always reclaims its own previous registration, even a
+    leased one, because the server may not have noticed the old TCP
+    connection dying yet.
+
+    Returns None when the caller may retry the allocation, or a
+    (error_message, reason_code) tuple when the claim must be refused.
+    """
+    old_session, old_tunnel_id = entry
+    old_tunnel = old_session.tunnels.get(old_tunnel_id)
+    old_mode = old_tunnel.mode if old_tunnel is not None else TUNNEL_MODE_HANDOFF
+    old_instance = old_tunnel.instance_id if old_tunnel is not None else None
+
+    same_process = (
+        old_session.client_id == session.client_id
+        and (instance_id is None or old_instance is None or instance_id == old_instance)
+    )
+
+    if same_process:
+        log.info("Reclaiming %s '%s' for reconnecting client %s",
+                 kind, label, session.client_id[:8])
+        # Only notify when the old registration lives on a different
+        # connection -- notifying the very connection that is re-claiming
+        # would make the client think it had lost the tunnel.
+        notify = old_session is not session
+        await close_tunnel(old_session, old_tunnel_id, ctx,
+                           reason="reclaimed" if notify else None,
+                           message=f"Tunnel '{label}' was reclaimed by the same client reconnecting")
+        return None
+
+    if old_mode == TUNNEL_MODE_LEASE:
+        log.info("Refused %s '%s' for client %s: leased by client %s",
+                 kind, label, session.client_id[:8], old_session.client_id[:8])
+        return (
+            f"{kind} '{label}' is leased to another client and cannot be taken over; "
+            f"choose a different name or wait for the lease holder to disconnect",
+            "leased",
+        )
+
+    if mode == TUNNEL_MODE_LEASE:
+        log.info("Refused lease on %s '%s' for client %s: already in use by client %s",
+                 kind, label, session.client_id[:8], old_session.client_id[:8])
+        return (
+            f"{kind} '{label}' is already in use by another client and lease mode does not "
+            f"take over existing tunnels; reconnect without --lease to hand the name over",
+            "in_use",
+        )
+
+    log.info("Handing off %s '%s' from client %s to client %s",
+             kind, label, old_session.client_id[:8], session.client_id[:8])
+    ctx.log_event(f"Handed off {kind} '{label}' from client {old_session.client_id[:8]} "
+                  f"to client {session.client_id[:8]} (handoff mode)")
+    await close_tunnel(old_session, old_tunnel_id, ctx, reason="handoff",
+                       message=f"Tunnel '{label}' was handed off to a new client")
+    return None
+
+
+async def claim_public_name(session: ClientSession, ctx: ServerContext, requested,
+                            allocate, registry: dict, kind: str, mode: str,
+                            instance_id: Optional[str]):
+    """Reserve a public name for a new tunnel.
+
+    `requested` is the name the client asked for (None = pick one). Returns
+    (granted_name, error, reason); `granted_name` is None on failure.
+    """
+    # allocate() may answer with a *different* free port when the requested
+    # one is taken (that is the documented fallback for TCP/UDP), so an
+    # answer other than the requested name still counts as a conflict.
+    granted = allocate(ctx, requested)
+    if granted is not None and (requested is None or granted == requested):
+        return granted, None, None
+    if not requested:
+        return None, f"no {kind}s available", "exhausted"
+
+    entry = registry.get(requested)
+    if entry is None:
+        # Nothing registered under that name: either it was freed between the
+        # two calls, or the port is held by an unrelated local process.
+        granted = allocate(ctx, requested)
+        if granted is not None and granted == requested:
+            return granted, None, None
+        return None, f"{kind} '{requested}' is already in use", "in_use"
+
+    conflict = await resolve_claim_conflict(session, ctx, entry, requested, kind,
+                                            mode, instance_id)
+    if conflict is not None:
+        error, reason = conflict
+        return None, error, reason
+
+    granted = allocate(ctx, requested)
+    if granted is None or granted != requested:
+        return None, f"{kind} '{requested}' is already in use", "in_use"
+    return granted, None, None
+
+
 async def handle_tunnel_open(session: ClientSession, frame, ctx: ServerContext):
     try:
         req = json.loads(frame.payload.decode())
@@ -705,123 +842,140 @@ async def handle_tunnel_open(session: ClientSession, frame, ctx: ServerContext):
 
     tunnel_id = req.get("tunnel_id") or secrets.token_hex(8)
     ttype = req.get("type")
+    mode = str(req.get("mode") or TUNNEL_MODE_HANDOFF).lower()
+    instance_id = req.get("instance_id")
 
     if ttype not in ("http", "tcp", "udp"):
-        resp = {"tunnel_id": tunnel_id, "status": "error", "error": "type must be 'http', 'tcp' or 'udp'"}
-        await session.send_frame(FrameType.TUNNEL_OPEN_RESPONSE, CONTROL_STREAM_ID, json.dumps(resp).encode())
+        await _reject_tunnel_claim(session, tunnel_id,
+                                    "type must be 'http', 'tcp' or 'udp'", "invalid")
+        return
+    if mode not in TUNNEL_MODES:
+        await _reject_tunnel_claim(session, tunnel_id,
+                                    f"mode must be one of: {', '.join(TUNNEL_MODES)}", "invalid")
         return
 
-    if ttype == "http":
-        requested = req.get("subdomain")
-        subdomain = allocate_subdomain(ctx, requested)
-        if subdomain is None and requested:
-            # The subdomain is taken -- but if it belongs to a *different
-            # session* of the SAME client_id, the old session is stale
-            # (the client reconnected).  Reclaim the tunnel from the old
-            # session so the new one can have it.
-            existing = ctx.by_subdomain.get(requested.lower())
-            if existing is not None:
-                old_session, old_tunnel_id = existing
-                if old_session.client_id == session.client_id and old_session is not session:
-                    log.info("Reclaiming subdomain '%s' from stale session of client %s",
-                             requested, session.client_id[:8])
-                    await close_tunnel(old_session, old_tunnel_id, ctx)
-                    subdomain = allocate_subdomain(ctx, requested)
-        if subdomain is None:
-            reason = "subdomain already in use" if requested else "could not allocate a subdomain"
-            resp = {"tunnel_id": tunnel_id, "status": "error", "error": reason}
-            await session.send_frame(FrameType.TUNNEL_OPEN_RESPONSE, CONTROL_STREAM_ID, json.dumps(resp).encode())
-            return
-
-        tunnel = TunnelInfo(tunnel_id=tunnel_id, type="http", subdomain=subdomain)
-        session.tunnels[tunnel_id] = tunnel
-        ctx.by_subdomain[subdomain] = (session, tunnel_id)
-        ctx.storage.save_tunnel(tunnel_id, session.client_id, "http", subdomain, None)
-
-        scheme = "https" if not ctx.config.get("http_only") else "http"
-        public_url = f"{scheme}://{subdomain}.{ctx.config['wildcard_domain']}"
-        resp = {"tunnel_id": tunnel_id, "status": "ok", "type": "http", "public_url": public_url}
-        ctx.log_event(f"Client {session.client_id[:8]} opened HTTP tunnel {public_url}")
-
-    elif ttype == "tcp":
-        preferred = req.get("remote_port")
-        port = allocate_tcp_port(ctx, preferred)
-        if port is None and preferred is not None:
-            # Port taken -- reclaim from stale session of same client_id
-            existing = ctx.by_port.get(preferred)
-            if existing is not None:
-                old_session, old_tunnel_id = existing
-                if old_session.client_id == session.client_id and old_session is not session:
-                    log.info("Reclaiming TCP port %s from stale session of client %s",
-                             preferred, session.client_id[:8])
-                    await close_tunnel(old_session, old_tunnel_id, ctx)
-                    port = allocate_tcp_port(ctx, preferred)
-        if port is None:
-            resp = {"tunnel_id": tunnel_id, "status": "error", "error": "no TCP ports available"}
-            await session.send_frame(FrameType.TUNNEL_OPEN_RESPONSE, CONTROL_STREAM_ID, json.dumps(resp).encode())
-            return
-
-        try:
-            tcp_server = await asyncio.start_server(
-                lambda r, w, p=port: handle_public_tcp_conn(r, w, ctx, p),
-                ctx.config["tcp"].get("bind_host", "0.0.0.0"), port,
+    # Name claims are serialised: allocate + lease check + eviction must be
+    # atomic, otherwise two racing clients could both pass the check.
+    async with ctx.claim_lock:
+        if ttype == "http":
+            requested = req.get("subdomain")
+            if requested is not None:
+                requested = str(requested).strip().lower() or None
+            subdomain, error, reason = await claim_public_name(
+                session, ctx, requested, allocate_subdomain, ctx.by_subdomain,
+                "subdomain", mode, instance_id,
             )
-        except OSError as e:
-            resp = {"tunnel_id": tunnel_id, "status": "error", "error": f"bind failed: {e}"}
-            await session.send_frame(FrameType.TUNNEL_OPEN_RESPONSE, CONTROL_STREAM_ID, json.dumps(resp).encode())
-            return
+            if subdomain is None:
+                await _reject_tunnel_claim(session, tunnel_id, error, reason)
+                return
 
-        tunnel = TunnelInfo(tunnel_id=tunnel_id, type="tcp", remote_port=port, tcp_server=tcp_server)
-        session.tunnels[tunnel_id] = tunnel
-        ctx.by_port[port] = (session, tunnel_id)
-        ctx.storage.save_tunnel(tunnel_id, session.client_id, "tcp", None, port)
+            tunnel = TunnelInfo(tunnel_id=tunnel_id, type="http", mode=mode,
+                                instance_id=instance_id, subdomain=subdomain)
+            session.tunnels[tunnel_id] = tunnel
+            ctx.by_subdomain[subdomain] = (session, tunnel_id)
+            ctx.storage.save_tunnel(tunnel_id, session.client_id, "http", subdomain, None)
 
-        resp = {"tunnel_id": tunnel_id, "status": "ok", "type": "tcp",
-                "remote_port": port, "public_host": ctx.config["wildcard_domain"]}
-        ctx.log_event(f"Client {session.client_id[:8]} opened TCP tunnel on port {port}")
+            scheme = "https" if not ctx.config.get("http_only") else "http"
+            public_url = f"{scheme}://{subdomain}.{ctx.config['wildcard_domain']}"
+            resp = {"tunnel_id": tunnel_id, "status": "ok", "type": "http",
+                    "public_url": public_url, "mode": mode}
+            ctx.log_event(f"Client {session.client_id[:8]} opened HTTP tunnel "
+                          f"{public_url} ({mode} mode)")
 
-    else:  # udp
-        preferred = req.get("remote_port")
-        port = allocate_udp_port(ctx, preferred)
-        if port is None and preferred is not None:
-            # Port taken -- reclaim from stale session of same client_id
-            existing = ctx.by_udp_port.get(preferred)
-            if existing is not None:
-                old_session, old_tunnel_id = existing
-                if old_session.client_id == session.client_id and old_session is not session:
-                    log.info("Reclaiming UDP port %s from stale session of client %s",
-                             preferred, session.client_id[:8])
-                    await close_tunnel(old_session, old_tunnel_id, ctx)
-                    port = allocate_udp_port(ctx, preferred)
-        if port is None:
-            resp = {"tunnel_id": tunnel_id, "status": "error", "error": "no UDP ports available"}
-            await session.send_frame(FrameType.TUNNEL_OPEN_RESPONSE, CONTROL_STREAM_ID, json.dumps(resp).encode())
-            return
+        elif ttype == "tcp":
+            preferred = req.get("remote_port")
+            port, error, reason = await claim_public_name(
+                session, ctx, preferred, allocate_tcp_port, ctx.by_port,
+                "TCP port", mode, instance_id,
+            )
+            if port is None:
+                await _reject_tunnel_claim(session, tunnel_id, error, reason)
+                return
 
-        tunnel = TunnelInfo(tunnel_id=tunnel_id, type="udp", remote_port=port, udp_streams={})
-        session.tunnels[tunnel_id] = tunnel
-        ctx.by_udp_port[port] = (session, tunnel_id)
-        ctx.storage.save_tunnel(tunnel_id, session.client_id, "udp", None, port)
+            try:
+                tcp_server = await asyncio.start_server(
+                    lambda r, w, p=port: handle_public_tcp_conn(r, w, ctx, p),
+                    ctx.config["tcp"].get("bind_host", "0.0.0.0"), port,
+                )
+            except OSError as e:
+                await _reject_tunnel_claim(session, tunnel_id, f"bind failed: {e}", "bind_failed")
+                return
 
-        bind_host = ctx.config["udp"].get("bind_host", "0.0.0.0")
-        asyncio.create_task(serve_udp_tunnel(session, tunnel, ctx, bind_host, port))
+            tunnel = TunnelInfo(tunnel_id=tunnel_id, type="tcp", mode=mode,
+                                instance_id=instance_id, remote_port=port,
+                                tcp_server=tcp_server)
+            session.tunnels[tunnel_id] = tunnel
+            ctx.by_port[port] = (session, tunnel_id)
+            ctx.storage.save_tunnel(tunnel_id, session.client_id, "tcp", None, port)
 
-        resp = {"tunnel_id": tunnel_id, "status": "ok", "type": "udp",
-                "remote_port": port, "public_host": ctx.config["wildcard_domain"]}
-        ctx.log_event(f"Client {session.client_id[:8]} opened UDP tunnel on port {port}")
+            resp = {"tunnel_id": tunnel_id, "status": "ok", "type": "tcp",
+                    "remote_port": port, "public_host": ctx.config["wildcard_domain"],
+                    "mode": mode}
+            ctx.log_event(f"Client {session.client_id[:8]} opened TCP tunnel on port "
+                          f"{port} ({mode} mode)")
 
-    await session.send_frame(FrameType.TUNNEL_OPEN_RESPONSE, CONTROL_STREAM_ID, json.dumps(resp).encode())
+        else:  # udp
+            preferred = req.get("remote_port")
+            port, error, reason = await claim_public_name(
+                session, ctx, preferred, allocate_udp_port, ctx.by_udp_port,
+                "UDP port", mode, instance_id,
+            )
+            if port is None:
+                await _reject_tunnel_claim(session, tunnel_id, error, reason)
+                return
+
+            tunnel = TunnelInfo(tunnel_id=tunnel_id, type="udp", mode=mode,
+                                instance_id=instance_id, remote_port=port,
+                                udp_streams={})
+            session.tunnels[tunnel_id] = tunnel
+            ctx.by_udp_port[port] = (session, tunnel_id)
+            ctx.storage.save_tunnel(tunnel_id, session.client_id, "udp", None, port)
+
+            bind_host = ctx.config["udp"].get("bind_host", "0.0.0.0")
+            asyncio.create_task(serve_udp_tunnel(session, tunnel, ctx, bind_host, port))
+
+            resp = {"tunnel_id": tunnel_id, "status": "ok", "type": "udp",
+                    "remote_port": port, "public_host": ctx.config["wildcard_domain"],
+                    "mode": mode}
+            ctx.log_event(f"Client {session.client_id[:8]} opened UDP tunnel on port "
+                          f"{port} ({mode} mode)")
+
+        await _send_tunnel_open_response(session, resp)
 
 
-async def close_tunnel(session: ClientSession, tunnel_id: str, ctx: ServerContext):
+async def close_tunnel(session: ClientSession, tunnel_id: str, ctx: ServerContext,
+                       reason: Optional[str] = None, message: Optional[str] = None):
+    """Unregister a tunnel and free its public name.
+
+    When `reason` is given the owning client is told about the revocation
+    with a TUNNEL_CLOSE frame carrying that reason ("handoff", "reclaimed"),
+    so it can report an informative message instead of silently going quiet.
+    """
     tunnel = session.tunnels.pop(tunnel_id, None)
     if not tunnel:
         return
+
+    if reason:
+        payload = json.dumps({
+            "tunnel_id": tunnel_id,
+            "reason": reason,
+            "message": message or f"Tunnel {tunnel_id[:8]} was closed by the server",
+        }).encode()
+        try:
+            await session.send_frame(FrameType.TUNNEL_CLOSE, CONTROL_STREAM_ID, payload)
+        except Exception:
+            pass
+
+    # Only free a registry slot if it still points at *this* tunnel -- after a
+    # handoff the name already belongs to the new owner and must not be stolen
+    # back by the old session's late cleanup.
     if tunnel.type == "http" and tunnel.subdomain:
-        ctx.by_subdomain.pop(tunnel.subdomain, None)
+        if _entry_owner(ctx.by_subdomain.get(tunnel.subdomain), session, tunnel_id):
+            ctx.by_subdomain.pop(tunnel.subdomain, None)
     if tunnel.type == "tcp":
         if tunnel.remote_port is not None:
-            ctx.by_port.pop(tunnel.remote_port, None)
+            if _entry_owner(ctx.by_port.get(tunnel.remote_port), session, tunnel_id):
+                ctx.by_port.pop(tunnel.remote_port, None)
         if tunnel.tcp_server is not None:
             tunnel.tcp_server.close()
             try:
@@ -830,7 +984,8 @@ async def close_tunnel(session: ClientSession, tunnel_id: str, ctx: ServerContex
                 pass
     if tunnel.type == "udp":
         if tunnel.remote_port is not None:
-            ctx.by_udp_port.pop(tunnel.remote_port, None)
+            if _entry_owner(ctx.by_udp_port.get(tunnel.remote_port), session, tunnel_id):
+                ctx.by_udp_port.pop(tunnel.remote_port, None)
         if tunnel.udp_sock is not None:
             try:
                 tunnel.udp_sock.close()
@@ -849,7 +1004,7 @@ async def close_tunnel(session: ClientSession, tunnel_id: str, ctx: ServerContex
             except Exception:
                 pass
             session.streams.pop(sid, None)
-    ctx.log_event(f"Tunnel {tunnel_id[:8]} closed")
+    ctx.log_event(f"Tunnel {tunnel_id[:8]} closed" + (f" ({reason})" if reason else ""))
 
 
 async def handle_tunnel_close(session: ClientSession, frame, ctx: ServerContext):
@@ -1045,9 +1200,9 @@ async def handle_control_connection(reader: asyncio.StreamReader, writer: asynci
 
     # If this client_id already has live sessions, keep them -- a single
     # user may run multiple client processes from the same machine (they
-    # share a client_id via the persisted state file).  Conflicting
-    # tunnel resources (e.g. same subdomain) are reclaimed at tunnel-open
-    # time, not here.
+    # share a client_id via the persisted state file).  Which session wins a
+    # contested tunnel name is decided at tunnel-open time by the tunnel's
+    # ownership mode (handoff vs. lease), not here.
     existing_sessions = ctx.clients.get(client_id, set())
 
     session = ClientSession(client_id, reader, writer)

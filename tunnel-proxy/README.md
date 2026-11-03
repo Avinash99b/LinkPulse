@@ -171,6 +171,30 @@ python3 examples/reference_client.py \
 
 Your app will be available at `https://myapp.tunnel.example.com` (via your HTTPS-terminating front).
 
+### Tunnel ownership modes
+
+Public names (subdomain / TCP port / UDP port) are shared, so the server needs
+a rule for a second client that asks for a name already in use. Each tunnel
+declares its mode in `TUNNEL_OPEN_REQUEST` (clients expose this as `--lease`):
+
+| mode | behaviour |
+|------|-----------|
+| `handoff` (default) | Newest claimant wins. The previous owner is revoked (`TUNNEL_CLOSE` with `reason="handoff"` and a message), its streams are aborted, and the newcomer gets the name. |
+| `lease` | The name is reserved. Other clients are refused (`status="error"`, `reason="leased"`) and the holder keeps serving. A client asking for a lease over a name that is already in use is refused too (`reason="in_use"`). |
+
+Reconnects are never treated as a conflict: the same client process (same
+`client_id` and `instance_id`) reclaims its own registration, including a
+leased one. Two processes on one machine share the persisted `client_id` but
+send different `instance_id`s, so they count as two competing clients — which
+is what makes `--lease` meaningful when the same machine runs two clients for
+the same name.
+
+A lease lives as long as the owning session: once the client is unreachable
+past `heartbeat_timeout_seconds` the server drops the session and the name
+returns to the pool. Leases are therefore exclusive but never permanent, which
+keeps the "routes are rebuilt on reconnect, nothing is reserved forever"
+design intact.
+
 ## Monitoring
 
 - Dashboard: `https://your-domain/dashboard/` (requires `DASHBOARD_PASSWORD` and `JWT_SECRET`)
@@ -227,7 +251,7 @@ Resists replay and proves knowledge of shared secret without sending it.
 2. **No external services** — SQLite + local files only. Scales from laptop to modest production
 3. **Per-stream flow control** — Backpressure-aware, prevents one slow tunnel from starving others
 4. **Replay-protected auth** — HMAC-SHA256 + timestamp checks + nonce tracking; no secret sent over wire
-5. **Stable reconnect behavior** — Clients persist their ID, routes aren't "reserved" ahead of time (first-come first-served), allows graceful recovery without complex state sync
+5. **Stable reconnect behavior** — Clients persist their ID, routes aren't "reserved" ahead of time (first-come first-served), allows graceful recovery without complex state sync. Contested names are resolved by the tunnel's **ownership mode**: `handoff` (default — newest claimant wins, previous owner is revoked with an explanatory message) or `lease` (name reserved; other claimants are refused until the holder's session ends)
 6. **SSL termination externalized** — Handled by Render/Cloudflare/etc., keeps proxy server simple and focused
 7. **Two public ports** — Port 80 for HTTP, port 9000 for raw TCP control. Works with cloud platforms that terminate TLS at the edge.
 8. **Observability, not governance** — SQLite bookkeeping, dashboard, and logs are for transparency; routing is purely in-memory and rebuilt on reconnect

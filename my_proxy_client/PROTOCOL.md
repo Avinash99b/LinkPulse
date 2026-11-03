@@ -42,9 +42,9 @@ Every message is a frame with a 12-byte fixed header followed by a variable-leng
 | 0x03  | HELLO_FAIL            | server → client   | JSON `{error}` (connection closes after)   |
 | 0x04  | PING                  | either            | empty                                      |
 | 0x05  | PONG                  | either            | empty                                      |
-| 0x06  | TUNNEL_OPEN_REQUEST   | client → server   | JSON `{tunnel_id, type, subdomain?, remote_port?}` |
-| 0x07  | TUNNEL_OPEN_RESPONSE  | server → client   | JSON `{tunnel_id, status, ...}`            |
-| 0x08  | TUNNEL_CLOSE          | either            | JSON `{tunnel_id}`                         |
+| 0x06  | TUNNEL_OPEN_REQUEST   | client → server   | JSON `{tunnel_id, type, mode?, instance_id?, subdomain?, remote_port?}` |
+| 0x07  | TUNNEL_OPEN_RESPONSE  | server → client   | JSON `{tunnel_id, status, mode?, ...}`     |
+| 0x08  | TUNNEL_CLOSE          | either            | JSON `{tunnel_id, reason?, message?}`      |
 | 0x09  | STREAM_OPEN           | server → client   | JSON `{tunnel_id, proto, remote_addr}`, stream ID in header |
 | 0x0A  | STREAM_DATA           | either            | raw bytes (≤ 64 KiB)                       |
 | 0x0B  | STREAM_CLOSE          | either            | empty                                      |
@@ -107,16 +107,24 @@ This gives simple, symmetric backpressure without per-request buffering.
 ```json
 {
   "tunnel_id": "uuid-hex",
-  "type": "http" | "tcp",
-  "subdomain": "app",     // http only, optional
-  "remote_port": 20000    // tcp only, optional
+  "type": "http" | "tcp" | "udp",
+  "mode": "handoff" | "lease",   // optional, default "handoff"
+  "instance_id": "hex",          // optional: one random id per client process
+  "subdomain": "app",            // http only, optional
+  "remote_port": 20000           // tcp/udp only, optional
 }
 ```
 
 - `tunnel_id` is client-generated and persistent across reconnects (same tunnel_id after reconnect = resume that tunnel)
-- `type` is required; "http" or "tcp"
+- `type` is required; "http", "tcp" or "udp"
 - `subdomain` (http only): client requests a specific subdomain. If omitted or taken, server assigns one.
-- `remote_port` (tcp only): client requests a specific port. If omitted or taken, server assigns one.
+- `remote_port` (tcp/udp only): client requests a specific port. If omitted or taken, server assigns one.
+- `mode` says what to do when the requested name is already registered (see
+  [Tunnel ownership modes](#tunnel-ownership-modes)). Unknown values are rejected.
+- `instance_id` is a per-process random string. `client_id` is shared by every
+  client process on a machine (they persist it in the same state file), so the
+  server uses `instance_id` to tell a genuine reconnect (same client_id **and**
+  same instance_id) from a second competing process (different instance_id).
 
 ### TUNNEL_OPEN_RESPONSE (server → client)
 
@@ -125,22 +133,68 @@ This gives simple, symmetric backpressure without per-request buffering.
   "tunnel_id": "uuid-hex",
   "status": "ok" | "error",
   "type": "http" | "tcp",
+  "mode": "handoff" | "lease",                          // echoed back, if ok
   "public_url": "https://app.forwarding.example.com",  // http only, if ok
   "public_host": "forwarding.example.com",              // tcp only, if ok
-  "remote_port": 20000,                                 // tcp only, if ok
-  "error": "reason for failure"                         // if error
+  "remote_port": 20000,                                 // tcp/udp only, if ok
+  "error": "reason for failure",                        // if error
+  "reason": "leased" | "in_use" | "exhausted" | "invalid"  // if error, optional
 }
 ```
+
+The client is expected to retry a failed registration periodically (the
+reference client retries every 5s while it stays connected), because a name can
+become available later (the holder disconnected, a lease expired with its
+session, ports freed up, ...).
 
 ### TUNNEL_CLOSE (either direction)
 
 ```json
 {
-  "tunnel_id": "uuid-hex"
+  "tunnel_id": "uuid-hex",
+  "reason": "handoff" | "reclaimed",   // server-initiated closes only
+  "message": "human-readable explanation"
 }
 ```
 
 Unregisters the tunnel. The tunnel is freed for reuse. Any in-flight streams for this tunnel are aborted.
+
+Client → server closes carry only `tunnel_id`. Server → client closes are
+revocations and carry a `reason`/`message` so the client can say *why* its
+tunnel disappeared:
+
+| `reason` | meaning | client reaction |
+|----------|---------|-----------------|
+| `handoff` | Another client claimed the same name in handoff mode. | Report the message, stop serving that tunnel, and (if it has no tunnels left) exit cleanly. |
+| `reclaimed` | The same client process reconnected and took its own registration back. | Ignore; the tunnel is re-opened by the matching `TUNNEL_OPEN_RESPONSE`. |
+
+## Tunnel ownership modes
+
+Public names (subdomain / TCP port / UDP port) are shared, not
+permanently reserved. Each tunnel declares how contests for its name are
+resolved; the server enforces the mode stored on the **existing** tunnel.
+
+| mode | behaviour when the name is already registered |
+|------|-----------------------------------------------|
+| `handoff` (default) | The newcomer wins. The current owner's tunnel is revoked (`TUNNEL_CLOSE` with `reason="handoff"`), its in-flight streams are aborted, and the newcomer is granted the name. |
+| `lease` | The newcomer is refused with `status="error"`, `reason="leased"`. The holder keeps serving. A client asking for a lease on a name that is already in use is likewise refused (`reason="in_use"`) — a lease never takes over an existing tunnel. |
+
+Two exceptions, both about *identity*:
+
+- A reconnect of the same client process (same `client_id` **and** same
+  `instance_id`, or an older client that sends no `instance_id`) always
+  reclaims its own previous registration, even a leased one — the server may
+  not have noticed the old TCP connection dying yet. The previous
+  registration is revoked silently (`reason="reclaimed"` only if it lived on
+  a different connection).
+- A second process with the same `client_id` but a different `instance_id`
+  counts as a **competitor**, not a reconnect: it is refused by a lease and
+  takes over in handoff mode.
+
+A lease lasts as long as the owning client's session. If the owner becomes
+unreachable for `heartbeat_timeout_seconds` the server drops the session and
+the name returns to the pool (the same stale-session rule that applies to
+every other tunnel), so leases cannot block a name forever.
 
 ## Stream lifecycle
 
@@ -183,8 +237,11 @@ Empty payload. Sent when one side has finished (EOF from local backend, or error
 - Subdomains/ports are *not* "reserved" — they're granted to whichever client currently asks for them
   - A client wanting a stable public URL re-requests the same `subdomain` or `remote_port` on reconnect
   - If no one else claimed it, client gets it back automatically
+  - If somebody else did claim it, the ownership mode decides who wins (see [Tunnel ownership modes](#tunnel-ownership-modes))
+- A client that wants to keep its name to itself should request `mode: "lease"`
 - **In-flight streams are NOT resumed**: if control connection drops, open streams are aborted (their sockets closed). Full resumption would require sequence numbers, retransmit buffers, and significantly more state. For a self-hosted tool, occasional dropped requests on reconnect are acceptable.
-- If a HELLO arrives for a `client_id` that already has a live session (race), server tears down the old session before accepting the new one
+- If a HELLO arrives for a `client_id` that already has a live session (race), the server keeps both sessions; name contests between them are resolved like any other contest (by mode and `instance_id`)
+- The client retries a dropped/unreachable control connection indefinitely (every 5s by default); it never exits because the server is down
 
 ## Error handling
 
@@ -226,7 +283,8 @@ When implementing a client or alternative server:
 - [ ] Flow control windows: per-stream, independent directions, credit-based
 - [ ] STREAM_DATA chunking: split payloads > 64 KiB into multiple frames
 - [ ] Multiplexing: interleave frames from different streams freely
-- [ ] Reconnect: client persists client_id, re-requests same tunnels
+- [ ] Ownership modes: store `mode` per tunnel, evict on `handoff`, refuse on `lease`, and treat same `(client_id, instance_id)` as a reconnect
+- [ ] Reconnect: client persists client_id, re-requests same tunnels, retries forever (never gives up)
 - [ ] Graceful shutdown: close tunnels cleanly before disconnecting
 - [ ] Error handling: malformed frames are fatal; auth failures don't retry
 

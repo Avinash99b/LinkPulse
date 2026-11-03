@@ -64,6 +64,30 @@ CONTROL_STREAM_ID = 0
 # it must wait for a WINDOW_UPDATE). See FlowWindow in proxy_server.py.
 INITIAL_WINDOW = 256 * 1024
 
+# ---------------------------------------------------------------------------
+# Tunnel ownership modes
+# ---------------------------------------------------------------------------
+#
+# Every TUNNEL_OPEN_REQUEST carries a "mode" telling the server what should
+# happen when the requested public name (subdomain / TCP port / UDP port) is
+# already registered to somebody else.
+#
+#   handoff (default): the newcomer wins. The current owner's tunnel is
+#                      revoked, the owner is told why (TUNNEL_CLOSE with
+#                      reason="handoff") and the newcomer takes the name.
+#   lease           : the name is reserved. A newcomer is refused with an
+#                      error response; only a reconnect of the *same client
+#                      process* may take the registration back.
+#
+# The mode declared by the tunnel's owner is what the server stores and
+# enforces, so a lease protects a name from every later claimant, and a
+# client asking for a lease over a name that is already in use is refused
+# rather than silently stealing it.
+
+TUNNEL_MODE_HANDOFF = "handoff"
+TUNNEL_MODE_LEASE = "lease"
+TUNNEL_MODES = (TUNNEL_MODE_HANDOFF, TUNNEL_MODE_LEASE)
+
 
 class FrameType(enum.IntEnum):
     # --- connection / session lifecycle -----------------------------------
