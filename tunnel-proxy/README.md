@@ -37,32 +37,88 @@ A minimal, self-hosted alternative to ngrok. One `proxy_server.py`, no external 
 
 ## Quick Start
 
-### 1. Manual Docker Run (Recommended)
+### 1. Docker (recommended)
 
 ```bash
-# Copy environment template
-cp .env.example .env
-
-# Edit with your values
-# Required: SHARED_SECRET, WILDCARD_DOMAIN, DASHBOARD_PASSWORD
+cp .env.example .env      # SHARED_SECRET, WILDCARD_DOMAIN, DASHBOARD_PASSWORD, JWT_SECRET (+ certbot creds)
 vim .env
 
-# Build
+# Interactive: inspects the machine first (container, image, database,
+# certbot certificates, DNS, busy ports), then asks what to do.
+./startup.sh
+
+# Non-interactive equivalents:
+./startup.sh --action restart                                    # restart as-is (fastest)
+./startup.sh --action redeploy --mode 3 --range 20000-20100 -y   # http + tcp + udp
+./startup.sh --action rebuild  --mode 3 --range 20000-20100 -y   # rebuild, then swap
+```
+
+Manual equivalent of the default layout (HTTP + TCP + UDP tunnels):
+
+```bash
 docker build -t tunnel-proxy .
 
-# Run - ports 80 (HTTP) and 9000 (control) exposed
-docker run -d \
-  --name tunnel-proxy \
+docker run -d --name tunnel-proxy --restart unless-stopped \
   -p 80:80 \
+  -p 443:443 \
   -p 9000:9000 \
+  -p 20000-20100:20000-20100 \
+  -p 20000-20100:20000-20100/udp \
+  -e TCP_PORT_MIN=20000 -e TCP_PORT_MAX=20100 \
+  -e UDP_PORT_MIN=20000 -e UDP_PORT_MAX=20100 \
   --env-file .env \
-  -v tunnel-proxy-data:/data \
-  -v tunnel-proxy-logs:/var/log/tunnel-proxy \
+  -v /data:/data \
+  -v /var/log:/var/log \
   tunnel-proxy
 
 # Check health
 curl http://localhost/health
 ```
+
+HTTP-only (two public ports plus the control channel — no raw TCP/UDP tunnels):
+
+```bash
+docker run -d --name tunnel-proxy --restart unless-stopped \
+  -p 80:80 -p 443:443 -p 9000:9000 \
+  --env-file .env \
+  -v /data:/data -v /var/log:/var/log \
+  tunnel-proxy
+```
+
+`/data` holds the SQLite database **and** `/data/letsencrypt`, so replacing or
+restarting the container keeps client history and reuses existing certificates.
+
+### Ports and tunnel types
+
+| Port(s) | Needed for | Notes |
+|---------|------------|-------|
+| `80` | `/health`, HTTP tunnels, apex→HTTPS redirect | Always publish |
+| `443` | HTTPS tunnels + dashboard | Unless `HTTP_ONLY=true` / external TLS |
+| `9000` | Control channel (`CONTROL_PORT`) | Every client connects here |
+| `TCP_PORT_MIN..TCP_PORT_MAX` | raw `tcp` tunnels | Publish **1:1** (`-p 20000-20100:20000-20100`) |
+| `UDP_PORT_MIN..UDP_PORT_MAX` | raw `udp` tunnels | Same range with `/udp` |
+
+- **HTTP tunnels never need extra ports**: every `http` tunnel is routed by the
+  `Host` header / subdomain through the shared 80/443 listener, so 80/443+9000
+  is enough for any number of HTTP tunnels. Raw `tcp`/`udp` tunnels are the only
+  ones that consume a dedicated public port.
+- `EXPOSE` in the Dockerfile is documentation only; nothing is reachable from
+  outside the container unless it is published with `-p` (or `--network host`).
+  Publishing must also be 1:1: the server advertises the container-side port
+  number, so `-p 30000:20000` would advertise a port nobody can reach.
+- The server only verifies that an allocated port is *bindable inside the
+  container*. An unpublished port therefore shows up as a `ready` tunnel that is
+  unreachable from the internet — keep the published range and the
+  `TCP_PORT_MIN/MAX` (and `UDP_*`) values identical.
+- Keep the range small (~100 ports). Each published port costs an iptables DNAT
+  rule (and, with Docker's default userland proxy, a proxy listener); a range
+  like `10000-65535` is impractical and often rejected by cloud firewalls.
+- With bridge networking Docker routes published ports through its own
+  DNAT/FORWARD rules, so a restrictive host `INPUT` chain does **not** block
+  them. With `--network host` (or the direct Python run) the server binds the
+  host directly and the host firewall must allow 80, 443, 9000 and the range.
+- On Oracle Cloud (and any cloud) the VCN security list / NSG must also allow
+  those ports — that is outside the host.
 
 ### 2. Direct Python Run (Development)
 
@@ -91,11 +147,15 @@ All configuration is via environment variables:
 | `DASHBOARD_PASSWORD` | **Yes for dashboard** | - | Password required to unlock dashboard |
 | `JWT_SECRET` | **Yes for dashboard** | - | High-entropy HS256 JWT signing secret |
 | `CONTROL_HOST` | No | `0.0.0.0` | Control channel bind host |
-| `CONTROL_PORT` | No | `9001` | Control channel port (internal; nginx stream fronts it at `:9000`) |
+| `CONTROL_PORT` | No | `9000` | Control channel port (clients connect here) |
 | `HTTP_HOST` | No | `0.0.0.0` | HTTP server bind host |
-| `HTTP_PORT` | No | `8080` | HTTP server port |
-| `TCP_PORT_MIN` | No | `20000` | TCP port range minimum |
-| `TCP_PORT_MAX` | No | `20100` | TCP port range maximum |
+| `HTTP_PORT` | No | `80` | HTTP server port |
+| `HTTPS_HOST` | No | `0.0.0.0` | HTTPS server bind host |
+| `HTTPS_PORT` | No | `443` | HTTPS server port |
+| `TCP_PORT_MIN` | No | `10000` | TCP tunnel port range minimum (publish it!) |
+| `TCP_PORT_MAX` | No | `65535` | TCP tunnel port range maximum (publish it!) |
+| `UDP_PORT_MIN` | No | `10000` | UDP tunnel port range minimum (publish it!) |
+| `UDP_PORT_MAX` | No | `65535` | UDP tunnel port range maximum (publish it!) |
 | `DASHBOARD_HOST` | No | `127.0.0.1` | Standalone dashboard bind host (loopback only by default) |
 | `DASHBOARD_PORT` | No | `8081` | Dashboard port |
 | `HTTP_ONLY` | No | `true` | Use http:// URLs |
@@ -112,27 +172,34 @@ All configuration is via environment variables:
 
 ## Container Architecture
 
-Two public ports, three internal processes under supervisord:
+One container, one process: `entrypoint.sh` fixes volume ownership, provisions
+or reuses the wildcard certificate with certbot (DNS challenge), then `exec`s
+`proxy_server.py`, which binds every port itself.
 
 ```
-:80  (haproxy) ──────────────────────────── HTTP tunnels + dashboard
-  │  HTTP only (no protocol sniffing)
-  └─ → nginx http :8088
-        ├─ /dashboard/, /api/ → dashboard :8081
-        └─ everything else    → proxy_server :8080 (tunnel HTTP)
-
-:9000 (nginx stream) ───────────────────── Control channel (client connection)
-  │  raw TCP, no TLS
-  └─ → proxy_server :9001 (control channel)
+:80        proxy_server.py  ── /health, apex→HTTPS redirect, HTTP tunnels
+:443       proxy_server.py  ── HTTPS tunnels + dashboard (apex domain)
+:9000      proxy_server.py  ── control channel (raw TCP, no TLS)
+RANGE/tcp  proxy_server.py  ── one listener per raw TCP tunnel
+RANGE/udp  proxy_server.py  ── one UDP socket per raw UDP tunnel
 ```
 
-- **haproxy** — HTTP reverse proxy for tunnels and dashboard (`haproxy.cfg`)
-- **nginx** — HTTP reverse proxy (dashboard + tunnels) + TCP stream for control (`nginx.conf`, `libnginx-mod-stream`)
-- **proxy_server.py** — the tunnel proxy itself (`supervisord.conf`)
+- **`entrypoint.sh`** — runs as root: `chown`s `/data` and `/var/log/...`,
+  symlinks `/etc/letsencrypt` to `/data/letsencrypt`, renews the certificate if
+  it is missing or expires within 30 days, starts cron for renewals, then drops
+  into the server.
+- **`proxy_server.py`** — the tunnel server: HTTP(S) routing by `Host`,
+  per-tunnel TCP/UDP listeners, control channel, dashboard.
+- **`startup.sh`** — deployment helper (detects existing state, builds,
+  swaps/restarts the container, waits for health, rolls back on failure).
 
-**Why two ports?** Render (and most cloud platforms) terminate HTTPS at the edge and forward **HTTP** to the container. The control channel is a raw TCP protocol (`TN` magic bytes) that can't ride over HTTP/HTTPS. Separate port 9000 keeps the control channel as raw TCP while port 80 handles HTTP traffic.
+**Why separate ports?** HTTP(S) tunnels multiplex over 80/443 by `Host` header,
+but the control channel is a raw TCP protocol (`TN` magic bytes) that cannot
+ride over HTTP, so it needs its own port. Raw `tcp`/`udp` tunnels each need a
+public port of their own, which is why the range above exists.
 
-**Render / persistent disk note:** The container includes an `entrypoint.sh` that runs as root on startup, `chown`s all writable directories (`/data`, `/var/log/...`, `/run/...`) to the `tunnelproxy` user, then hands off to supervisord. This makes the container work with Render's persistent disks (which mount as root) without permission issues.
+**Persistent data:** everything mutable lives under `/data` (`tunnel_proxy.db`,
+`letsencrypt/`), so mounting `/data` is enough to keep state across rebuilds.
 
 ## Render Deployment
 
@@ -152,9 +219,24 @@ Two public ports, three internal processes under supervisord:
 
 **Note:** Render handles HTTPS termination automatically on port 443 and forwards HTTP to container port 80. The control channel uses a separate TCP port (9000) which Render exposes as a TCP load balancer target. Point `*.yourdomain` and `yourdomain` at the service.
 
+Render cannot expose an arbitrary port range, so on Render only `http` tunnels
+work — `tcp`/`udp` tunnels need a host/VPS where you can publish
+`TCP_PORT_MIN..TCP_PORT_MAX` (see [Ports and tunnel types](#ports-and-tunnel-types)).
+
 ## SSL/TLS
 
-**HTTPS termination is handled externally** (Render, Cloudflare, or your own reverse proxy). The container exposes HTTP on port 80 only. The control channel uses raw TCP on port 9000 (no TLS). No SSL certificates, Let's Encrypt, or certbot needed.
+The container terminates HTTPS itself: `entrypoint.sh` requests a wildcard
+certificate (`*.<WILDCARD_DOMAIN>` + the apex) via certbot's DNS challenge on
+first start, stores it in `/data/letsencrypt`, reuses it on later starts when it
+is valid for more than 30 days, and renews it daily via cron.
+
+- Needs `DNS_PROVIDER` + credentials (`CF_API_TOKEN` for Cloudflare) and
+  `CERTBOT_EMAIL`; otherwise set `HTTP_ONLY=true` and put TLS in front yourself.
+- Set `EXTERNAL_SSL=true` to skip certbot entirely when a proxy/reverse proxy
+  terminates TLS for you.
+- `startup.sh` reports the certificate it finds (path + expiry) before deploying,
+  so a restart or redeploy never re-requests a valid certificate.
+- Clients always reach the control channel as **raw TCP on 9000**, not TLS.
 
 ## Client Usage
 
