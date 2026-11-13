@@ -1,554 +1,220 @@
-# my_proxy — Client for the self-hosted tunneling proxy
+# LinkPulse Client (`my_proxy`)
 
-A production-quality client for the `proxy_server.py` tunneling proxy. Exposes local HTTP and TCP services on public URLs/ports via a single persistent, multiplexed connection. Handles reconnects indefinitely (every 5 seconds, never gives up), graceful shutdown, tunnel handoff/lease, and automatic recovery.
+Expose local HTTP, TCP and UDP services through a LinkPulse server over one
+persistent, authenticated, multiplexed connection. Single file, Python stdlib
+only. Python 3.11 recommended (Docker image); local runs/tests use Python
+3.12.13.
 
-**Zero external dependencies** (uses only Python stdlib: asyncio, ssl, sqlite3, struct, json, etc.).
+```
+local :8080 ── my_proxy ── one multiplexed connection ── server ── https://app.example.com
+```
 
-## Quick start
+## Install / run
+
+Nothing to install; run the script (or the packaged `linkpulse` binary):
 
 ```bash
-# Expose local HTTP service
-my_proxy http 8080
-my_proxy http localhost:3000
-my_proxy http 5173 -u myapp
-
-# Keep a name to yourself (refuse to share/take it over)
-my_proxy http 5173 -u myapp --lease
-
-# Expose local TCP service
-my_proxy tcp 22
-my_proxy tcp 25565
-
-# Expose multiple services at once
-my_proxy start tunnels.json
-
-# All commands require a shared secret:
-my_proxy http 8080 --token <shared-secret>
-
-# Or set environment variable:
-export MY_PROXY_TOKEN=<shared-secret>
-my_proxy http 8080
+python3 my_proxy.py http 8080 --token 'replace-with-secret' --server proxy.example.com:9000
 ```
 
-## Features
-
-✅ **Single persistent connection** — All tunnels multiplexed over one authenticated TCP connection  
-✅ **HTTP and TCP forwarding** — Host header–based routing for HTTP; random port allocation for TCP  
-✅ **Reconnects forever** — Retries every 5 s (`--retry-interval`) and never gives up, so a sleeping laptop or a server restart heals itself  
-✅ **Tunnel ownership modes** — `handoff` (default: the newest client takes the name) or `--lease` (the name is reserved; other clients are refused)  
-✅ **Failed registrations retried** — a name that is in use/unavailable is retried every 5 s, not left dead  
-✅ **Local dashboard** — Real-time tunnel status, mode, bytes/connection counts, latency, logs (default `127.0.0.1:4040`)  
-✅ **Flow control** — Per-stream credit-based backpressure (256 KiB windows), prevents stalling  
-✅ **Graceful shutdown** — SIGINT/SIGTERM cleanly closes tunnels and disconnects  
-✅ **Persistent identity** — Client ID saved across restarts for stable public URLs  
-✅ **Zero external deps** — Only Python stdlib  
-
-## Project structure
-
-```
-my_proxy                    Single-file client
-README.md                   This file
-config.example.json         Multi-tunnel config template
-requirements.txt            Python dependencies (empty — stdlib only)
-PROTOCOL.md                 Wire protocol spec (for client implementers)
-```
-
----
-
-## Installation
-
-### Requirements
-
-- Python 3.9+
-- A running `proxy_server.py` instance
-- The shared secret configured on the server
-
-### Setup
+Or make it executable and use the launcher name:
 
 ```bash
-# No installation needed; just run directly:
-python3 my_proxy http 8080 --token <secret>
-
-# Or make executable and add to PATH:
 chmod +x my_proxy
-./my_proxy http 8080 --token <secret>
+./my_proxy http 8080
 ```
 
----
+## CLI
 
-## CLI reference
-
-### Commands
-
-#### `my_proxy http <target> [options]`
-
-Expose a local HTTP service on a public HTTPS URL.
-
-**Arguments:**
-- `<target>` — local port (e.g., `8080`) or `host:port` (e.g., `localhost:5173`)
-
-**Options:**
-- `-u, --subdomain <subdomain>` — request a specific subdomain (e.g., `myapp` → `https://myapp.forwarding.example.com`)
-- `--lease` — lease the name: another client cannot take it over, and this client refuses to take over a name that is already in use
-
-**Example:**
-```bash
-my_proxy http 8080
-my_proxy http localhost:5173 -u frontend
-my_proxy http localhost:5173 -u frontend --lease
-my_proxy http 127.0.0.1:3000 --token mysecret
+```
+my_proxy http <port|host:port> [-u SUBDOMAIN] [options]
+my_proxy tcp  <port|host:port> [--remote-port PORT] [options]
+my_proxy udp  <port|host:port> [--remote-port PORT] [options]
+my_proxy start <config.json> [options]
+my_proxy authtoken <secret>
+my_proxy server <host:port>
+my_proxy clients list|info|delete|clear
 ```
 
-#### `my_proxy tcp <target> [options]`
+Common options:
 
-Expose a local TCP service on a random public port.
+| Option | Env | Default | Meaning |
+|--------|-----|---------|---------|
+| `--server HOST:PORT` | `MY_PROXY_SERVER` | `127.0.0.1:9000` | Control-channel address |
+| `--token SECRET` | `MY_PROXY_TOKEN` | — (required) | Shared secret |
+| `--tls` | `MY_PROXY_TLS` | off | Use native TLS for the control channel |
+| `--ca-cert PATH` | `MY_PROXY_CA_CERT` | system trust | CA bundle for control TLS |
+| `--lease` | — | off | Lease the requested name (default: handoff) |
+| `--retry-interval SECONDS` | `MY_PROXY_RETRY_INTERVAL` | `5` | Reconnect/registration retry delay |
+| `--grace-time SECONDS` | — | `10` | When retry logs escalate from warnings to errors (never stops retrying) |
+| `--dashboard HOST:PORT` | `MY_PROXY_DASHBOARD` | `127.0.0.1:4040` | Local read-only dashboard |
+| `--no-dashboard` | — | off | Disable the dashboard |
+| `--state-file PATH` | — | `~/.my_proxy/state.json` | Persistent client identity |
+| `--log-level LEVEL` | — | `INFO` | `DEBUG`/`INFO`/`WARNING`/`ERROR` |
+| `-d, --detach` | — | off | Run in the background (via `linkpulse`) |
 
-**Arguments:**
-- `<target>` — local port (e.g., `22`) or `host:port` (e.g., `127.0.0.1:25565`)
+Value precedence: explicit CLI > environment > config file > saved
+`authtoken.json` > defaults.
 
-**Options:**
-- `--remote-port <port>` — request a specific public port
-- `--lease` — lease the requested port (see above)
+### TLS
 
-**Example:**
+TLS is optional; the server must have `CONTROL_TLS=true`. Certificate
+verification is mandatory — there is no skip-verify mode:
+
 ```bash
-my_proxy tcp 22
-my_proxy tcp 25565 --remote-port 20000
-my_proxy tcp 25565 --remote-port 20000 --lease
-my_proxy tcp localhost:5432 --token mysecret
+my_proxy http 8080 --tls
+my_proxy http 8080 --tls --ca-cert /path/to/private-ca.pem
 ```
 
-#### `my_proxy start <config>`
+Without TLS the control connection (including HTTP headers and bodies) is only
+protected by the network path. Use a VPN/WireGuard/SSH tunnel or enable TLS on
+untrusted networks. Public HTTPS covers the browser↔server leg only.
 
-Open multiple tunnels at once from a JSON config file.
+### Saving the token/server
 
-**Arguments:**
-- `<config>` — path to JSON file (see `config.example.json`)
-
-**Example:**
 ```bash
-my_proxy start tunnels.json --token mysecret
+linkpulse authtoken <secret>
+linkpulse server proxy.example.com:9000
 ```
 
-#### Detached Mode (`-d` / `--detach`)
+Both values are stored in `~/.config/linkpulse/authtoken.json` with mode 0600.
 
-Run any port-forwarding command in background mode:
+### Detached mode and management
 
 ```bash
-# Expose HTTP in background
-linkpulse http 8080 -d --token <secret> --server proxy.example.com:9000
-
-# Expose TCP in background
-linkpulse tcp 22 --remote-port 20022 -d --token <secret> --server proxy.example.com:9000
-
-# Expose multi-tunnel in background
+linkpulse http 8080 -d
+linkpulse tcp 22 --remote-port 20022 -d
 linkpulse start config.json -d
-```
 
-When detached mode is requested:
-- Spawns an independent background child process.
-- The parent process returns to the shell immediately.
-- Stdin/stdout/stderr are cleanly detached; child logs are written to `~/.config/linkpulse/logs/<client-id>.log`.
-
-#### Client Management (`clients`)
-
-Manage running and detached LinkPulse client instances:
-
-```bash
-# List all running and managed clients
 linkpulse clients list
-
-# View detailed information for a client (accepts full ID or prefix)
 linkpulse clients info <client-id>
-
-# Gracefully stop a client and remove its local state
 linkpulse clients delete <client-id>
-
-# Remove all idle (stopped) clients
-linkpulse clients clear
-
-# Stop and remove ALL clients (including connected ones)
-linkpulse clients clear -f
+linkpulse clients clear          # idle only
+linkpulse clients clear -f       # stop and remove all
 ```
 
-Aliases supported: `client` for `clients`, `ls` for `list`, `show`/`status` for `info`, `stop`/`rm`/`kill` for `delete`, `prune` for `clear`.
+- The parent returns immediately after validating the invocation; logs go to
+  `~/.config/linkpulse/logs/<managed-id>.log`
+  (or `LINKPULSE_LOGS_DIR`).
+- Per-process managed state is `~/.config/linkpulse/clients/<managed-id>.json`
+  (or `LINKPULSE_STATE_DIR`).
+- `linkpulse clients list` shows both the machine-wide `CLIENT ID` and the
+  per-process `MANAGED ID`; `info`/`delete` accept either value or an
+  unambiguous prefix. A foreground process gets its own managed ID; a detached
+  run with no explicit client id uses the generated ID for both fields, but the
+  state file is still keyed by the managed ID.
+- Written files are created atomically with mode 0600. LinkPulse never changes
+  the permissions of a parent directory you point `--state-file` at.
+- Before signalling a PID, the manager verifies the recorded process start
+  time. On platforms where that cannot be verified it fails closed and may
+  refuse to manage the process.
+- `delete` sends `SIGTERM`, waits up to 3 s, then `SIGKILL`.
+- Aliases: `client`, `ls`, `show`/`status`, `stop`/`rm`/`kill`, `prune`.
 
-### Global options
-
-All commands support:
-
-| Option | Env var | Default | Description |
-|--------|---------|---------|-------------|
-| `-d, --detach` | — | (off) | Run client in background (detached mode) |
-| `--server <host:port>` | `MY_PROXY_SERVER` | `127.0.0.1:9000` | Proxy server address |
-| `--token <secret>` | `MY_PROXY_TOKEN` | (required) | Shared authentication secret |
-| `--lease` | — | (off) | Lease the requested name instead of taking it over |
-| `--retry-interval <seconds>` | `MY_PROXY_RETRY_INTERVAL` | `5` | Delay between reconnect attempts (retries are indefinite) |
-| `--grace-time <seconds>` | — | `10` | After this long without a connection, retries are logged as errors (the client still never gives up) |
-| `--dashboard <host:port>` | `MY_PROXY_DASHBOARD` | `127.0.0.1:4040` | Local status dashboard |
-| `--no-dashboard` | — | (off) | Disable the dashboard |
-| `--state-file <path>` | — | `~/.my_proxy/state.json` (foreground) / `~/.config/linkpulse/clients/<id>.json` (detached) | Custom state file path |
-| `--log-level <LEVEL>` | — | `INFO` | DEBUG, INFO, WARNING, ERROR |
-
-### Examples
-
-```bash
-# Simple HTTP tunnel with default server/secret from env
-export MY_PROXY_SERVER=proxy.example.com:9000
-export MY_PROXY_TOKEN=my-shared-secret
-my_proxy http 8080
-
-# HTTP tunnel with custom subdomain
-my_proxy http 3000 -u api --server proxy.example.com:9000 --token mysecret
-
-# TCP tunnel for SSH with preferred port
-my_proxy tcp 22 --remote-port 20022 --server proxy.example.com:9000 --token mysecret
-
-# Multiple tunnels at once
-my_proxy start config.json --server proxy.example.com:9000 --token mysecret
-
-# Disable dashboard, custom grace period, debug logging
-my_proxy http 5173 --no-dashboard --grace-time 30 --log-level DEBUG
-```
-
----
-
-## Configuration (multi-tunnel)
-
-Create a JSON file to configure multiple tunnels:
+## Multi-tunnel config
 
 ```json
 {
   "server": "proxy.example.com:9000",
-  "token": "shared-secret-or-use-CLI-flag",
+  "token": "shared-secret",
   "mode": "handoff",
   "tunnels": [
-    {
-      "type": "http",
-      "local": "127.0.0.1:3000",
-      "subdomain": "api",
-      "mode": "lease"
-    },
-    {
-      "type": "http",
-      "local": "8080"
-    },
-    {
-      "type": "tcp",
-      "local": "localhost:22",
-      "remote_port": 20022
-    },
-    {
-      "type": "tcp",
-      "local": "5432"
-    }
+    { "type": "http", "local": "127.0.0.1:3000", "subdomain": "api", "mode": "lease" },
+    { "type": "http", "local": "8080" },
+    { "type": "tcp", "local": "localhost:22", "remote_port": 20022 },
+    { "type": "udp", "local": "127.0.0.1:5353", "remote_port": 15353 }
   ]
 }
 ```
 
-**Fields:**
-- `server` (optional) — proxy server address (overridden by `--server` CLI flag)
-- `token` (optional) — shared secret (overridden by `--token` CLI flag)
-- `mode` (optional) — default ownership mode for every tunnel: `"handoff"` (default) or `"lease"`; the `--lease` flag forces `"lease"` for all tunnels
-- `tunnels` (required) — array of tunnel specs:
-  - `type` — `"http"`, `"tcp"` or `"udp"`
-  - `local` — port or `host:port` string
-  - `subdomain` (http only, optional) — requested subdomain
-  - `remote_port` (tcp/udp only, optional) — requested public port
-  - `mode` (optional) — per-tunnel override of the top-level `mode`
+Fields:
 
-Run with:
-```bash
-my_proxy start config.json --token mysecret
-```
+- `server`, `token` (optional defaults; CLI/env wins)
+- `tls` (boolean) and `ca_cert` (path or null) for control-channel TLS; `ca_cert`
+  implies TLS. CLI/env still wins.
+- `mode` (top-level default: `"handoff"` or `"lease"`; `--lease` forces lease)
+- `tunnels`: `type` (`http`/`tcp`/`udp`), `local` (port or `host:port`),
+  optional `subdomain` (HTTP), `remote_port` (TCP/UDP), and per-tunnel `mode`.
 
----
+## Tunnel behaviour
+
+- Each HTTP request connection becomes a stream. Routing is by subdomain; a
+  requested name is granted or the server assigns one. The granted subdomain is
+  stored after `TUNNEL_OPEN_RESPONSE`, so an auto-assigned name survives
+  reconnects.
+- Each TCP connection becomes a stream; bytes are forwarded transparently.
+- UDP uses one stream per public peer; one `UDP_DATAGRAM` frame per complete
+  datagram (empty datagrams allowed, max 65507 bytes).
+- Optional `STREAM_EOF` half-close lets one direction finish while the other
+  keeps flowing, when both peers advertise the `stream_eof` capability. Older
+  servers use abortive `STREAM_CLOSE`; the client falls back automatically.
+- WebSocket upgrades and keep-alive work while the control connection lives,
+  but they are **not resumed** after a reconnect.
+
+### Ownership modes
+
+| Mode | Behaviour |
+|------|-----------|
+| `handoff` (default) | Newest claimant wins; the previous owner is told `Tunnel 'x' was handed off to a new client` and stops serving it (exits if it has nothing left). |
+| `lease` (`--lease`) | The name is reserved for this process/session; other clients are refused, and this client will not take over an in-use name. |
+
+Two processes on one machine share `client_id` but have distinct
+`instance_id`s, so they are competitors, not a reconnect (a lease refuses the
+second one). A lease ends when its session ends; it is not permanent and is not
+extended by HTTP reconnect waiting.
+
+## Reliability
+
+- **Retries forever**: a dropped/unreachable server is retried every
+  `--retry-interval` seconds (default 5). `--grace-time` only changes log level.
+- **Registrations retry too**: an in-use/leased name or exhausted port range is
+  re-requested every interval until it succeeds.
+- **Authentication failure exits** immediately (wrong secret cannot be fixed by
+  retrying).
+- **Local backend down**: per-request failure, not tunnel failure; the tunnel
+  stays registered.
+- **Graceful shutdown** (`SIGINT`/`SIGTERM`): closes tunnels, disconnects, exits.
+- **Inactivity watchdog**: no server frame for roughly 3× heartbeat interval
+  forces a reconnect.
+- **Reconnect does not resume** WebSockets, in-flight requests, or partial
+  uploads. HTTP requests waiting on the server see the current owner once the
+  client is back; the server does not accumulate, spool, or replay a request
+  body at the application level (normal bounded TCP buffering only).
 
 ## Dashboard
 
-A lightweight read-only status page accessible at `http://127.0.0.1:4040` (or configured `--dashboard` address).
+`http://127.0.0.1:4040` (or `--dashboard`) is a read-only local dashboard:
+status, uptime, reconnect count, per-tunnel type/mode/public URL/local target,
+connection and byte counters, first-byte-since-open “latency”, recent logs.
+`/api/stats` returns the same JSON. It has no authentication, so keep it on
+loopback (the default) or a trusted network.
 
-**Shows:**
-- Connection status (connecting, connected, reconnecting, stopped)
-- Process uptime
-- Server address and client ID
-- Reconnect count
-- Per-tunnel info:
-  - Type (http/tcp/udp), status (pending/active/error/handed_off/closed)
-  - Ownership mode (handoff/lease)
-  - Public URL
-  - Local destination (host:port)
-  - Connection count
-  - Bytes in/out
-  - Average latency (if available)
-- Recent log messages
+Counters are accounting figures, not network RTT or throughput guarantees.
 
-**API:**
-- `GET /` — HTML dashboard (auto-refreshes every 2 seconds)
-- `GET /api/stats` — JSON stats payload
+## Security
 
-No authentication, no request inspection, no replay, no packet capture.
-
----
-
-## Tunnel behavior
-
-### HTTP tunnels
-
-- Requests are routed to the local service based on the `Host` header / subdomain
-- The first HTTP request on a connection determines which tunnel owns it; subsequent requests on the same TCP connection stay with that tunnel
-- WebSocket upgrades and keep-alive both work transparently (the proxy doesn't parse individual HTTP requests after routing)
-- Each `STREAM_OPEN` from the server gets its own local TCP connection to the backend
-
-### TCP tunnels
-
-- Each incoming public TCP connection becomes one stream
-- All bytes are forwarded transparently (no parsing, no protocol awareness)
-- Connection stays open until either side closes
-
-### Subdomains
-
-- Specify with `-u myapp` or the config file
-- If not specified, a random subdomain is assigned
-- Subdomains are first-come, first-served across all clients
-- If you reconnect and request the same subdomain, you get it back (if no one else claimed it in the meantime)
-
-### Tunnel ownership modes (handoff vs. lease)
-
-Public names are shared, so a second client asking for the same subdomain/port
-has to be resolved somehow. Each tunnel declares how:
-
-| mode | who wins |
-|------|----------|
-| `handoff` (default) | The newest client wins. The previous owner's tunnel is revoked, it is told `Tunnel 'x' was handed off to a new client`, stops serving that tunnel, and exits if it has no tunnels left. |
-| `lease` (`--lease`) | The name is reserved. Other clients are refused with a clear error, and this client also refuses to take over a name someone else already uses. |
-
-Details worth knowing:
-
-- Modes are per tunnel. In `start` config files, set a top-level `"mode"` and/or a per-tunnel `"mode"`; the `--lease` flag forces lease mode for every tunnel.
-- Reconnecting is never a conflict: the client keeps its tunnel ids and its process identity, so the server hands its own names straight back (even a leased one) after a blip.
-- Two processes on the same machine share the persisted `client_id`, but each one sends a distinct per-process `instance_id`. The server therefore treats them as two competing clients, not as one client reconnecting: in lease mode the second process is refused, in handoff mode it takes the name over.
-- A failed registration is retried every `--retry-interval` seconds while connected, so a name that frees up later is picked up automatically.
-- A lease is held for as long as the owning client's session lives. If the client is unreachable for the server's `heartbeat_timeout_seconds` the server drops the session and the name returns to the pool (no permanent reservations).
-
-### Public ports (TCP)
-
-- Allocated randomly from the server's configured range (e.g., 20000–20100)
-- Can request a preferred port with `--remote-port PORT`
-- Ports are freed when the tunnel closes and reusable by other clients
-- Requested ports follow the same handoff/lease rules as subdomains
-- The server logs/dashboard show the assigned port after `TUNNEL_OPEN_RESPONSE`
-
----
-
-## Reliability & error handling
-
-### Reconnect behavior
-
-If the server becomes unreachable:
-1. Client detects the disconnect (read error or inactivity timeout)
-2. Enters reconnecting mode, logs a warning
-3. Retries every `--retry-interval` seconds (default 5s) **indefinitely** — reconnect messages are logged on the first attempts and then at most once a minute, so a long outage doesn't flood the log
-4. Past `--grace-time` seconds the messages switch from warnings to errors; the client still keeps retrying and only stops on Ctrl+C
-5. All reconnects attempt to re-register the same tunnels (same subdomain/port if possible)
-
-Authentication failure is the only error that exits the process (see below).
-
-### Registration retry
-
-If a tunnel cannot be registered (name in use or leased, no ports free, ...):
-- The client keeps the process (and its other tunnels) running
-- It re-requests that tunnel every `--retry-interval` seconds until it succeeds
-- The failure is logged once, then at most once a minute until it is resolved
-
-### Local service failure
-
-If the local backend is down (connection refused, timeout):
-- The client logs a warning but **doesn't** tear down the tunnel
-- The tunnel remains registered and active
-- Per-request failures are handled normally (connection errors sent back to the public side)
-- The tunnel is still available if the local service comes back up
-
-### Authentication failure
-
-- If the shared secret is wrong: client exits immediately (exit code 1) with a clear error
-- Not retried (retrying won't help if the secret is wrong)
-- Check `--token` and server configuration
-
-### Graceful shutdown
-
-- SIGINT (`Ctrl+C`) or SIGTERM triggers clean shutdown:
-  1. Client sends `TUNNEL_CLOSE` frames for all active tunnels
-  2. Gracefully disconnects from server
-  3. Exits with code 0
-- In-flight connections are closed; no data loss recovery (see protocol spec)
-
-### Inactivity detection
-
-- If no frames received from server for 3× heartbeat interval (default 60s), client reconnects
-- Acts as a safety net for silently dropped connections
-
----
-
-## Performance & limits
-
-- **Flow control**: each stream has a 256 KiB send window; backpressure is applied automatically
-- **Frame chunking**: payloads > 64 KiB are split into multiple frames
-- **Multiplexing**: all streams share one TCP connection; latency of one stream doesn't affect others (independent flow windows)
-- **Memory**: bounded by number of concurrent connections (each stream ≈ a few KB of state)
-
-No request inspection, no traffic replay, no packet capture — the proxy is intentionally transparent to the application protocols.
-
----
-
-## Security & privacy
-
-**What the client does NOT do:**
-- Inspect, log, or replay request/response bodies
-- Capture or cache traffic
-- Store credentials or sensitive data (except the shared secret, which is in memory only)
-
-**What you SHOULD do:**
-- Keep the shared secret **secure** and **unique** (treat it like a password)
-- Rotate it periodically if you suspect compromise
-- Run the client and server over a **private network** (LAN, WireGuard, VPN) if possible
-  - Optionally enable TLS on the control channel (`control.tls: true` in server config)
-  - The current version uses HMAC-SHA256 challenge-response, not full encryption
-- Never commit the secret to version control (use env vars or `.env` files with `.gitignore`)
-
----
+- Keep the shared secret private; rotate it if exposed.
+- Prefer native control TLS (`--tls`, verified) or a private network.
+- The client does not inspect, log, cache or replay request/response bodies.
+- Credentials and state files are written atomically with mode 0600. A custom
+  parent directory for `--state-file` is not chmod-ed by LinkPulse. Do not
+  commit them.
 
 ## Troubleshooting
 
-### `Connection refused` to server
+| Symptom | Check |
+|---------|-------|
+| `Connection refused` | Server running? Port 9000 open? |
+| `Authentication failed: invalid signature` | `--token`/`MY_PROXY_TOKEN` matches `SHARED_SECRET` |
+| TLS handshake failure | `CONTROL_TLS` enabled server-side; CA/hostname valid; `--ca-cert` correct |
+| Local service unreachable | Backend listening on the configured host/port |
+| Tunnel active but requests fail | Dashboard error text; local backend health |
+| Dashboard missing | Not disabled; port 4040 free |
+| Client exits at startup | Missing token, bad config, or auth failure; run `--log-level DEBUG` |
+| HTTP request 503 after a reconnect | Server reconnect wait expired; retry |
 
-- Confirm server is running: `curl http://<server>:9000/` (or check port in config)
-- Confirm firewall allows the control port (default 9000)
-- Check server logs for crashes or binding errors
+## Protocol
 
-### `Authentication failed: invalid signature`
-
-- Wrong `--token` / `MY_PROXY_TOKEN`
-- Confirm token matches server's `shared_secret` in `config.json`
-
-### `Local service <host>:<port> unreachable`
-
-- Confirm your backend is listening on that address/port
-- `netstat -ln | grep :8080` (if testing port 8080)
-- Check firewall (localhost should be allowed)
-
-### Tunnel is active but requests fail
-
-- Check dashboard for per-tunnel status
-- If status is "error", read the error message for details
-- If status is "active" but requests hang, local service may be slow/unresponsive
-
-### Dashboard not accessible
-
-- Confirm it's enabled (no `--no-dashboard` flag)
-- Confirm `--dashboard` address is correct
-- Check if another process is using that port (`lsof -i :4040`)
-
-### Client exits immediately after connecting
-
-- Check log for error messages (usually authentication or server config issue)
-- Run with `--log-level DEBUG` for verbose output
-
-### High latency on tunneled requests
-
-- Latency is measured from first byte sent to local backend to response received
-- If consistently high, your local service may be slow
-- Check dashboard for per-tunnel average latency
-- Confirm no other clients are hogging the connection (multiple streams shouldn't interfere due to independent flow control)
-
----
-
-## Advanced usage
-
-### Debug logging
-
-```bash
-my_proxy http 8080 --log-level DEBUG
-```
-
-Prints frame-by-frame protocol details, useful for troubleshooting protocol issues.
-
-### Custom state file
-
-```bash
-my_proxy http 8080 --state-file /tmp/my_proxy_state.json
-```
-
-By default, client ID is persisted in `~/.my_proxy/state.json`. Useful for testing or running multiple instances.
-
-### Log retry noise escalation
-
-```bash
-my_proxy http 8080 --grace-time 60
-```
-
-After 60 seconds without a connection, retry messages are logged as errors instead of warnings (default 10s). The client keeps retrying either way — it never gives up on the server.
-
-### Different retry cadence
-
-```bash
-my_proxy http 8080 --retry-interval 15
-```
-
-Retry the server (and any tunnel registration that failed) every 15 seconds instead of the default 5.
-
-### Tunnels that keep a name to themselves
-
-```bash
-my_proxy http 8080 -u api --lease
-```
-
-Refuse to share or take over the name `api`. Without `--lease`, the default handoff mode gives the name to whichever client asked for it most recently.
-
-### Custom dashboard port
-
-```bash
-my_proxy http 8080 --dashboard 0.0.0.0:8888
-```
-
-Bind dashboard to all interfaces on port 8888 (security: dashboard has no auth, only bind to trusted networks).
-
----
-
-## Process Management & State Lifecycle
-
-### Local State Storage
-
-- Client state files are saved in `~/.config/linkpulse/clients/<client-id>.json` (or `$LINKPULSE_STATE_DIR`).
-- Detached process logs are saved in `~/.config/linkpulse/logs/<client-id>.log` (or `$LINKPULSE_LOGS_DIR`).
-- Auth token and saved server address are saved in `~/.config/linkpulse/authtoken.json` and `~/.config/linkpulse/server.json`.
-
-### How Detached Processes Are Managed
-
-- **Identification**: Each client is tracked with a unique `client_id` (UUID hex), PID, start timestamp, target mode, and server address.
-- **Liveness & PID Safety**: When checking or stopping a client, LinkPulse verifies whether the process is alive, not in a zombie state, and that the command line matches Python/LinkPulse. This prevents PID reuse from signaling unrelated processes.
-- **Graceful Termination**: `linkpulse clients delete <client-id>` sends `SIGTERM`, allows up to 3 seconds for graceful disconnection and tunnel closure, escalates to `SIGKILL` only if unresponsive, and removes the state file.
-- **After Reboot**: If the machine reboots, state entries whose PIDs no longer exist are cleanly shown as `stopped` and removed when `clients delete` is called.
-- **Multiple Clients**: Any number of independent client instances can run concurrently in detached mode without conflicting state files.
-
----
-
-## Protocol compliance
-
-This client implements the **canonical wire protocol** exactly as defined by `proxy_server.py`:
-
-- Frame layout: 12-byte header (magic, version, type, stream_id, length) + variable payload
-- HELLO authentication: HMAC-SHA256 challenge-response
-- Multiplexing: independent streams over one connection
-- Flow control: per-stream, credit-based, 256 KiB windows
-- Reconnect semantics: client ID persists, tunnels re-registered by tunnel_id
-
-See `PROTOCOL.md` for the full spec (or `protocol.py` in the server project for the reference implementation).
-
----
-
-## License & credits
-
-Built to interoperate exactly with `proxy_server.py` (also in this project). Both implement the same canonical protocol, ensuring client/server compatibility and making alternative implementations straightforward.
-
-Clean, production-quality code with zero external dependencies — suitable for embedded use, CI runners, or self-hosting with minimal footprint.
+See [PROTOCOL.md](PROTOCOL.md). The client embeds a synchronized copy of the
+canonical `protocol.py`; keep them in sync when changing framing or frame
+semantics.

@@ -1,6 +1,34 @@
+# LinkPulse server (tunnel-proxy/) generated files
+
+# Runtime config & secrets (keep .env.example checked in)
 config.json
-*.log
-.venv
-__pycache__
-examples/__pycache__
 .env
+
+# Virtual environments
+.venv/
+venv/
+
+# Bytecode / caches
+__pycache__/
+examples/__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Logs
+*.log
+logs/
+
+# SQLite bookkeeping (created at runtime; real data lives under /data)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+db/
+
+# TLS material (certbot output belongs in mounted volumes, never in the image)
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx

@@ -1,0 +1,10 @@
+# Tooling used to build the standalone client binaries with PyInstaller.
+#
+# These packages are build-time only; the shipped runtime (my_proxy_client)
+# stays dependency-free (see my_proxy_client/requirements.txt).
+#
+# PyInstaller 6.11.1 requires Python >=3.8,<3.14 and publishes wheels for the
+# platforms CI targets (manylinux2014_x86_64, macosx universal2, win_amd64).
+#
+# Install with:  python -m pip install -r build-requirements.txt
+pyinstaller==6.11.1

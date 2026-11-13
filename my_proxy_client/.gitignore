@@ -1,4 +1,25 @@
-.venv
-build
-my_proxy.spec
-dist
+# LinkPulse client (my_proxy_client/) generated files
+
+# PyInstaller output
+build/
+dist/
+*.spec
+
+# Virtual environments
+.venv/
+venv/
+
+# Local toolchain pin
+.python-version
+
+# Client runtime state written while running/testing the client here
+state.json
+authtoken.json
+clients/
+logs/
+*.log
+
+# Bytecode / caches
+__pycache__/
+*.py[cod]
+.pytest_cache/

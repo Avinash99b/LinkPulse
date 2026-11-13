@@ -1,10 +1,55 @@
 {
-  "shared_secret": "REPLACE_WITH_A_LONG_RANDOM_SECRET",
+  "_README": "LEGACY REFERENCE ONLY. proxy_server.py does not read or accept this file. All server configuration comes from environment variables; see .env.example. This JSON only documents the historical config-file shape and how those settings map to environment variables.",
+  "_env_mapping": {
+    "shared_secret": "SHARED_SECRET (required)",
+    "wildcard_domain": "WILDCARD_DOMAIN (required)",
+    "control.host": "CONTROL_HOST",
+    "control.port": "CONTROL_PORT",
+    "control.tls": "CONTROL_TLS",
+    "control.cert_path": "CONTROL_CERT_PATH",
+    "control.key_path": "CONTROL_KEY_PATH",
+    "http.host": "HTTP_HOST",
+    "http.port": "HTTP_PORT",
+    "https.host": "HTTPS_HOST",
+    "https.port": "HTTPS_PORT",
+    "tcp.port_range": "TCP_PORT_MIN / TCP_PORT_MAX",
+    "udp.port_range": "UDP_PORT_MIN / UDP_PORT_MAX",
+    "tls.cert_path": "CERT_PATH (or CONTROL_CERT_PATH for control TLS)",
+    "tls.key_path": "KEY_PATH (or CONTROL_KEY_PATH for control TLS)",
+    "dashboard.host": "DASHBOARD_HOST",
+    "dashboard.port": "DASHBOARD_PORT",
+    "dashboard_password": "DASHBOARD_PASSWORD (required)",
+    "jwt_secret": "JWT_SECRET (required)",
+    "http_only": "HTTP_ONLY",
+    "external_ssl": "EXTERNAL_SSL",
+    "allow_http_fallback": "ALLOW_HTTP_FALLBACK",
+    "heartbeat_interval_seconds": "HEARTBEAT_INTERVAL",
+    "heartbeat_timeout_seconds": "HEARTBEAT_TIMEOUT",
+    "stale_grace_seconds": "STALE_GRACE_SECONDS",
+    "storage.db_path": "DB_PATH",
+    "logging.level": "LOG_LEVEL",
+    "logging.file": "LOG_FILE",
+    "http_reconnect_grace_seconds": "HTTP_RECONNECT_GRACE_SECONDS",
+    "http_reconnect_max_waiters_per_name": "HTTP_RECONNECT_MAX_WAITERS_PER_NAME",
+    "http_reconnect_max_waiters": "HTTP_RECONNECT_MAX_WAITERS",
+    "max_clients": "MAX_CLIENTS",
+    "max_tunnels_per_client": "MAX_TUNNELS_PER_CLIENT",
+    "max_streams_per_client": "MAX_STREAMS_PER_CLIENT",
+    "max_pending_http_connections": "MAX_PENDING_HTTP_CONNECTIONS",
+    "udp_max_peers_per_tunnel": "UDP_MAX_PEERS_PER_TUNNEL",
+    "udp_idle_timeout": "UDP_IDLE_TIMEOUT",
+    "stream_write_timeout": "STREAM_WRITE_TIMEOUT"
+  },
+
+  "shared_secret": "CHANGE_ME",
+  "wildcard_domain": "tunnel.example.com",
 
   "control": {
     "host": "0.0.0.0",
     "port": 9000,
-    "tls": false
+    "tls": false,
+    "cert_path": null,
+    "key_path": null
   },
 
   "http": {
@@ -17,36 +62,50 @@
     "port": 443
   },
 
-  "wildcard_domain": "linkpulse.avinash9.in",
-
   "tcp": {
-    "port_range": [10000, 65535],
+    "port_range": [20000, 20100],
     "bind_host": "0.0.0.0"
   },
 
   "udp": {
-    "port_range": [10000, 65535],
+    "port_range": [20000, 20100],
     "bind_host": "0.0.0.0"
   },
 
   "tls": {
-    "cert_path": "/etc/letsencrypt/live/linkpulse.avinash9.in/fullchain.pem",
-    "key_path": "/etc/letsencrypt/live/linkpulse.avinash9.in/privkey.pem"
+    "cert_path": "/etc/letsencrypt/live/tunnel.example.com/fullchain.pem",
+    "key_path": "/etc/letsencrypt/live/tunnel.example.com/privkey.pem"
   },
 
   "dashboard": {
-    "host": "0.0.0.0",
+    "host": "127.0.0.1",
     "port": 8081
   },
+  "dashboard_password": "CHANGE_ME",
+  "jwt_secret": "CHANGE_ME",
 
   "http_only": false,
+  "external_ssl": false,
+  "allow_http_fallback": false,
 
   "heartbeat_interval_seconds": 20,
   "heartbeat_timeout_seconds": 60,
   "stale_grace_seconds": 300,
 
+  "http_reconnect_grace_seconds": 8,
+  "http_reconnect_max_waiters_per_name": 16,
+  "http_reconnect_max_waiters": 128,
+
+  "max_clients": 128,
+  "max_tunnels_per_client": 32,
+  "max_streams_per_client": 256,
+  "max_pending_http_connections": 256,
+  "udp_max_peers_per_tunnel": 128,
+  "udp_idle_timeout": 60,
+  "stream_write_timeout": 30,
+
   "storage": {
-    "db_path": "/var/lib/tunnel-proxy/tunnel_proxy.db"
+    "db_path": "/data/tunnel_proxy.db"
   },
 
   "logging": {

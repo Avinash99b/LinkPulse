@@ -1,263 +1,118 @@
-# Self-Hosted Tunneling Proxy — Project Index
+# LinkPulse Server — Project Index
 
-**1,605 lines of production-quality Python** across 5 core modules + 2 examples. **Tested end-to-end**: authentication, HTTP routing, TCP forwarding, multiplexing, flow control, and dashboard all verified to work.
+The server is one asyncio process (`proxy_server.py`) that binds every public
+port itself: HTTP/HTTPS for tunnels and the dashboard, a raw control channel,
+and one listener per TCP/UDP tunnel. SQLite is bookkeeping only. No nginx,
+HAProxy or supervisord is involved.
+
+Configuration is environment-only. Python 3.11 is recommended (Docker image);
+local tests run on Python 3.12.13.
+
+## File map
+
+| File | Purpose |
+|------|---------|
+| `proxy_server.py` | Entry point: auth, routing, HTTP/TCP/UDP listeners, flow control, shutdown, limits |
+| `protocol.py` | Canonical wire protocol: frames, HELLO, capabilities, UDP, constants |
+| `storage.py` | SQLite client/tunnel bookkeeping (never used for live routing) |
+| `dashboard.py` | Password/JWT dashboard HTML and `/api/stats` |
+| `entrypoint.sh` | Root init: volumes, certbot, cron renewal, then unprivileged server |
+| `startup.sh` | Optional deploy helper: detect state, build, health-wait, rollback |
+| `Dockerfile` | Single container, direct server execution |
+| `.env.example` | Complete environment template |
+| `config.example.json` | Legacy shape reference only — the server does not parse it |
+| `requirements.txt` | Optional `psutil` (dashboard CPU/RAM) |
+| `examples/reference_client.py` | Illustrative protocol client |
+| `README.md` | Server guide (setup, ports, env, TLS, reconnect waiting) |
+| `DEPLOYMENT.md` | Docker/VPS deployment, certificates, rollback, platform limits |
 
 ## Quick orientation
 
-| File | Lines | Purpose |
-|------|-------|---------|
-| **proxy_server.py** | 894 | Main server (entry point). Handles control channel, HTTP routing, TCP listeners, multiplexing, flow control, and lifecycle. Configuration via environment variables. |
-| **protocol.py** | 215 | Canonical binary framed wire protocol. Single source of truth; clients must implement exactly. Frame layout, frame types, HMAC auth, flow control constants. |
-| **dashboard.py** | 251 | Read-only status page (HTML + JSON API). Shows connected clients, active tunnels, bytes/request counts, uptime, logs, CPU/RAM. |
-| **storage.py** | 117 | SQLite persistence. Bookkeeping only (not used for live routing decisions). Survives restarts for observability. |
-| **haproxy.cfg** | — | HTTP front door on `:80`. Routes HTTP traffic (tunnels + dashboard) to nginx http. Control channel is on separate port 9000. |
-| **nginx.conf** | — | Nginx reverse proxy: HTTP server on `:8088` (dashboard + tunnels) + `stream` module on `:9000` (control channel TCP proxy). |
-| **supervisord.conf** | — | Runs `proxy_server.py`, nginx, and haproxy together in a single container. |
-| **config.example.json** | — | Config template (legacy, kept for reference). |
-| **requirements.txt** | — | Optional `psutil` for dashboard CPU/RAM. |
-| **examples/reference_client.py** | — | Minimal working client. Demonstrates protocol implementation. |
-| **Dockerfile** | — | Multi-stage build. Single container: tunnel-proxy + nginx + haproxy via supervisord. Exposes ports 80 and 9000. |
-| **entrypoint.sh** | — | Root entrypoint: chowns mounted volumes, starts supervisord. |
-| **README.md** | — | Full architecture, protocol spec, config reference, setup & run instructions. |
-| **DEPLOYMENT.md** | — | Detailed deployment guide for Docker and Render. |
+```bash
+cp .env.example .env      # SHARED_SECRET, WILDCARD_DOMAIN, DASHBOARD_PASSWORD, JWT_SECRET
+docker build -t tunnel-proxy .
+docker run -d --name tunnel-proxy --restart unless-stopped \
+  --network host --cap-add NET_BIND_SERVICE --env-file .env \
+  -v /data:/data -v /var/log/tunnel-proxy:/var/log/tunnel-proxy tunnel-proxy
+curl -i http://localhost/health
+```
 
-**Total: 1,605 lines, ~120 KB.**
+Public ports:
+
+| Port | Purpose |
+|------|---------|
+| 80 | `/health`, apex→HTTPS redirect, HTTP tunnels |
+| 443 | HTTPS tunnels + dashboard |
+| 9000 | Control channel |
+| 20000–20100 TCP/UDP | One port per raw tunnel (configurable range) |
 
 ## What it does
 
-```
-Internet traffic (HTTP)  and  client control connections
-                    │
-                    ▼
-    haproxy  :80  ────────────────────────── HTTP tunnels + dashboard
-       │  (HTTP only, no protocol sniffing)
-       └─ → nginx http :8088
-              ├─ /dashboard/, /api/ → dashboard
-              └─ else               → proxy_server.py
-                                                          │ (one persistent, authenticated,
-                                                          │  multiplexed connection)
-                                                          ▼
-    nginx stream :9000 ──────────────── Control channel (client)
-       │  (raw TCP, "TN" magic)
-       └─ → proxy_server.py :9001 (control channel)
-                                                      │ (one persistent, authenticated,
-                                                      │  multiplexed connection)
-                                                      ▼
-                                                  Client (your laptop, server, CI runner, ...)
-                                                  (runs one or more tunnels: HTTP or TCP)
-```
-
-- **Authentication**: HMAC-SHA256 challenge-response (no shared secret sent over wire).
-- **HTTP routing**: Host header–based. `app.tunnel.example.com` → tunnels traffic to the registered client.
-- **TCP routing**: Random port allocation (or preferred port, if free). Concurrent TCP listeners, one per tunnel.
-- **Multiplexing**: One persistent connection carries many logical streams. Each stream = one HTTP request-connection or one TCP connection.
-- **Flow control**: Per-stream, credit-based (HTTP/2 style). Backpressure-aware. Prevents one slow tunnel from stalling others.
-- **Two public ports**: Port 80 for HTTP, port 9000 for raw TCP control. Works with cloud platforms that terminate TLS at the edge.
-- **SSL termination**: Handled externally by Render/Cloudflare/etc. Proxy server runs HTTP only.
-- **Dashboard**: Real-time client/tunnel status, bytes transferred, connection counts, uptime, logs, optional CPU/RAM.
-- **SQLite**: Lightweight persistence for bookkeeping & observability. Routing decisions live in memory; DB is purely informational.
-- **No external services**: Just the proxy binary + SQLite + local files.
-- **Docker ready**: Single container (supervisord runs tunnel-proxy + nginx + haproxy), multi-stage build, resource limits optimized for 512MB RAM / 0.5 vCPU.
-- **Environment-based config**: No config files needed, all via environment variables.
-- **Auto directory creation**: DB and log directories created automatically.
-
-## Getting started
-
-### 1. Install
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-### 2. Configure (Environment Variables)
-```bash
-cp .env.example .env
-# Edit .env:
-#   - SHARED_SECRET: a long random string (openssl rand -hex 32)
-#   - WILDCARD_DOMAIN: your domain (DNS *.domain.com → this server)
-```
-
-### 3. Run (Docker)
-```bash
-docker build -t tunnel-proxy .
-docker run -d -p 80:80 -p 9000:9000 --env-file .env -v tunnel-proxy-data:/data tunnel-proxy
-```
-
-### 4. Verify
-```bash
-# Health:
-curl http://localhost:80/health
-
-# Dashboard:
-open http://localhost:80/dashboard/
-
-# HTTP routing (once a client registers "app" subdomain):
-curl -H "Host: app.tunnel.example.com" http://localhost:80/
-```
+- **Authentication**: HMAC-SHA256 HELLO over `client_id || timestamp || nonce`
+  with 60-second skew and replay-tracked nonces. Authentication is one-way; no
+  server challenge is involved.
+- **HTTP routing**: by `Host` header / subdomain over the shared 80/443
+  listeners.
+- **TCP/UDP routing**: a dedicated public port per tunnel, allocated from the
+  configured range.
+- **Multiplexing**: one control connection per client process; independent
+  streams with per-stream credit (256 KiB initial window, 64 KiB frames).
+  Streams share one TCP connection, so TCP head-of-line effects are inherent.
+- **HTTP reconnect waiting**: briefly parks the request head and socket for a
+  known tunnel whose client just dropped (default 8 s; 16 per name, 128 total).
+  Unknown → 404; expired/full → 503 + `Retry-After: 2`; no application-level
+  body accumulation/spooling/replay (normal bounded TCP buffering only);
+  waiters follow the current owner.
+- **Ownership modes**: `handoff` (newest wins) or `lease` (session-scoped
+  reservation).
+- **Optional native control TLS**: `CONTROL_TLS=true`; clients verify the
+  certificate (system trust or `--ca-cert`).
+- **Dashboard**: password login, in-memory HS256 JWT sessions (up to 31 days;
+  restart/logout/password rotation invalidates), login throttle, lockdown on
+  logout; served on the apex HTTPS listener (or a standalone loopback listener
+  in HTTP-only mode).
+- **SQLite**: bookkeeping and observability only; routing is in memory and is
+  rebuilt on reconnect.
+- **Limits**: `MAX_CLIENTS`, `MAX_TUNNELS_PER_CLIENT`, `MAX_STREAMS_PER_CLIENT`,
+  `MAX_PENDING_HTTP_CONNECTIONS`, UDP peer caps/idle timeout, stream write
+  timeout.
 
 ## Protocol at a glance
 
-### Frame format (12-byte header + variable payload)
 ```
-[Magic:2] [Ver:1] [Type:1] [StreamID:4] [Length:4] [Payload:...]
-  "TN"     1      enum      0 = control  bytes
+[Magic:2 "TN"] [Ver:1] [Type:1] [StreamID:4] [Length:4] [Payload]
 ```
 
-### Authentication (binary HELLO payload, 72 bytes)
-```
-[ClientID:16] [Timestamp:8] [Nonce:16] [HMAC-SHA256:32]
-```
-Resists replay and proves knowledge of shared secret without sending it.
+- Stream 0: control (HELLO, PING, tunnel registration, errors)
+- Stream 1+: one HTTP connection / TCP connection / UDP peer
+- `STREAM_EOF` (0x0F): optional negotiated half-close (`stream_eof` capability
+  advertised in `HELLO_OK`, echoed in `TUNNEL_OPEN_REQUEST`); without the
+  capability, peers use abortive `STREAM_CLOSE`.
+- `UDP_DATAGRAM` (0x0E): one complete datagram (including empty), max 65507
+  bytes, no TCP flow-control credit.
 
-### Multiplexing (Stream ID)
-- Stream 0: control (HELLO, PING, tunnel open/close, errors)
-- Stream 1+: individual tunneled connections (each stream = 1 HTTP request or 1 TCP conn)
-
-### Flow control
-- Per-stream, credit-based: both sides start with 256 KiB send window
-- Sender consumes credit before sending `STREAM_DATA`
-- Receiver sends back `STREAM_WINDOW_UPDATE` after flushing (batched every 128 KiB)
-- Simple backpressure: slow consumer naturally throttles sender
-
-## Files in detail
-
-### Core modules
-
-**protocol.py** — Wire protocol (the canonical spec)
-- Frame header parsing & encoding
-- FrameType enum (13 frame types)
-- HMAC-SHA256 authentication (binary HELLO payload format)
-- Flow control constants (INITIAL_WINDOW=256KiB, MAX_FRAME_PAYLOAD=64KiB, etc.)
-- Meant to be imported by both server and any client implementation
-
-**proxy_server.py** — Main server
-- `ServerContext`: holds shared state (clients, by_subdomain, by_port, SQLite storage, recent logs)
-- `ClientSession`: per-client session (reader/writer, tunnels dict, streams dict, flow windows)
-- `StreamState`: per-multiplexed-stream state (stream_id, tunnel_id, public socket, flow windows, byte counters)
-- Control connection handler: HELLO auth, heartbeat, tunnel lifecycle
-- HTTP public listener: parses Host header, routes to correct tunnel
-- TCP public listener: one per tunnel, randomly allocated port
-- Stream data plumbing: bidirectional pump between public sockets and multiplexed connection with flow control
-- Flow control: per-stream send window, window updates, backpressure
-- Graceful shutdown: closes all tunnels, kills all streams, closes listeners
-
-**dashboard.py** — Status page
-- Raw asyncio streams (no web framework) for minimal deps
-- GET / → HTML (auto-refreshes, polls JSON every 3s)
-- GET /api/stats → JSON: clients, tunnels, bytes, connections, uptime, logs, CPU/RAM (if psutil installed)
-- `build_stats()`: gathers live state from ServerContext
-- Formatted for readability & quick scanning (cards, tables, charts via CSS grid)
-
-**storage.py** — SQLite bookkeeping
-- `Storage` class: thread-safe (threading.Lock) access to SQLite
-- Schema: `clients` table (client_id, first_seen, last_seen), `tunnels` table (tunnel_id, client_id, type, subdomain/remote_port, dates)
-- Methods: upsert_client, touch_client, save_tunnel, delete_tunnel, delete_tunnels_for_client, purge_stale
-- Intentionally NOT used for live routing (that's in-memory, rebuilt on reconnect) — DB is pure observability
-
-### Configuration & deployment
-
-**config.example.json** — Config template (legacy)
-- shared_secret, control port, HTTP port
-- wildcard_domain
-- TCP port range, dashboard port
-- Heartbeat/timeout intervals, stale tunnel grace period
-- SQLite path, logging (level, file)
-
-**requirements.txt** — Dependencies
-- `psutil` (optional): for CPU/RAM on dashboard
-
-### Docker files
-
-**haproxy.cfg** — HTTP front door on `:80`
-- Routes HTTP traffic (tunnels + dashboard) to nginx http
-- Control channel is handled on separate port 9000 via nginx stream
-
-**nginx.conf** — Nginx reverse proxy + stream
-- `http` block listens on `:8088`: `/dashboard/` and `/api/` → dashboard `:8081`, everything else → tunnel-proxy `:8080`
-- `stream` block listens on `:9000` and TCP-proxies the control channel to the internal control port `:9001`
-- Loads `ngx_stream_module.so` (via `libnginx-mod-stream`) for the stream/TCP proxy
-
-**supervisord.conf** — Process manager
-- Runs `proxy_server.py`, `nginx`, and `haproxy` in a single container
-- All three run as the unprivileged `tunnelproxy` user
-- Restart-on-failure for each process
-
-**Dockerfile** — Multi-stage build for the whole container
-- Builder stage: compiles dependencies
-- Runtime stage: minimal python:3.11-slim + nginx + haproxy + supervisor
-- Installs `libnginx-mod-stream` (nginx stream module is dynamic)
-- Non-root user, health check, resource optimization
-- `EXPOSE 80 9000`
-
-**entrypoint.sh** — Root entrypoint
-- Chowns mounted volumes (handles Render persistent disks)
-- Starts supervisord
-
-**DEPLOYMENT.md** — Detailed deployment guide
-- Single-container Docker quick start
-- Render deployment (ports 80 + 9000)
-- Client usage
-- Monitoring
-- Troubleshooting
-
-### Examples & documentation
-
-**examples/reference_client.py** — Minimal working client
-- Demonstrates correct protocol implementation
-- Connects, authenticates (HELLO), opens HTTP and/or TCP tunnels
-- Forwards traffic to local backends (e.g., a web app or SSH server)
-- Persists client_id locally (`.client_id.json`) for stable identity across reconnects
-- Handles STREAM_OPEN, STREAM_DATA, STREAM_CLOSE, flow control, window updates
-- ~220 lines; intentionally simple to highlight the protocol, not production-hardened
-
-**README.md** — Comprehensive documentation
-- Architecture overview with ASCII diagram
-- Protocol spec (frames, auth, multiplexing, flow control)
-- Deployment guide (Docker, Render)
-- Configuration reference (all fields explained)
-- Client usage examples
-- Design trade-offs & intentional omissions
-
-**INDEX.md** (this file) — Quick orientation & stats
-
-## Key design principles
-
-1. **Simple binary protocol** — No JSON for hot-path data, just 12-byte headers + carefully chosen payloads.
-2. **No external services** — SQLite + local files only. Scales from laptop to modest production.
-3. **Per-stream flow control** — Backpressure-aware, prevents one slow tunnel from starving others.
-4. **Replay-protected auth** — HMAC-SHA256 + timestamp checks + nonce tracking; no secret sent over wire.
-5. **Stable reconnect behavior** — Clients persist their ID, routes aren't "reserved" ahead of time (just first-come first-served), allows graceful recovery without complex state sync.
-6. **SSL termination externalized** — Handled by nginx/Render/Cloudflare, keeps proxy server simple and focused.
-7. **Two public ports** — Port 80 for HTTP, port 9000 for raw TCP control. Works with cloud platforms that terminate TLS at the edge.
-8. **Observability, not governance** — SQLite bookkeeping, dashboard, and logs are for transparency; routing is purely in-memory and rebuilt on reconnect.
-9. **Minimal dependencies** — Asyncio (stdlib), ssl (stdlib), sqlite3 (stdlib), psutil (optional). Main server has zero required external packages.
-10. **Environment-based config** — No config files, all via environment variables for container-friendly deployment.
-11. **Auto directory creation** — DB and log directories created automatically.
+See `../my_proxy_client/PROTOCOL.md` for the full specification.
 
 ## Testing
 
-A complete smoke test is included but not in the deliverable (used during development):
-- Verifies auth handshake (HELLO → HELLO_OK)
-- Tests HTTP host-based routing via curl (request reaches client, response relayed back)
-- Tests raw TCP routing (bidirectional bytes)
-- Validates dashboard JSON API
-- Confirms flow control & multiplexing work correctly
+```bash
+pytest ../tests -q
+```
 
-All tests passed before finalizing the deliverable.
+Covers tunnel modes and reconnect behaviour, dashboard authentication,
+detached-client process management, and an end-to-end client path against a
+mock server. Platform coverage is not claimed beyond what is actually run.
 
 ## Production checklist
 
-- [ ] Set `SHARED_SECRET` to a long random value (`openssl rand -hex 32`)
-- [ ] Set `WILDCARD_DOMAIN` to your actual domain
-- [ ] Ensure DNS has `*.yourdomain` and `yourdomain` pointing to the server
-- [ ] Expose ports 80 (HTTP) and 9000 (control); verify both work
-- [ ] Configure HTTPS termination in front (Render managed, Cloudflare, or your own reverse proxy)
-- [ ] Bind dashboard to `127.0.0.1` or put it behind reverse-proxy auth
-- [ ] Set `tcp.port_range` to your preferred allocation pool
-- [ ] Set resource limits appropriate for your infrastructure
-- [ ] Monitor `tunnel_proxy.log` and the `/api/stats` dashboard
-
----
-
-**Total project: ~1,600 lines of code + ~1,000 lines of docs. Ready for self-hosting.**
+- [ ] `SHARED_SECRET` and `WILDCARD_DOMAIN` set (placeholders rejected)
+- [ ] `DASHBOARD_PASSWORD` and `JWT_SECRET` set
+- [ ] DNS: apex and `*.<domain>` resolve to the server
+- [ ] Ports 80, 443, 9000 and the chosen tunnel range open in the host and
+      cloud firewall
+- [ ] Docker port mapping 1:1 for every tunnel port, or host networking
+- [ ] Certificate provisioned (or an explicit `HTTP_ONLY`/`EXTERNAL_SSL`/
+      `ALLOW_HTTP_FALLBACK` decision)
+- [ ] `/data` (database + certificates) and `/var/log/tunnel-proxy` mounted
+- [ ] Restrict dashboard exposure; use HTTPS off localhost
+- [ ] Monitor health, the authenticated dashboard and logs

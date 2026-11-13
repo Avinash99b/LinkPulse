@@ -1,242 +1,145 @@
-# Quick Start Guide
+# Quick Start — LinkPulse Client
 
 ## Prerequisites
 
-- Python 3.9+
-- A running `proxy_server.py` instance (see the server project)
-- The shared secret from the server config
+- Python 3.11 recommended (Docker image). Local runs/tests use Python 3.12.13;
+  3.9–3.10 are not verified.
+- A running LinkPulse server with `SHARED_SECRET` and `WILDCARD_DOMAIN` set.
+- The shared secret and the server's control address (`host:9000`).
 
-## Installation
-
-No installation needed. Just run:
-
-```bash
-python3 my_proxy http 8080 --token <shared-secret>
-```
-
-Or make it executable:
+## Expose a local HTTP service
 
 ```bash
-chmod +x my_proxy
-./my_proxy http 8080 --token <shared-secret>
+python3 my_proxy.py http 8080 \
+  --token 'replace-with-shared-secret' --server proxy.example.com:9000
 ```
 
-## Basic usage
-
-### 1. Expose a local HTTP service
+Or with environment variables:
 
 ```bash
-# Expose localhost:8080
-my_proxy http 8080 --token mysecret
+export MY_PROXY_SERVER=proxy.example.com:9000
+export MY_PROXY_TOKEN='replace-with-shared-secret'
+export MY_PROXY_DASHBOARD=127.0.0.1:4040
 
-# Expose on a different host
-my_proxy http localhost:5173 --token mysecret
-
-# Request a specific subdomain
-my_proxy http 3000 -u myapp --token mysecret
+python3 my_proxy.py http 8080
 ```
 
-The client will print the public URL:
+Output includes the public URL:
+
 ```
-HTTP tunnel ready: https://myapp.forwarding.example.com -> localhost:3000
+HTTP tunnel ready: https://a1b2c3d4.example.com -> 127.0.0.1:8080
 ```
 
-Test it:
-```bash
-curl https://myapp.forwarding.example.com/
-```
-
-### 2. Expose a local TCP service
+Request a name and keep it for the session:
 
 ```bash
-# Expose localhost:22 (SSH)
-my_proxy tcp 22 --token mysecret
-
-# Request a specific port
-my_proxy tcp 25565 --remote-port 20000 --token mysecret
+python3 my_proxy.py http 3000 -u myapp --lease
 ```
 
-The client will print the public address:
-```
-TCP tunnel ready: tcp://forwarding.example.com:20000 -> localhost:25565
-```
+Without `--lease`, a newer client claiming the same name takes it over
+(handoff mode).
 
-Test it:
+## Expose TCP or UDP
+
 ```bash
-ssh -p 20000 user@forwarding.example.com
+python3 my_proxy.py tcp 22 --remote-port 20022
+python3 my_proxy.py udp 5353
 ```
 
-### 3. Expose multiple services at once
+TCP/UDP tunnels need the server to have those public ports published (the
+server's default pool is 20000–20100).
 
-Create a config file `tunnels.json`:
+## Multiple tunnels
+
+`tunnels.json`:
 
 ```json
 {
+  "server": "proxy.example.com:9000",
+  "token": "shared-secret",
+  "mode": "handoff",
   "tunnels": [
-    {"type": "http", "local": "3000", "subdomain": "api"},
-    {"type": "http", "local": "8080", "subdomain": "frontend"},
-    {"type": "tcp", "local": "22", "remote_port": 20022}
+    { "type": "http", "local": "3000", "subdomain": "api", "mode": "lease" },
+    { "type": "http", "local": "8080" },
+    { "type": "tcp", "local": "22", "remote_port": 20022 },
+    { "type": "udp", "local": "5353", "remote_port": 15353 }
   ]
 }
 ```
 
-Run:
 ```bash
-my_proxy start tunnels.json --token mysecret
+python3 my_proxy.py start tunnels.json --token shared-secret
 ```
 
-## Environment variables
+## Control-channel TLS
 
-Instead of repeating `--token` and `--server`, set environment variables:
+If the server has `CONTROL_TLS=true`:
 
 ```bash
-export MY_PROXY_SERVER=proxy.example.com:9000
-export MY_PROXY_TOKEN=shared-secret
-export MY_PROXY_DASHBOARD=127.0.0.1:4040
-
-# Now just:
-my_proxy http 8080
-my_proxy tcp 22
+python3 my_proxy.py http 8080 --tls
+python3 my_proxy.py http 8080 --tls --ca-cert ./private-ca.pem
 ```
+
+Certificate verification is mandatory. Without TLS, run over a VPN or other
+private path; public HTTPS does not protect the client↔server leg.
+
+## Run in the background
+
+```bash
+linkpulse http 8080 -d --token 'replace-with-shared-secret' --server proxy.example.com:9000
+linkpulse clients list
+linkpulse clients info <client-id>
+linkpulse clients delete <client-id>
+```
+
+Logs: `~/.config/linkpulse/logs/<managed-id>.log` (`clients list` shows both
+the machine `CLIENT ID` and the per-process `MANAGED ID`).
 
 ## Dashboard
 
-By default, a dashboard is available at `http://127.0.0.1:4040`:
+Open `http://127.0.0.1:4040` for connection status, tunnels, counters and
+recent logs. Disable with `--no-dashboard`. The dashboard has no
+authentication.
 
-- **Status indicators**: connection state, uptime, reconnect count
-- **Per-tunnel view**: type, public URL, local destination, bytes transferred, latency
-- **Logs**: recent messages from the client
-- **Auto-refresh**: updates every 2 seconds
+## Test locally against a server
 
-Disable with `--no-dashboard` if you don't want it.
+Terminal 1 — server (HTTP-only, non-privileged ports):
 
-## Testing locally
-
-To test the client against `proxy_server.py` on the same machine:
-
-**Terminal 1: Start the server**
 ```bash
-cd /path/to/proxy_server
-python3 proxy_server.py config.json
+cd tunnel-proxy
+SHARED_SECRET=test-secret WILDCARD_DOMAIN=forwarding.local \
+DASHBOARD_PASSWORD=test-password JWT_SECRET=test-jwt-secret-0123456789abcdef \
+HTTP_ONLY=true HTTP_PORT=8080 HTTPS_PORT=8443 DASHBOARD_PORT=8081 \
+DB_PATH=/tmp/lp.db LOG_FILE=/tmp/lp.log \
+python3 proxy_server.py
 ```
 
-**Terminal 2: Start a local backend**
+Terminal 2 — a local backend:
+
 ```bash
-# A simple HTTP echo server on port 8001
-python3 -c "
-import asyncio
-async def echo(reader, writer):
-    req = await reader.readline()
-    writer.write(b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nHello!')
-    await writer.drain()
-    writer.close()
-async def main():
-    server = await asyncio.start_server(echo, '127.0.0.1', 8001)
-    async with server:
-        await server.serve_forever()
-asyncio.run(main())
-"
+python3 -m http.server 8001
 ```
 
-**Terminal 3: Start the client**
+Terminal 3 — the client:
+
 ```bash
-python3 my_proxy http 8001 -u test --token test-secret-please-change
+python3 my_proxy.py http 8001 -u test \
+  --token test-secret --server 127.0.0.1:9000
 ```
 
-**Terminal 4: Test it**
+Terminal 4 — through the tunnel:
+
 ```bash
-# Note: using self-signed cert, so -k flag
-curl -sk https://test.forwarding.local:18443/
-# Should print: Hello!
+curl -H 'Host: test.forwarding.local' http://127.0.0.1:8080/
 ```
 
 ## Troubleshooting
 
-### `Connection refused` to server
-
-```bash
-$ my_proxy http 8080 --token secret
-ERROR Authentication failed: invalid signature
-```
-
-Solution: Check that `--server` points to the right address and port, and that `--token` matches the server's `shared_secret`.
-
-### `Local service unreachable`
-
-```
-WARNING Local service localhost:8080 unreachable for tunnel ...: Connect call failed
-```
-
-Solution: Make sure your backend is actually listening on the configured port.
-
-```bash
-netstat -ln | grep 8080
-# or
-lsof -i :8080
-```
-
-### Dashboard not showing up
-
-The dashboard runs by default on `127.0.0.1:4040`. If it's not accessible:
-- Check the port is free: `lsof -i :4040`
-- Bind it elsewhere: `my_proxy http 8080 --dashboard 0.0.0.0:8888`
-- Disable it if not needed: `my_proxy http 8080 --no-dashboard`
-
-### Enable debug logging
-
-```bash
-my_proxy http 8080 --token secret --log-level DEBUG
-```
-
-This will print detailed frame-by-frame protocol messages, useful for diagnosing protocol issues.
-
-## Common scenarios
-
-### Expose a web app running on localhost:3000
-
-```bash
-my_proxy http localhost:3000 -u frontend --token mysecret
-# Public URL: https://frontend.forwarding.example.com
-```
-
-### Expose SSH for remote access
-
-```bash
-my_proxy tcp 22 --remote-port 20022 --token mysecret
-# Access: ssh -p 20022 user@forwarding.example.com
-```
-
-### Expose multiple services with stable subdomains
-
-```bash
-# Create config.json with specific subdomains
-cat > config.json <<EOF
-{
-  "tunnels": [
-    {"type": "http", "local": "3000", "subdomain": "api"},
-    {"type": "http", "local": "8080", "subdomain": "web"}
-  ]
-}
-EOF
-
-# Run it
-my_proxy start config.json --token mysecret
-```
-
-Subdomains are persistent across restarts — as long as no other client has claimed them.
-
-### Run the client in the background
-
-```bash
-nohup my_proxy http 8080 --token mysecret > /tmp/my_proxy.log 2>&1 &
-# Check status:
-tail -f /tmp/my_proxy.log
-```
-
-Or use systemd (see deployment docs if available).
-
-## Next steps
-
-- Read [README.md](README.md) for full CLI reference and configuration options
-- Read [PROTOCOL.md](PROTOCOL.md) to understand the wire protocol (useful for debugging or building alternative clients/servers)
-- Check [config.example.json](config.example.json) for multi-tunnel setup examples
+- `Connection refused`: wrong server/port (control port is 9000 by default) or
+  the server is down/firewalled.
+- `Authentication failed: invalid signature`: token does not match
+  `SHARED_SECRET`. The client exits rather than retrying a wrong secret.
+- TLS errors: server control TLS not enabled, or the CA/hostname cannot be
+  verified; pass the right `--ca-cert`.
+- Dashboard not reachable: `--no-dashboard` set, or port 4040 is occupied.
+- More detail: `--log-level DEBUG`, or see [README.md](README.md).

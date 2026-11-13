@@ -1,459 +1,297 @@
-# Self-Hosted Tunneling Proxy
+# LinkPulse Server (`tunnel-proxy`)
 
-A minimal, self-hosted alternative to ngrok. One `proxy_server.py`, no external services (SQLite + local files only), automatic wildcard DNS routing, HTTP host-based routing, and randomly allocated TCP ports for raw TCP tunnels.
+The server side of LinkPulse: it accepts authenticated, multiplexed client
+connections and routes public HTTP, TCP and UDP traffic back through them.
+It runs as one asyncio process and binds every public port itself.
 
 ```
-                                          ┌────────────────────────────────────┐
-    HTTP(S) app.tunnel.example.com        │         Single container           │
-    ───────────────────────────────────▶  │  :80   HTTP (redirect + health)    │
-                                          │  :443  HTTPS (tunnels + dashboard) │
-    Control channel (client)              │  :9000 control channel (raw TCP)   │
-    ───────────────────────────────────▶  │  range TCP/UDP tunnel listeners    │
-                                          │         │                          │
-                                          │   proxy_server.py                 │◀───multiplexed───▶  client
-                                          │  - control channel (auth)         │      connection     (your
-                                          │  - HTTP router by Host header     │                       laptop /
-                                          │  - TCP/UDP listeners per tunnel   │                       server)
-                                          │  - SQLite bookkeeping             │
-                                          └────────────────────────────────────┘
+ browser ── :443 (HTTPS) ─┐
+ client  ── :9000 (TCP) ──┤ proxy_server.py ── one persistent connection per client process
+ public  ── :20000+ ──────┘   (in-memory routing, SQLite bookkeeping)
 ```
 
-## Key Features
+- Stdlib only; `psutil` is optional (adds CPU/RAM to the dashboard).
+- Python 3.11 recommended (the Docker image); local tests run on 3.12.13.
+- Configuration is **environment variables only**. `config.example.json` is a
+  legacy shape reference and is never read.
 
-- **Authentication**: HMAC-SHA256 challenge-response (no shared secret sent over wire)
-- **HTTP routing**: Host header–based. `app.tunnel.example.com` → tunnels traffic to the registered client
-- **TCP routing**: Random port allocation (or preferred port, if free). Concurrent TCP listeners, one per tunnel
-- **Multiplexing**: One persistent connection carries many logical streams. Each stream = one HTTP request-connection or one TCP connection
-- **Flow control**: Per-stream, credit-based (HTTP/2 style). Backpressure-aware. Prevents one slow tunnel from stalling others
-- **Tunnel ownership modes**: `handoff` (default — the newest client claiming a subdomain/port takes it over and the previous owner is told) or `lease` (the name is reserved and other clients are refused)
-- **TLS in the container**: certbot obtains/renews the wildcard certificate (DNS challenge) and `proxy_server.py` terminates HTTPS itself; `EXTERNAL_SSL=true` or `HTTP_ONLY=true` delegate TLS elsewhere
-- **Private dashboard**: Server-validated password login, signed expiring HttpOnly cookie, authenticated stats API, no wildcard CORS; listener defaults to loopback
-- **SQLite**: Lightweight persistence for bookkeeping & observability
-- **No external services**: Just the proxy process + SQLite + local files
-- **Docker ready**: Single container, single process (`entrypoint.sh` → `proxy_server.py`), multi-stage build, resource limits tuned for 512 MB RAM / 0.5 vCPU
-- **Deployment helper**: `startup.sh` detects existing state (container, image, certificates, DNS, ports) and restarts/redeploys/rebuilds accordingly
-- **Environment-based config**: No config files needed, all via environment variables
-- **Auto directory creation**: DB and log directories created automatically
-
-## Quick Start
-
-### 1. Docker (recommended)
+## Quick start (Docker)
 
 ```bash
-cp .env.example .env      # SHARED_SECRET, WILDCARD_DOMAIN, DASHBOARD_PASSWORD, JWT_SECRET (+ certbot creds)
-vim .env
-
-# Interactive: inspects the machine first (container, image, database,
-# certbot certificates, DNS, busy ports), then asks what to do.
-./startup.sh
-
-# Non-interactive equivalents:
-./startup.sh --action restart                                  # restart as-is (fastest)
-./startup.sh --action redeploy --mode 4 --range 20000-20100 -y # host networking (recommended on a VPS)
-./startup.sh --action redeploy --mode 3 --range 20000-20004 -y # bridge + 5 mapped ports
-./startup.sh --action rebuild  --mode 4 --range 20000-20100 -y # rebuild, then swap
-```
-
-> **On a small VPS (Oracle Cloud always-free, 1 vCPU / 1 GB) use host
-> networking (`--network host`, mode 4), not a wide `-p` port range.**
-> Mapping a whole range makes Docker create one iptables DNAT rule **and one
-> `docker-proxy` process per port** at container start. On a single vCPU that
-> starves the CPU, delays the listeners from binding and the container gets
-> marked `unhealthy` (the health check has a 15 s grace period and 3 retries).
-> Host networking binds the ports directly with no NAT rules and no proxy
-> processes, so the server is up in ~2 s. See
-> [Why port mapping is expensive](#why-port-mapping-is-expensive-on-small-instances).
-
-**Recommended on a VPS (host networking, no port mapping at all):**
-
-```bash
+cp .env.example .env      # fill in the required values (below)
 docker build -t tunnel-proxy .
 
+# Recommended on a VPS: host networking, no per-port NAT/proxy overhead
 docker run -d --name tunnel-proxy --restart unless-stopped \
   --network host \
-  -e TCP_PORT_MIN=20000 -e TCP_PORT_MAX=20100 \
-  -e UDP_PORT_MIN=20000 -e UDP_PORT_MAX=20100 \
+  --cap-add NET_BIND_SERVICE \
   --env-file .env \
-  -v /data:/data \
-  -v /var/log:/var/log \
+  -v /data:/data -v /var/log/tunnel-proxy:/var/log/tunnel-proxy \
   tunnel-proxy
 ```
 
-With `--network host` the container binds 80, 443, 9000 and the whole tunnel
-range directly on the host, so `-p` is unnecessary (and ignored). Open those
-ports in the host firewall and in the cloud security list/NSG instead:
-
-```bash
-sudo iptables -I INPUT 1 -p tcp -m multiport --dports 80,443,9000 -j ACCEPT
-sudo iptables -I INPUT 1 -p tcp --dport 20000:20100 -j ACCEPT
-sudo iptables -I INPUT 1 -p udp --dport 20000:20100 -j ACCEPT
-sudo netfilter-persistent save     # if iptables-persistent is installed
-```
-
-Bridge networking (port mapping) — only with a **small** range:
-
-```bash
-docker run -d --name tunnel-proxy --restart unless-stopped \
-  -p 80:80 \
-  -p 443:443 \
-  -p 9000:9000 \
-  -p 20000-20005:20000-20005 \
-  -e TCP_PORT_MIN=20000 -e TCP_PORT_MAX=20005 \
-  --env-file .env \
-  -v /data:/data \
-  -v /var/log:/var/log \
-  tunnel-proxy
-
-# Check health (301 is expected: HTTP redirects to HTTPS)
-curl -si http://localhost/health | head -1
-```
-
-HTTP-only (two public ports plus the control channel — no raw TCP/UDP tunnels):
+With `--network host` the container binds 80, 443, 9000 and the tunnel range
+directly; `--cap-add NET_BIND_SERVICE` lets the unprivileged server bind low
+ports portably. Open those ports in the host firewall and the cloud security
+list/NSG. With bridge networking, publish only a small range:
 
 ```bash
 docker run -d --name tunnel-proxy --restart unless-stopped \
   -p 80:80 -p 443:443 -p 9000:9000 \
+  -p 20000-20100:20000-20100 \
+  -p 20000-20100:20000-20100/udp \
+  -e TCP_PORT_MIN=20000 -e TCP_PORT_MAX=20100 \
+  -e UDP_PORT_MIN=20000 -e UDP_PORT_MAX=20100 \
   --env-file .env \
-  -v /data:/data -v /var/log:/var/log \
+  -v /data:/data -v /var/log/tunnel-proxy:/var/log/tunnel-proxy \
   tunnel-proxy
 ```
 
-`/data` holds the SQLite database **and** `/data/letsencrypt`, so replacing or
-restarting the container keeps client history and reuses existing certificates.
+Mapping must be 1:1: the server advertises the container-side port, so
+`-p 30000:20000` would advertise an unreachable port. The server only checks
+that a port is bindable inside the container; an unpublished port looks
+“ready” but is unreachable.
 
-### Ports and tunnel types
+`/data` holds the SQLite database and `/data/letsencrypt`; mounting it
+preserves client history and certificates across rebuilds.
+`/var/log/tunnel-proxy` holds
+the server and certbot logs.
 
-| Port(s) | Needed for | How to expose |
-|---------|------------|---------------|
-| `80` | `/health`, HTTP tunnels, apex→HTTPS redirect | Host networking, or `-p 80:80` |
-| `443` | HTTPS tunnels + dashboard | Host networking, or `-p 443:443` (unless `HTTP_ONLY=true` / external TLS) |
-| `9000` | Control channel (`CONTROL_PORT`) | Host networking, or `-p 9000:9000` — every client connects here |
-| `TCP_PORT_MIN..TCP_PORT_MAX` | raw `tcp` tunnels | Host networking (**recommended**), or `-p 20000-20100:20000-20100` |
-| `UDP_PORT_MIN..UDP_PORT_MAX` | raw `udp` tunnels | Host networking, or the same range with `/udp` |
-
-- **HTTP tunnels never need extra ports**: every `http` tunnel is routed by the
-  `Host` header / subdomain through the shared 80/443 listener, so 80/443+9000
-  is enough for any number of HTTP tunnels. Raw `tcp`/`udp` tunnels are the only
-  ones that consume a dedicated public port.
-- `EXPOSE` in the Dockerfile is documentation only; nothing is reachable from
-  outside the container unless it is published with `-p` (or `--network host`).
-  Mapping must also be 1:1: the server advertises the container-side port
-  number, so `-p 30000:20000` would advertise a port nobody can reach.
-- The server only verifies that an allocated port is *bindable inside the
-  container*. An unpublished port therefore shows up as a `ready` tunnel that is
-  unreachable from the internet — keep the exposed range and the
-  `TCP_PORT_MIN/MAX` (and `UDP_*`) values identical.
-- With bridge networking Docker routes published ports through its own
-  DNAT/FORWARD rules, so a restrictive host `INPUT` chain does **not** block
-  them. With `--network host` (or the direct Python run) the server binds the
-  host directly and the host firewall must allow 80, 443, 9000 and the range.
-- On Oracle Cloud (and any cloud) the VCN security list / NSG must also allow
-  those ports — that is outside the host.
-
-#### Why port mapping is expensive on small instances
-
-`docker run -p 20000-20100:20000-20100` does **not** open a range cheaply. For
-every single published port Docker adds an iptables DNAT rule **and**, with the
-default userland proxy, starts a `docker-proxy` process that listens on it. A
-100-port TCP range plus the same UDP range is ~200 rules and ~200 extra
-processes created in the few seconds the container starts.
-
-On a 1 vCPU / 1 GB instance (Oracle Cloud always-free `VM.Standard.E2.1.Micro`
-is exactly that) this saturates the CPU while the container is still starting:
-
-- the server's listeners bind late, so `docker run` looks like it hangs;
-- the health check (15 s start period, 3 retries, 30 s interval) can flip the
-  container to `unhealthy` before it ever answers — which is what makes a
-  redeploy appear to fail and roll back;
-- the whole host becomes unresponsive for tens of seconds, so existing tunnels
-  and even SSH sessions stutter (`thrashing`).
-
-Numbers to keep in mind: 3 published ports ≈ instant; 20 ports ≈ noticeably
-slow on 1 vCPU; 100+ ports per protocol can take long enough to fail the health
-check; a range like `10000-65535` is unusable (and usually rejected by cloud
-firewalls).
-
-**Recommendation for any VPS (and required on 1 vCPU): use host networking.**
+Check health:
 
 ```bash
-docker run -d --name tunnel-proxy --restart unless-stopped \
-  --network host \
-  -e TCP_PORT_MIN=20000 -e TCP_PORT_MAX=20100 \
-  -e UDP_PORT_MIN=20000 -e UDP_PORT_MAX=20100 \
-  --env-file .env -v /data:/data -v /var/log:/var/log tunnel-proxy
+curl -si http://localhost/health | head -1
+# /health always returns 200, including when HTTPS redirect is active
 ```
 
-No DNAT rules, no `docker-proxy` processes, no startup lag: the server binds
-80/443/9000 and the tunnel range directly and is up in ~2 s. The trade-off is
-that the host firewall (`INPUT`) and the cloud security list must allow those
-ports — see the `iptables` snippet above.
-
-If you must use bridge networking:
-
-- keep the mapped range as small as you can (5-20 ports covers most `tcp`/`udp`
-  needs; idle tunnels release their port);
-- or disable the userland proxy in `/etc/docker/daemon.json`
-  (`{"userland-proxy": false}`) and restart Docker — this removes the per-port
-  `docker-proxy` processes (DNAT rules remain, which is cheap);
-- do not map a protocol you do not use (skip the `/udp` flag if you only need
-  `http` and `tcp` tunnels).
-
-### 2. Direct Python Run (Development)
+Optional helper (interactive or non-interactive) that detects existing
+container/image/certificates/DNS, builds, waits for health, and restores the
+previous container if the new one fails:
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+./startup.sh
+./startup.sh --action redeploy --mode 4 --range 20000-20100 --yes
+./startup.sh --action rebuild  --mode 4 --range 20000-20100 --yes
+```
 
-# Run with environment variables
-SHARED_SECRET="your-secret" \
+## Direct run (development)
+
+```bash
+SHARED_SECRET="$(openssl rand -hex 32)" \
 WILDCARD_DOMAIN="tunnel.example.com" \
-DASHBOARD_PASSWORD="choose-a-long-unique-password" \
-HTTP_PORT=8080 \
+DASHBOARD_PASSWORD="a-long-password" \
+JWT_SECRET="$(openssl rand -hex 32)" \
+HTTP_ONLY=true HTTP_PORT=8080 HTTPS_PORT=8443 DASHBOARD_PORT=8081 \
 python3 proxy_server.py
 ```
 
-> The dev run binds control on `:9000`, HTTP on `:8080` and dashboard on `:8081`
-> directly (override with `HTTP_PORT`/`DASHBOARD_PORT`). Add
-> `TCP_PORT_MIN`/`TCP_PORT_MAX` (and `UDP_*`) to enable raw TCP/UDP tunnels.
+`HTTP_ONLY=true` avoids certificates and serves the dashboard on the standalone
+`DASHBOARD_HOST:DASHBOARD_PORT` listener (loopback by default). Without
+`HTTP_ONLY`, the server expects readable certificates at the configured paths
+and fails startup if it cannot get them (see TLS below).
 
 ## Configuration
 
-All configuration is via environment variables:
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SHARED_SECRET` | — (required) | Client authentication secret |
+| `WILDCARD_DOMAIN` | — (required) | Apex domain; `*.<domain>` must resolve to this host |
+| `DASHBOARD_PASSWORD` | — (required) | Dashboard login password (min 8 chars; validated at startup) |
+| `JWT_SECRET` | — (required) | HS256 signing secret for dashboard sessions (min 32 chars) |
+| `CONTROL_HOST` | `0.0.0.0` | Control listener host |
+| `CONTROL_PORT` | `9000` | Control channel port |
+| `CONTROL_TLS` | `false` | Wrap the control channel in TLS |
+| `CONTROL_CERT_PATH` | public cert path | Certificate for control TLS |
+| `CONTROL_KEY_PATH` | public key path | Key for control TLS |
+| `HTTP_HOST` / `HTTP_PORT` | `0.0.0.0` / `80` | Public HTTP listener |
+| `HTTPS_HOST` / `HTTPS_PORT` | `0.0.0.0` / `443` | Public HTTPS listener |
+| `TCP_PORT_MIN` / `TCP_PORT_MAX` | `20000` / `20100` | TCP tunnel port pool |
+| `UDP_PORT_MIN` / `UDP_PORT_MAX` | `20000` / `20100` | UDP tunnel port pool |
+| `DASHBOARD_HOST` / `DASHBOARD_PORT` | `127.0.0.1` / `8081` | Standalone dashboard (HTTP-only mode) |
+| `HTTP_ONLY` | `false` | No HTTPS listener; use `http://` public URLs |
+| `EXTERNAL_SSL` | `false` | Skip certbot provisioning; a front proxy terminates TLS |
+| `ALLOW_HTTP_FALLBACK` | `false` | Permit startup without a certificate (explicit downgrade) |
+| `HEARTBEAT_INTERVAL` | `20` | Server ping interval (seconds) |
+| `HEARTBEAT_TIMEOUT` | `60` | Drop an unresponsive client after this long |
+| `STALE_GRACE_SECONDS` | `300` | Stale bookkeeping cleanup grace |
+| `DB_PATH` | `/data/tunnel_proxy.db` | SQLite path |
+| `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
+| `LOG_FILE` | `/var/log/tunnel-proxy/tunnel_proxy.log` | Log file |
+| `HTTP_RECONNECT_GRACE_SECONDS` | `8` | Max wait for an unexpectedly dropped HTTP owner (`0` disables) |
+| `HTTP_RECONNECT_MAX_WAITERS_PER_NAME` | `16` | Queued requests per subdomain |
+| `HTTP_RECONNECT_MAX_WAITERS` | `128` | Queued requests globally |
+| `MAX_CLIENTS` | `128` | Concurrent client sessions |
+| `MAX_TUNNELS_PER_CLIENT` | `32` | Tunnels per client session |
+| `MAX_STREAMS_PER_CLIENT` | `256` | Active streams per client session |
+| `MAX_PENDING_HTTP_CONNECTIONS` | `256` | Pending HTTP connections |
+| `UDP_MAX_PEERS_PER_TUNNEL` | `128` | Distinct UDP peers tracked per tunnel |
+| `UDP_IDLE_TIMEOUT` | `60` | UDP peer idle expiry (seconds) |
+| `STREAM_WRITE_TIMEOUT` | `30` | Stream write timeout (seconds) |
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `SHARED_SECRET` | **Yes** | - | Authentication secret (generate with `openssl rand -hex 32`) |
-| `WILDCARD_DOMAIN` | **Yes** | - | Wildcard domain for tunnels (e.g., `tunnel.example.com`) |
-| `DASHBOARD_PASSWORD` | **Yes for dashboard** | - | Password required to unlock dashboard |
-| `JWT_SECRET` | **Yes for dashboard** | - | High-entropy HS256 JWT signing secret |
-| `CONTROL_HOST` | No | `0.0.0.0` | Control channel bind host |
-| `CONTROL_PORT` | No | `9000` | Control channel port (clients connect here) |
-| `HTTP_HOST` | No | `0.0.0.0` | HTTP server bind host |
-| `HTTP_PORT` | No | `80` | HTTP server port |
-| `HTTPS_HOST` | No | `0.0.0.0` | HTTPS server bind host |
-| `HTTPS_PORT` | No | `443` | HTTPS server port |
-| `TCP_PORT_MIN` | No | `10000` | TCP tunnel range minimum — set it to the range you expose (e.g. `20000`) |
-| `TCP_PORT_MAX` | No | `65535` | TCP tunnel range maximum (e.g. `20100`) |
-| `UDP_PORT_MIN` | No | `10000` | UDP tunnel range minimum (e.g. `20000`) |
-| `UDP_PORT_MAX` | No | `65535` | UDP tunnel range maximum (e.g. `20100`) |
-| `DASHBOARD_HOST` | No | `127.0.0.1` | Standalone dashboard bind host (loopback only by default) |
-| `DASHBOARD_PORT` | No | `8081` | Dashboard port |
-| `HTTP_ONLY` | No | `true` | Use http:// URLs |
-| `HEARTBEAT_INTERVAL` | No | `20` | Heartbeat interval (seconds) |
-| `HEARTBEAT_TIMEOUT` | No | `60` | Heartbeat timeout (seconds) |
-| `STALE_GRACE_SECONDS` | No | `300` | Stale client cleanup grace |
-| `DB_PATH` | No | `/data/tunnel_proxy.db` | SQLite database path |
-| `LOG_LEVEL` | No | `INFO` | Logging level |
-| `LOG_FILE` | No | `/var/log/tunnel-proxy/tunnel_proxy.log` | Log file path |
+Required values are validated at startup: missing or placeholder
+`SHARED_SECRET`/`WILDCARD_DOMAIN` and missing dashboard credentials fail loudly
+instead of serving an insecure default. `DASHBOARD_PASSWORD` must be at least 8
+characters and `JWT_SECRET` at least 32; generate `JWT_SECRET` with
+`openssl rand -hex 32`. Dashboard sessions are HS256 JWTs valid for at most 31
+days and are held in memory, so a server restart, logout, or dashboard-password
+rotation invalidates them; API clients may send
+`Authorization: Bearer <JWT>`. Use HTTPS whenever the dashboard is reachable
+beyond localhost.
 
-**`SHARED_SECRET` and `WILDCARD_DOMAIN` are required for the tunnel service. Set both `DASHBOARD_PASSWORD` and `JWT_SECRET`; the panel fails closed if either is unset. Generate `JWT_SECRET` with `openssl rand -hex 32`. Dashboard JWT sessions persist for 31 days. API clients may authenticate with `Authorization: Bearer <JWT>`. Use HTTPS whenever the dashboard is reachable beyond localhost.**
+Directories for the database and log file are created automatically.
 
-**Directories are auto-created**: The server automatically creates `/data` and `/var/log/tunnel-proxy` directories if they don't exist.
+## Ports
 
-## Container Architecture
+| Port(s) | Purpose |
+|---------|---------|
+| 80 | `/health`, apex→HTTPS redirect, HTTP tunnels |
+| 443 | HTTPS tunnels and dashboard (apex domain) |
+| 9000 | Control channel (raw TCP, optional native TLS) |
+| 20000–20100/tcp | One port per raw TCP tunnel |
+| 20000–20100/udp | One port per raw UDP tunnel |
 
-One container, one process: `entrypoint.sh` fixes volume ownership, provisions
-or reuses the wildcard certificate with certbot (DNS challenge), then `exec`s
-`proxy_server.py`, which binds every port itself.
+- HTTP tunnels share 80/443 and need no additional public HTTP port, but every
+  tunnel still needs the control port 9000. Only TCP/UDP tunnels consume a
+  dedicated public port.
 
-```
-:80        proxy_server.py  ── /health, apex→HTTPS redirect, HTTP tunnels
-:443       proxy_server.py  ── HTTPS tunnels + dashboard (apex domain)
-:9000      proxy_server.py  ── control channel (raw TCP, no TLS)
-RANGE/tcp  proxy_server.py  ── one listener per raw TCP tunnel
-RANGE/udp  proxy_server.py  ── one UDP socket per raw UDP tunnel
-```
+## TLS and certificates
 
-- **`entrypoint.sh`** — runs as root: `chown`s `/data` and `/var/log/...`,
-  symlinks `/etc/letsencrypt` to `/data/letsencrypt`, renews the certificate if
-  it is missing or expires within 30 days, starts cron for renewals, then drops
-  into the server.
-- **`proxy_server.py`** — the tunnel server: HTTP(S) routing by `Host`,
-  per-tunnel TCP/UDP listeners, control channel, dashboard.
-- **`startup.sh`** — deployment helper (detects existing state, builds,
-  swaps/restarts the container, waits for health, rolls back on failure).
+In the Docker image, `entrypoint.sh` runs as root to create/chown volumes, then
+uses certbot (DNS challenge) to obtain a wildcard certificate for
+`*.<WILDCARD_DOMAIN>` and the apex, storing it under `/data/letsencrypt`
+(symlinked from `/etc/letsencrypt`). It then starts `proxy_server.py` as the
+unprivileged `tunnelproxy` user. Certificate renewal is a separate daily cron
+entry running `certbot renew`; renewed certificates are reloaded in place for
+both the public HTTPS listener and control TLS (polled). Changing the
+configured certificate paths requires a restart.
 
-**Why separate ports?** HTTP(S) tunnels multiplex over 80/443 by `Host` header,
-but the control channel is a raw TCP protocol (`TN` magic bytes) that cannot
-ride over HTTP, so it needs its own port. Raw `tcp`/`udp` tunnels each need a
-public port of their own, which is why the range above exists.
+- Needs `DNS_PROVIDER` plus its credential (for Cloudflare: `CF_API_TOKEN`)
+  and `CERTBOT_EMAIL`. Build the matching `certbot-dns-<provider>` plugin in
+  the image/venv used for renewal so provisioning and renewal share one
+  interpreter.
+- `EXTERNAL_SSL=true` skips certbot when a reverse proxy terminates TLS.
+- `HTTP_ONLY=true` skips certificate handling entirely.
+- Without a certificate the server fails startup. `ALLOW_HTTP_FALLBACK=true`
+  is the explicit opt-in to an HTTP-only run; never treat silent downgrade as
+  normal.
+- Keep private keys non-world-readable. The container makes the certificate
+  directories traversable and sets key files to root:`tunnelproxy` mode 0640 so
+  the unprivileged server can read them without exposing them to every user.
+- **Control TLS** is separate from public HTTPS: `CONTROL_TLS=true` plus
+  `CONTROL_CERT_PATH`/`CONTROL_KEY_PATH` (defaults: the public certificate).
+  Clients must use `--tls` and validate the certificate (system trust store or
+  `--ca-cert`); there is no insecure-skip-verify option. Plaintext control is
+  acceptable only over a private network (VPN/WireGuard/SSH).
 
-**Persistent data:** everything mutable lives under `/data` (`tunnel_proxy.db`,
-`letsencrypt/`), so mounting `/data` is enough to keep state across rebuilds.
+## HTTP reconnect waiting
 
-## Render Deployment
+When an HTTP tunnel's client connection drops unexpectedly, the server does not
+immediately return 404:
 
-### Manual Render Setup
+1. The request headers and client socket are held while the name is
+   re-registered, up to `HTTP_RECONNECT_GRACE_SECONDS` (default 8).
+2. The waiting request is then forwarded to whoever currently owns the name —
+   the reconnected client or a new legitimate claimant.
+3. No application-level request-body accumulation, spooling, or replay. Only
+   the pre-route request head is retained; the normal bounded TCP/asyncio
+   receive path may hold some bytes with backpressure.
+4. Unknown subdomains → immediate `404`. A known name whose wait expires (or a
+   full queue) → `503` with `Retry-After: 2`. Grace `0` → immediate `404`.
+5. An explicit close or a handoff does not create a waiting hint and does not
+   extend a lease. The grace starts when the server *detects* the disconnect
+   (heartbeat/inactivity), not necessarily when the physical link died.
+6. Per-name and global waiter caps bound memory (`16` / `128` by default).
 
-1. Create a new Web Service
-2. Use Docker runtime with `Dockerfile`
-3. Set plan to **Starter** (512MB RAM, 0.5 CPU)
-4. Add **required** environment variables:
-   - `SHARED_SECRET`
-   - `WILDCARD_DOMAIN`
-  - `DASHBOARD_PASSWORD` (long, unique secret)
-  - `JWT_SECRET` (random signing key, e.g. `openssl rand -hex 32`)
-5. Add persistent disk at `/data` (1GB)
-6. Set **Ports** to `80` (HTTP) and `9000` (TCP control channel)
-7. Deploy
+This is not stream resumption: open WebSocket connections and in-flight bodies
+are still aborted on disconnect.
 
-**Note:** Render handles HTTPS termination automatically on port 443 and forwards HTTP to container port 80. The control channel uses a separate TCP port (9000) which Render exposes as a TCP load balancer target. Point `*.yourdomain` and `yourdomain` at the service.
+## Running and monitoring
 
-Render cannot expose an arbitrary port range, so on Render only `http` tunnels
-work — `tcp`/`udp` tunnels need a host/VPS where you can publish
-`TCP_PORT_MIN..TCP_PORT_MAX` (see [Ports and tunnel types](#ports-and-tunnel-types)).
+- Dashboard: `https://<WILDCARD_DOMAIN>/` or `/dashboard/` (login required).
+  In HTTP-only mode: `http://<DASHBOARD_HOST>:<DASHBOARD_PORT>/`.
+- Stats API: `GET /api/stats` with a dashboard session or bearer JWT; no
+  wildcard CORS.
+- Health: `GET /health` (unauthenticated, always available).
+- Logs: the console and `LOG_FILE`; the dashboard shows recent log lines.
+  There is no built-in rotation, so bound the log file with logrotate, the
+  container log driver, or your platform's log retention.
 
-## SSL/TLS
+Dashboard login is throttled (5 attempts/60 s → `429`), sessions are in-memory
+HS256 JWTs valid for at most 31 days, and logout or a password rotation
+invalidates them; a server restart clears all sessions.
 
-The container terminates HTTPS itself: `entrypoint.sh` requests a wildcard
-certificate (`*.<WILDCARD_DOMAIN>` + the apex) via certbot's DNS challenge on
-first start, stores it in `/data/letsencrypt`, reuses it on later starts when it
-is valid for more than 30 days, and renews it daily via cron.
+## Client usage
 
-- Needs `DNS_PROVIDER` + credentials (`CF_API_TOKEN` for Cloudflare) and
-  `CERTBOT_EMAIL`; otherwise set `HTTP_ONLY=true` and put TLS in front yourself.
-- Set `EXTERNAL_SSL=true` to skip certbot entirely when a proxy/reverse proxy
-  terminates TLS for you.
-- `startup.sh` reports the certificate it finds (path + expiry) before deploying,
-  so a restart or redeploy never re-requests a valid certificate.
-- Clients always reach the control channel as **raw TCP on 9000**, not TLS.
-
-## Client Usage
+Use the real client in `my_proxy_client/`:
 
 ```bash
-# Using the reference client
-python3 examples/reference_client.py \
-  --server your-server:9000 \
-  --secret your-shared-secret \
-  --local-http 127.0.0.1:3000 \
-  --subdomain myapp
+python3 ../my_proxy_client/my_proxy.py http 3000 \
+  --server your-server:9000 --token "$SHARED_SECRET" -u myapp
 ```
 
-> Point the client at **port 9000** for the control channel. HTTP tunnels are automatically available on port 80 (via your HTTPS front).
+A reference implementation for protocol work lives at
+`examples/reference_client.py`. Point clients at **port 9000**, the control
+channel.
 
-Your app will be available at `https://myapp.tunnel.example.com` (via your HTTPS-terminating front).
+Public URLs are `https://<subdomain>.<WILDCARD_DOMAIN>` (or `http://` when
+`HTTP_ONLY=true`). The server echoes the granted subdomain in
+`TUNNEL_OPEN_RESPONSE`, including for auto-assigned names.
 
-### Tunnel ownership modes
+## Tunnel ownership
 
-Public names (subdomain / TCP port / UDP port) are shared, so the server needs
-a rule for a second client that asks for a name already in use. Each tunnel
-declares its mode in `TUNNEL_OPEN_REQUEST` (clients expose this as `--lease`):
-
-| mode | behaviour |
+| Mode | Behaviour |
 |------|-----------|
-| `handoff` (default) | Newest claimant wins. The previous owner is revoked (`TUNNEL_CLOSE` with `reason="handoff"` and a message), its streams are aborted, and the newcomer gets the name. |
-| `lease` | The name is reserved. Other clients are refused (`status="error"`, `reason="leased"`) and the holder keeps serving. A client asking for a lease over a name that is already in use is refused too (`reason="in_use"`). |
+| `handoff` (default) | Newest claimant wins; the previous owner gets `TUNNEL_CLOSE reason="handoff"` and stops serving that name. |
+| `lease` | Reserved for the session. Other clients get `reason="leased"`; a lease request over an in-use name gets `reason="in_use"`. |
 
-Reconnects are never treated as a conflict: the same client process (same
-`client_id` and `instance_id`) reclaims its own registration, including a
-leased one. Two processes on one machine share the persisted `client_id` but
-send different `instance_id`s, so they count as two competing clients — which
-is what makes `--lease` meaningful when the same machine runs two clients for
-the same name.
+A reconnect of the same client process reclaims its own registration,
+including a lease. Leases end when the owning session ends (heartbeat
+timeout), so no name is reserved forever. A duplicate tunnel ID is rejected;
+it never creates orphaned names or listeners.
 
-A lease lives as long as the owning session: once the client is unreachable
-past `heartbeat_timeout_seconds` the server drops the session and the name
-returns to the pool. Leases are therefore exclusive but never permanent, which
-keeps the "routes are rebuilt on reconnect, nothing is reserved forever"
-design intact.
+## Deployment platforms
 
-## Monitoring
+HTTP tunnels require a host that can serve 80/443 **and** expose the raw TCP
+control port (default 9000) to clients. The control channel cannot ride over
+HTTP; a platform that only forwards HTTP needs another path to 9000 (for
+example a VPN), otherwise the deployment is unsupported. Raw TCP/UDP tunnels
+also need a public raw TCP or UDP port (or range) forwarded unchanged. Most
+HTTP PaaS platforms do not provide arbitrary raw TCP/UDP ports, so do not
+promise TCP/UDP tunnels there; use a VPS with a public IP for those.
 
-- Dashboard: `https://your-domain/dashboard/` (requires `DASHBOARD_PASSWORD` and `JWT_SECRET`)
-- Stats API: `/api/stats` (requires a valid dashboard session; no wildcard CORS)
-- Health: `http://your-server/health` (an HTTPS-enabled deployment answers 301
-  on port 80 and serves the real `/health` on 443 — both count as up)
-
-## Project Structure
+## Project structure
 
 ```
-proxy_server.py       Main server (entry point; binds every port itself)
-protocol.py           Canonical wire protocol (frames, auth, constants)
-storage.py            SQLite persistence (clients/tunnels bookkeeping)
-dashboard.py          Status dashboard (password auth + JSON API)
-entrypoint.sh         Root entrypoint: volumes, certbot, then proxy_server.py
-startup.sh            Interactive deploy helper (detect, build, swap, rollback)
-Dockerfile            Single multi-stage build
+proxy_server.py       Server entry point (binds every port)
+protocol.py           Canonical wire protocol
+storage.py            SQLite bookkeeping
+dashboard.py          Authenticated dashboard + JSON API
+entrypoint.sh         Root init: volumes, certbot, cron, then server
+startup.sh            Optional interactive deploy helper
+Dockerfile            Direct-server container (no nginx/haproxy/supervisor)
 .env.example          Environment template
-config.example.json   Config template (legacy)
-requirements.txt      Optional deps (psutil)
-examples/reference_client.py  Illustrative client implementation
-DEPLOYMENT.md         Detailed deployment guide
+config.example.json   Legacy shape reference only (not parsed)
+requirements.txt      Optional psutil
+examples/reference_client.py
+DEPLOYMENT.md         Deployment detail
 ```
 
-## Architecture
+## Troubleshooting
 
-### Protocol at a Glance
-
-**Frame format** (12-byte header + variable payload):
-```
-[Magic:2] [Ver:1] [Type:1] [StreamID:4] [Length:4] [Payload:...]
-  "TN"     1      enum      0 = control  bytes
-```
-
-**Authentication** (binary HELLO payload, 72 bytes):
-```
-[ClientID:16] [Timestamp:8] [Nonce:16] [HMAC-SHA256:32]
-```
-Resists replay and proves knowledge of shared secret without sending it.
-
-**Multiplexing** (Stream ID):
-- Stream 0: control (HELLO, PING, tunnel open/close, errors)
-- Stream 1+: individual tunneled connections (each stream = 1 HTTP request or 1 TCP conn)
-
-**Flow control**:
-- Per-stream, credit-based: both sides start with 256 KiB send window
-- Sender consumes credit before sending `STREAM_DATA`
-- Receiver sends back `STREAM_WINDOW_UPDATE` after flushing (batched every 128 KiB)
-- Simple backpressure: slow consumer naturally throttles sender
-
-### Key Design Principles
-
-1. **Simple binary protocol** — No JSON for hot-path data, just 12-byte headers + carefully chosen payloads
-2. **No external services** — SQLite + local files only. Scales from laptop to modest production
-3. **Per-stream flow control** — Backpressure-aware, prevents one slow tunnel from starving others
-4. **Replay-protected auth** — HMAC-SHA256 + timestamp checks + nonce tracking; no secret sent over wire
-5. **Stable reconnect behavior** — Clients persist their ID, routes aren't "reserved" ahead of time (first-come first-served), allows graceful recovery without complex state sync. Contested names are resolved by the tunnel's **ownership mode**: `handoff` (default — newest claimant wins, previous owner is revoked with an explanatory message) or `lease` (name reserved; other claimants are refused until the holder's session ends)
-6. **SSL termination externalized** — Handled by Render/Cloudflare/etc., keeps proxy server simple and focused
-7. **Two public ports** — Port 80 for HTTP, port 9000 for raw TCP control. Works with cloud platforms that terminate TLS at the edge.
-8. **Observability, not governance** — SQLite bookkeeping, dashboard, and logs are for transparency; routing is purely in-memory and rebuilt on reconnect
-9. **Minimal dependencies** — Asyncio (stdlib), sqlite3 (stdlib), psutil (optional). Main server has zero required external packages
-10. **Environment-based config** — No config files, all via environment variables for container-friendly deployment
-11. **Auto directory creation** — DB and log directories created automatically
-
-## Production Checklist
-
-- [ ] Set `SHARED_SECRET` to a long random value (`openssl rand -hex 32`)
-- [ ] Set `WILDCARD_DOMAIN` to your actual domain
-- [ ] Ensure DNS has `*.yourdomain` and `yourdomain` pointing to the server
-- [ ] Expose ports 80 (HTTP) and 9000 (control); verify both work
-- [ ] Configure custom domain / HTTPS termination in front (Render, Cloudflare, etc.)
-- [x] Dashboard binds to `127.0.0.1` by default and enforces server-side password sessions
-- [ ] Set `tcp.port_range` to your preferred allocation pool
-- [ ] Set resource limits appropriate for your infrastructure
-- [ ] Monitor `tunnel_proxy.log` and the authenticated `/api/stats` dashboard
-
-## Resource Optimization
-
-The server is optimized for low-resource environments:
-
-- **Memory**: ~50-100MB base, +~10MB per 1000 active connections
-- **CPU**: Single-threaded asyncio, minimal overhead
-- **Connection limits**: Configurable via `INITIAL_WINDOW` (256KB per stream)
-
-### Recommended limits for Render (512MB, 0.5 vCPU):
-
-```yaml
-deploy:
-  resources:
-    limits:
-      cpus: '0.5'
-      memory: 512M
-    reservations:
-      cpus: '0.1'
-      memory: 256M
-```
-
----
-
-**Total project: ~1,600 lines of code + ~1,000 lines of docs. Ready for self-hosting.**
+- **Startup fails “SHARED_SECRET/WILDCARD_DOMAIN”**: set both; placeholders are
+  rejected. The default secret in the source is not usable.
+- **Startup fails on certificates**: check DNS (`*.<domain>` and apex), the
+  certbot provider plugin/credentials, and key readability. For an intentional
+  HTTP-only run set `HTTP_ONLY=true` (or `EXTERNAL_SSL=true` with a front
+  proxy), or `ALLOW_HTTP_FALLBACK=true`.
+- **`Authentication failed: invalid signature`**: client token does not match
+  `SHARED_SECRET`.
+- **Tunnel is `ready` but unreachable**: the port is not published/allowed on
+  the host/cloud firewall, or the published port and `TCP_PORT_MIN/MAX` do not
+  match.
+- **Dashboard refuses to start**: `DASHBOARD_PASSWORD` or `JWT_SECRET` is
+  unset or still a placeholder; startup fails validation.
+- **Dashboard 429**: too many login attempts; wait a minute.
+- **HTTP request gets 404 right after a client restart**: the name is not a
+  known tunnel, or the grace was exceeded. A 503 means it was known but the
+  wait expired.

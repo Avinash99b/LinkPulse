@@ -1,141 +1,329 @@
+# Build, test and release the standalone LinkPulse client binaries.
+#
+# Pipeline
+#   test    -> runs the pytest suite. Linux runs the FULL suite (authoritative);
+#              macOS/Windows run the platform-independent unit, registry and
+#              security tests. Tests that depend on POSIX-only file modes or
+#              subprocess signal semantics are explicitly excluded there
+#              (never silently skipped-and-counted-as-pass).
+#   build    -> runs only after `test` succeeds. Produces the three client
+#              binaries with PyInstaller, smoke-tests each one, and uploads
+#              them as workflow artifacts (also for workflow_dispatch).
+#   release  -> only for v* tags. Downloads the artifacts, emits SHA-256
+#              checksums plus a JSON manifest, and publishes the GitHub release.
+#
+# Security / hygiene
+#   * All third-party actions are pinned to immutable 40-hex commit SHAs. Each
+#     SHA was resolved to a real commit via the GitHub API on 2026-11-13.
+#   * Workflow default permission is contents: read; only `release` gets write.
+#   * The release job never echoes the token; it is passed via env to one step.
+#
+# Toolchain pins
+#   * pip 24.0 (matches tunnel-proxy/Dockerfile; supports Python 3.11).
+#   * CPython 3.11 series: actions/setup-python resolves the 3.11.x patch that
+#     the selected OS/arch image provides. The patch is NOT pinned (it is not
+#     stable across runner-image updates); the 3.11 minor series is.
+#   * PyInstaller 6.11.1         (build-requirements.txt)
+#   * pytest 8.3.4               (requirements-dev.txt)
+#   * Linux binary is built inside python:3.11.13-slim-bullseye pinned by
+#     digest, so it stays glibc-compatible with older distributions.
+#
+# Runner labels (verified against actions/runner-images, 2026-11):
+#   * macos-15 is the arm64 image; macos-14 is x64 and retired from GitHub
+#     Actions, so it must not be used here. The binary is therefore named
+#     darwin-arm64 (there is no universal/Intel macOS asset).
+#   * windows-2022 is x64 (amd64); ubuntu-24.04 is x64 (amd64).
+
 name: Build and Release Client
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
+    tags: ['v*']
+  pull_request:
   workflow_dispatch:
 
+# Least privilege by default; the release job opts into contents: write.
 permissions:
-  contents: write
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHON_VERSION: '3.11'
+  PIP_VERSION: '24.0'
+  PYINSTALLER_ARGS: >-
+    --onefile --name my_proxy --clean --noconfirm
+    --hidden-import=asyncio --hidden-import=json --hidden-import=logging
+    --hidden-import=argparse --hidden-import=dataclasses --hidden-import=enum
+    --hidden-import=hashlib --hidden-import=hmac --hidden-import=secrets
+    --hidden-import=struct --hidden-import=uuid --hidden-import=collections
+    --hidden-import=pathlib --hidden-import=signal --hidden-import=typing
 
 jobs:
-  build:
-    name: Build on ${{ matrix.os }}
+  test:
+    name: Test (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            artifact_name: my_proxy
-            asset_name: my_proxy-linux-amd64
-          - os: macos-latest
-            artifact_name: my_proxy
-            asset_name: my_proxy-darwin-universal
-          - os: windows-latest
-            artifact_name: my_proxy.exe
-            asset_name: my_proxy-windows-amd64.exe
-
+          - name: linux, full suite
+            os: ubuntu-24.04
+            arch: x64
+          - name: macos arm64, platform-independent units + security
+            os: macos-15
+            arch: arm64
+          - name: windows amd64, platform-independent units + security
+            os: windows-2022
+            arch: x64
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
-          python-version: '3.11'
+          python-version: ${{ env.PYTHON_VERSION }}
+          architecture: ${{ matrix.arch }}
 
-      - name: Install dependencies
+      - name: Install test dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install pyinstaller
+          set -euo pipefail
+          python -m pip install "pip==${{ env.PIP_VERSION }}"
+          python -m pip install -r requirements-dev.txt
 
-      - name: Build with PyInstaller (macOS)
+      # Linux is the authoritative run: every test file, no exclusions.
+      - name: Run full test suite
+        if: runner.os == 'Linux'
+        run: python -m pytest tests -q
+
+      # macOS: pure unit/registry tests plus the full security regression
+      # suite. macOS supports POSIX file modes and a real process start time,
+      # so test_client_regressions runs unfiltered here.
+      - name: Run macOS platform-independent + security tests
+        if: runner.os == 'macOS'
+        run: |
+          python -m pytest -q \
+            tests/test_dashboard_auth.py \
+            tests/test_client_process_mgmt.py::TestCLIArgumentParsing \
+            tests/test_client_process_mgmt.py::TestStateManagementHelpers \
+            tests/test_tunnel_modes.py \
+            tests/test_security_regressions.py \
+            tests/test_client_regressions.py \
+            --deselect tests/test_tunnel_modes.py::test_client_keeps_retrying_past_grace_period \
+            --deselect tests/test_tunnel_modes.py::test_client_terminates_with_message_on_handoff
+
+      # Windows: same selection minus the three tests that assert POSIX 0600
+      # file modes (os.stat() does not represent them on Windows). The PID
+      # start-time tests stay enabled: the client now probes with OpenProcess
+      # + GetExitCodeProcess on Windows and never calls os.kill(pid, 0).
+      - name: Run Windows platform-independent + security tests
+        if: runner.os == 'Windows'
+        run: |
+          python -m pytest -q \
+            tests/test_dashboard_auth.py \
+            tests/test_client_process_mgmt.py::TestCLIArgumentParsing \
+            tests/test_client_process_mgmt.py::TestStateManagementHelpers \
+            tests/test_tunnel_modes.py \
+            tests/test_security_regressions.py \
+            tests/test_client_regressions.py \
+            --deselect tests/test_tunnel_modes.py::test_client_keeps_retrying_past_grace_period \
+            --deselect tests/test_tunnel_modes.py::test_client_terminates_with_message_on_handoff \
+            --deselect tests/test_client_regressions.py::test_atomic_write_json_is_private_and_leaves_no_temp \
+            --deselect tests/test_client_regressions.py::test_save_config_writes_private_token_file \
+            --deselect tests/test_client_regressions.py::test_managed_state_file_is_private
+
+  build:
+    name: Build ${{ matrix.asset_name }}
+    needs: test
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            asset_name: my_proxy-linux-amd64
+            arch: x64
+          - os: macos-15
+            asset_name: my_proxy-darwin-arm64
+            arch: arm64
+          - os: windows-2022
+            asset_name: my_proxy-windows-amd64.exe
+            arch: x64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+      # Needed on every runner: PyInstaller on macOS/Windows, and the packaged
+      # binary smoke test on Linux. Guarantees a real `python` command.
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          architecture: ${{ matrix.arch }}
+
+      - name: Install PyInstaller (macOS/Windows)
+        if: runner.os != 'Linux'
+        run: |
+          set -euo pipefail
+          python -m pip install "pip==${{ env.PIP_VERSION }}"
+          python -m pip install -r build-requirements.txt
+
+      # Guard against a runner-label change silently producing the wrong arch
+      # under an arm64/amd64 asset name.
+      - name: Verify target architecture (macOS arm64)
+        if: runner.os == 'macOS'
+        run: |
+          python -c "import platform; m=platform.machine().lower(); assert m in ('arm64','aarch64'), m; print('macOS arch:', m)"
+
+      - name: Verify target architecture (Windows amd64)
+        if: runner.os == 'Windows'
+        run: |
+          python -c "import platform; m=platform.machine().lower(); assert m in ('amd64','x86_64'), m; print('Windows arch:', m)"
+
+      - name: Build binary with PyInstaller (macOS)
         if: runner.os == 'macOS'
         working-directory: my_proxy_client
-        shell: bash
-        run: |
-          pyinstaller \
-            --onefile \
-            --name my_proxy \
-            --clean \
-            --noconfirm \
-            --strip \
-            --hidden-import=asyncio \
-            --hidden-import=json \
-            --hidden-import=logging \
-            --hidden-import=argparse \
-            --hidden-import=dataclasses \
-            --hidden-import=enum \
-            --hidden-import=hashlib \
-            --hidden-import=hmac \
-            --hidden-import=secrets \
-            --hidden-import=struct \
-            --hidden-import=uuid \
-            --hidden-import=collections \
-            --hidden-import=pathlib \
-            --hidden-import=signal \
-            --hidden-import=typing \
-            my_proxy.py
+        run: pyinstaller ${{ env.PYINSTALLER_ARGS }} --strip my_proxy.py
 
-      - name: Build with PyInstaller in Docker (Linux)
-        if: runner.os == 'Linux'
-        uses: addnab/docker-run-action@v3
-        with:
-          image: python:3.11-slim-bullseye
-          options: -v ${{ github.workspace }}:/work -w /work/my_proxy_client
-          run: |
-            apt-get update && apt-get install -y binutils
-            pip install pyinstaller
-            pyinstaller \
-              --onefile \
-              --name my_proxy \
-              --clean \
-              --noconfirm \
-              --strip \
-              --hidden-import=asyncio \
-              --hidden-import=json \
-              --hidden-import=logging \
-              --hidden-import=argparse \
-              --hidden-import=dataclasses \
-              --hidden-import=enum \
-              --hidden-import=hashlib \
-              --hidden-import=hmac \
-              --hidden-import=secrets \
-              --hidden-import=struct \
-              --hidden-import=uuid \
-              --hidden-import=collections \
-              --hidden-import=pathlib \
-              --hidden-import=signal \
-              --hidden-import=typing \
-              my_proxy.py
-            chown -R $(stat -c "%u:%g" .) dist build *.spec
-
-      - name: Build with PyInstaller (Windows)
+      - name: Build binary with PyInstaller (Windows)
         if: runner.os == 'Windows'
         working-directory: my_proxy_client
-        shell: bash
+        run: pyinstaller ${{ env.PYINSTALLER_ARGS }} my_proxy.py
+
+      # Build inside a Debian bullseye image (pinned by digest) instead of the
+      # runner's newer glibc, so the released Linux binary runs on older
+      # distributions. Explicit `docker run` (no third-party action) keeps the
+      # inputs and the granted privileges visible, and --platform pins amd64.
+      - name: Build glibc-compatible binary (Linux)
+        if: runner.os == 'Linux'
         run: |
-          pyinstaller \
-            --onefile \
-            --name my_proxy \
-            --clean \
-            --noconfirm \
-            --hidden-import=asyncio \
-            --hidden-import=json \
-            --hidden-import=logging \
-            --hidden-import=argparse \
-            --hidden-import=dataclasses \
-            --hidden-import=enum \
-            --hidden-import=hashlib \
-            --hidden-import=hmac \
-            --hidden-import=secrets \
-            --hidden-import=struct \
-            --hidden-import=uuid \
-            --hidden-import=collections \
-            --hidden-import=pathlib \
-            --hidden-import=signal \
-            --hidden-import=typing \
-            my_proxy.py
+          set -euo pipefail
+          docker run --rm \
+            --platform linux/amd64 \
+            --volume "${{ github.workspace }}:/work" \
+            --workdir /work \
+            --env "HOST_UID=$(id -u)" \
+            --env "HOST_GID=$(id -g)" \
+            python:3.11.13-slim-bullseye@sha256:9e25f400253a5fa3191813d6a67eb801ca1e6f012b3bd2588fa6920b59e3eba6 \
+            bash -euo pipefail -c '
+              apt-get update
+              apt-get install -y --no-install-recommends binutils
+              python -m pip install --no-cache-dir "pip==24.0"
+              python -m pip install --no-cache-dir -r build-requirements.txt
+              cd my_proxy_client
+              pyinstaller '"$PYINSTALLER_ARGS"' --strip my_proxy.py
+              chown -R "${HOST_UID}:${HOST_GID}" dist build my_proxy.spec
+            '
 
       - name: Rename artifact
         working-directory: my_proxy_client
-        shell: bash
         run: |
-          mv dist/${{ matrix.artifact_name }} dist/${{ matrix.asset_name }}
+          set -euo pipefail
+          case "${{ matrix.asset_name }}" in
+            *.exe) mv dist/my_proxy.exe "dist/${{ matrix.asset_name }}" ;;
+            *)     mv dist/my_proxy     "dist/${{ matrix.asset_name }}" ;;
+          esac
 
-      - name: Upload Release Asset
-        uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Smoke test packaged binary (--help)
+        working-directory: my_proxy_client
+        run: './dist/${{ matrix.asset_name }} --help'
+
+      # The smoke harness lives in scripts/ (pure stdlib) so CI and local runs
+      # share one implementation instead of a large inline heredoc.
+      - name: Packaged client offline/detached smoke
+        env:
+          LINKPULSE_SMOKE_BINARY: ${{ github.workspace }}/my_proxy_client/dist/${{ matrix.asset_name }}
+        run: python scripts/smoke_packaged_client.py "$LINKPULSE_SMOKE_BINARY"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
-          files: my_proxy_client/dist/${{ matrix.asset_name }}
+          name: ${{ matrix.asset_name }}
+          path: my_proxy_client/dist/${{ matrix.asset_name }}
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums and release manifest
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          cp artifacts/* release/
+          cd release
+          sha256sum my_proxy-linux-amd64 my_proxy-darwin-arm64 \
+            my_proxy-windows-amd64.exe > CHECKSUMS.sha256
+          cat CHECKSUMS.sha256
+          python3 - <<'PY'
+          import datetime, hashlib, json, os
+
+          files = [
+              "my_proxy-linux-amd64",
+              "my_proxy-darwin-arm64",
+              "my_proxy-windows-amd64.exe",
+          ]
+
+          def sha256(path):
+              digest = hashlib.sha256()
+              with open(path, "rb") as fh:
+                  for chunk in iter(lambda: fh.read(1 << 20), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          manifest = {
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "release": os.environ["GITHUB_REF_NAME"],
+              "commit": os.environ["GITHUB_SHA"],
+              "workflow_run": os.environ["GITHUB_RUN_ID"],
+              "generated_at": datetime.datetime.now(datetime.timezone.utc)
+                                       .strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "python": "3.11",
+              "pyinstaller": "6.11.1",
+              "linux_build_image": "python:3.11.13-slim-bullseye@sha256:9e25f400253a5fa3191813d6a67eb801ca1e6f012b3bd2588fa6920b59e3eba6",
+              "artifacts": [
+                  {"name": name, "sha256": sha256(name), "size": os.path.getsize(name)}
+                  for name in files
+              ],
+          }
+          with open("RELEASE-MANIFEST.json", "w") as fh:
+              json.dump(manifest, fh, indent=2)
+              fh.write("\n")
+          PY
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2.6.2
+        with:
+          files: |
+            release/my_proxy-linux-amd64
+            release/my_proxy-darwin-arm64
+            release/my_proxy-windows-amd64.exe
+            release/CHECKSUMS.sha256
+            release/RELEASE-MANIFEST.json
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

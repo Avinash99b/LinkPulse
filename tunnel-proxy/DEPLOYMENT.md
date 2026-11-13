@@ -1,199 +1,232 @@
-# Deployment Guide for Tunnel Proxy
+# Deployment Guide — LinkPulse Server
 
-This document describes how to deploy the tunnel proxy server using Docker.
+Deploy `tunnel-proxy` as a single container or a direct Python process. There
+is no nginx/HAProxy/supervisord layer: `proxy_server.py` binds every public
+port and terminates HTTPS itself.
 
-## Architecture Overview
+## What gets exposed
 
-A single container runs three processes under supervisord. **Two public ports are exposed:**
+| Port | Purpose |
+|------|---------|
+| 80 | `/health`, apex→HTTPS redirect, HTTP tunnels |
+| 443 | HTTPS tunnels + dashboard |
+| 9000 | Control channel for clients (raw TCP unless `CONTROL_TLS=true`) |
+| 20000–20100/tcp | Raw TCP tunnels (default pool; one port per tunnel) |
+| 20000–20100/udp | Raw UDP tunnels (default pool) |
 
-- **Port 80** — HTTP (tunnels + dashboard) via HAProxy → nginx http
-- **Port 9000** — Control channel (raw TCP) via nginx stream → proxy_server
+HTTP tunnels share 80/443 via the `Host` header; only TCP/UDP tunnels consume a
+dedicated port. Change the range with `TCP_PORT_MIN/MAX` and
+`UDP_PORT_MIN/MAX` — and publish exactly that range.
 
-```
-:80  (haproxy) ──────────────────────────── HTTP tunnels + dashboard
-  │  HTTP only (no protocol sniffing)
-  └─ → nginx http :8088
-        ├─ /dashboard/, /api/ → dashboard :8081
-        └─ everything else     → proxy_server :8080 (tunnel HTTP)
-
-:9000 (nginx stream) ───────────────────── Control channel (client connection)
-  │  raw TCP, no TLS
-  └─ → proxy_server :9001 (control channel)
-```
-
-**Why two ports?** Render (and most cloud platforms) terminate HTTPS at the edge and forward **HTTP** to the container. The control channel is a raw TCP protocol (`TN` magic bytes) that can't ride over HTTP/HTTPS. Separate port 9000 keeps the control channel as raw TCP while port 80 handles HTTP traffic.
-
-## Quick Start
-
-### 1. Create `.env` file
-
-Copy `.env.example` to `.env` and fill in your values:
+## 1. Prepare configuration
 
 ```bash
 cp .env.example .env
-# Edit .env with your values
 ```
 
-**Required variables:**
-- `SHARED_SECRET` - Generate with: `openssl rand -hex 32`
-- `WILDCARD_DOMAIN` - Your wildcard domain (e.g., `tunnel.example.com`)
+Required:
 
-All other settings have sensible defaults and don't need to be set.
+| Variable | Notes |
+|----------|-------|
+| `SHARED_SECRET` | `openssl rand -hex 32` |
+| `WILDCARD_DOMAIN` | Apex domain; apex and `*.<domain>` must resolve here |
+| `DASHBOARD_PASSWORD` | Long, unique password (minimum 8 characters) |
+| `JWT_SECRET` | `openssl rand -hex 32` (minimum 32 characters) |
 
-### 2. Build and run
+Certbot (DNS challenge) additionally needs `DNS_PROVIDER`, that provider's
+credentials (Cloudflare: `CF_API_TOKEN`) and `CERTBOT_EMAIL`.
+
+The server validates required values before opening listeners and fails on
+missing/placeholder secrets. Without a usable certificate it also fails unless
+you explicitly choose `HTTP_ONLY=true`, `EXTERNAL_SSL=true`, or
+`ALLOW_HTTP_FALLBACK=true`.
+
+## 2. Build
 
 ```bash
-# Build the single container
 docker build -t tunnel-proxy .
+```
 
-# Run - ports 80 (HTTP) and 9000 (control) exposed
-docker run -d \
-  --name tunnel-proxy \
-  -p 80:80 \
-  -p 9000:9000 \
+The image pins the Python base and installs certbot and its DNS plugin into the
+same interpreter/environment that renewal uses, so provisioning and cron renew
+cannot disagree about plugin availability. Runtime dependencies are Python
+stdlib plus optional `psutil`.
+
+## 3. Run
+
+### Host networking (recommended on a VPS)
+
+```bash
+docker run -d --name tunnel-proxy --restart unless-stopped \
+  --network host \
+  --cap-add NET_BIND_SERVICE \
+  -e TCP_PORT_MIN=20000 -e TCP_PORT_MAX=20100 \
+  -e UDP_PORT_MIN=20000 -e UDP_PORT_MAX=20100 \
   --env-file .env \
-  -v tunnel-proxy-data:/data \
-  -v tunnel-proxy-logs:/var/log/tunnel-proxy \
+  -v /data:/data -v /var/log/tunnel-proxy:/var/log/tunnel-proxy \
   tunnel-proxy
 ```
 
-### 3. Verify deployment
+The container binds 80/443/9000 and the whole tunnel range directly; `-p` is
+unnecessary and ignored. Pass `--cap-add NET_BIND_SERVICE` so the unprivileged
+server can bind ports 80/443 under any Docker configuration. Open those ports
+on the host and in the cloud security list/NSG. Host networking avoids one
+Docker NAT rule + userland proxy process per published port, which matters on
+small (1 vCPU) instances.
+
+### Bridge networking (small ranges only)
 
 ```bash
-# Check logs
+docker run -d --name tunnel-proxy --restart unless-stopped \
+  -p 80:80 -p 443:443 -p 9000:9000 \
+  -p 20000-20100:20000-20100 \
+  -p 20000-20100:20000-20100/udp \
+  -e TCP_PORT_MIN=20000 -e TCP_PORT_MAX=20100 \
+  -e UDP_PORT_MIN=20000 -e UDP_PORT_MAX=20100 \
+  --env-file .env \
+  -v /data:/data -v /var/log/tunnel-proxy:/var/log/tunnel-proxy \
+  tunnel-proxy
+```
+
+Publish 1:1 only. A port the server can bind inside the container but Docker
+does not publish will appear “ready” and be unreachable from the internet.
+
+### HTTP-only (no certificate / no 443)
+
+```bash
+docker run -d --name tunnel-proxy --restart unless-stopped \
+  -p 80:80 -p 9000:9000 \
+  -e HTTP_ONLY=true \
+  --env-file .env \
+  -v /data:/data -v /var/log/tunnel-proxy:/var/log/tunnel-proxy \
+  tunnel-proxy
+```
+
+The dashboard then binds `DASHBOARD_HOST:DASHBOARD_PORT` (loopback by
+default). Publish it through your own authenticated reverse proxy if needed.
+
+### External TLS termination
+
+Set `EXTERNAL_SSL=true` to skip certbot, and terminate TLS in a front proxy
+that forwards to the server's HTTP listener. Keep the control channel on 9000
+(or configure control TLS). Ensure the public URL scheme the server advertises
+(`HTTP_ONLY` vs HTTPS) matches what clients will actually reach.
+
+### Direct Python run (development)
+
+```bash
+SHARED_SECRET=... WILDCARD_DOMAIN=... \
+DASHBOARD_PASSWORD=... JWT_SECRET=... \
+HTTP_ONLY=true HTTP_PORT=8080 HTTPS_PORT=8443 DASHBOARD_PORT=8081 \
+python3 proxy_server.py
+```
+
+## 4. Certificates and renewal
+
+- `entrypoint.sh` runs as root only for initialization: create/chown `/data`
+  and `/var/log/tunnel-proxy`, provision the wildcard certificate with certbot (DNS
+  challenge), install a root-owned renewal cron entry, then `exec` the server
+  as the unprivileged `tunnelproxy` user.
+- Certificates live in `/data/letsencrypt` (`/etc/letsencrypt` is a symlink),
+  so rebuilding the container reuses them.
+- Renewal is a separate root-owned cron job running a wrapper that invokes the
+  pinned `/opt/venv/bin/certbot` (the same interpreter that installed the
+  plugins); it is not a background task of `proxy_server.py`. Renewed
+  certificates are reloaded in place for both public HTTPS and control TLS;
+  changing the configured certificate paths requires a restart.
+- Private keys must not be world-readable. The container keeps certificate
+  directories traversable and key files at root:`tunnelproxy` mode 0640 so the
+  unprivileged server can read them without exposing them to all users.
+- If provisioning fails, startup fails. Do not rely on a silent HTTP fallback;
+  `ALLOW_HTTP_FALLBACK=true` is an explicit operator decision.
+
+## 5. Verify
+
+```bash
 docker logs -f tunnel-proxy
 
-# Test health endpoint (via haproxy -> nginx)
-curl http://localhost/health
+# /health always returns 200, including when apex HTTPS redirect is enabled
+curl -si http://localhost/health | head -1
 
-# Test dashboard (via haproxy -> nginx -> dashboard)
-curl -i http://localhost/dashboard/  # login screen only; dashboard data requires password login
+# Unauthenticated dashboard stats must be rejected
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8081/api/stats   # 401
+
+# Certificate (when HTTPS is enabled)
+openssl s_client -connect localhost:443 -servername "$WILDCARD_DOMAIN" </dev/null 2>/dev/null \
+  | openssl x509 -noout -subject -dates
 ```
 
-## Environment Variables
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `SHARED_SECRET` | **Yes** | - | Authentication secret (generate with `openssl rand -hex 32`) |
-| `WILDCARD_DOMAIN` | **Yes** | - | Wildcard domain for tunnels (e.g., `tunnel.example.com`) |
-| `DASHBOARD_PASSWORD` | **Yes for dashboard** | - | Password required to unlock dashboard |
-| `JWT_SECRET` | **Yes for dashboard** | - | High-entropy HS256 JWT signing secret |
-| `CONTROL_HOST` | No | `0.0.0.0` | Control channel bind host |
-| `CONTROL_PORT` | No | `9001` | Control channel port (internal; nginx stream fronts it at `:9000`) |
-| `HTTP_HOST` | No | `0.0.0.0` | HTTP server bind host |
-| `HTTP_PORT` | No | `8080` | HTTP server port |
-| `TCP_PORT_MIN` | No | `20000` | TCP port range minimum |
-| `TCP_PORT_MAX` | No | `20100` | TCP port range maximum |
-| `DASHBOARD_HOST` | No | `127.0.0.1` | Standalone dashboard bind host (loopback only by default) |
-| `DASHBOARD_PORT` | No | `8081` | Dashboard port |
-| `HTTP_ONLY` | No | `true` | Use http:// URLs |
-| `HEARTBEAT_INTERVAL` | No | `20` | Heartbeat interval (seconds) |
-| `HEARTBEAT_TIMEOUT` | No | `60` | Heartbeat timeout (seconds) |
-| `STALE_GRACE_SECONDS` | No | `300` | Stale client cleanup grace |
-| `DB_PATH` | No | `/data/tunnel_proxy.db` | SQLite database path |
-| `LOG_LEVEL` | No | `INFO` | Logging level |
-| `LOG_FILE` | No | `/var/log/tunnel-proxy/tunnel_proxy.log` | Log file path |
-
-**`SHARED_SECRET` and `WILDCARD_DOMAIN` are required for the tunnel service. Set both `DASHBOARD_PASSWORD` and `JWT_SECRET`; the panel fails closed if either is unset. Generate `JWT_SECRET` with `openssl rand -hex 32`. Dashboard JWT sessions persist for 31 days. API clients may authenticate with `Authorization: Bearer <JWT>`. Use HTTPS whenever the dashboard is reachable beyond localhost.**
-
-> In the container, `CONTROL_PORT` is set to `9001` so that nginx's stream module (listening on `:9000`) can front the control channel. Do not change it back to `9000` in `.env` — that would collide with nginx's listener.
-
-## Render Deployment
-
-### Manual Render setup
-
-1. Create a new Web Service
-2. Use Docker runtime with `Dockerfile`
-3. Set plan to **Starter** (512MB RAM, 0.5 CPU)
-4. Add **required** environment variables:
-   - `SHARED_SECRET`
-   - `WILDCARD_DOMAIN`
-  - `DASHBOARD_PASSWORD` (long, unique secret)
-  - `JWT_SECRET` (random signing key, e.g. `openssl rand -hex 32`)
-5. Add persistent disk at `/data` (1GB)
-6. Set **Ports** to `80` (HTTP) and `9000` (TCP control channel)
-7. Deploy
-
-**Note:** Render handles HTTPS termination automatically on port 443 and forwards HTTP to container port 80. The control channel uses a separate TCP port (9000) which Render exposes as a TCP load balancer target. Point `*.yourdomain` and `yourdomain` at the service.
-
-## Resource Optimization
-
-The server is optimized for low-resource environments:
-
-- **Memory**: ~50-100MB base, +~10MB per 1000 active connections
-- **CPU**: Single-threaded asyncio, minimal overhead
-- **Connection limits**: Configurable via `INITIAL_WINDOW` (256KB per stream)
-
-### Recommended limits for Render (512MB, 0.5 vCPU):
-
-```yaml
-deploy:
-  resources:
-    limits:
-      cpus: '0.5'
-      memory: 512M
-    reservations:
-      cpus: '0.1'
-      memory: 256M
-```
-
-## SSL/TLS
-
-**HTTPS termination is handled externally** (Render, Cloudflare, or your own reverse proxy). The container runs HTTP only on port 80. The control channel uses raw TCP on port 9000 (no TLS). No SSL certificates, Let's Encrypt, or certbot needed.
-
-## Monitoring
-
-- Dashboard: `https://your-domain/dashboard/` (requires `DASHBOARD_PASSWORD` and `JWT_SECRET`)
-- Stats API: `/api/stats` (requires a valid dashboard session; no wildcard CORS)
-- Health: `http://your-server:80/health`
-
-## Client Usage
+Then start a client:
 
 ```bash
-# Using the reference client
-python3 examples/reference_client.py \
-  --server your-server:9000 \
-  --secret your-shared-secret \
-  --local-http 127.0.0.1:3000 \
-  --subdomain myapp
+python3 ../my_proxy_client/my_proxy.py http 3000 \
+  --server "$WILDCARD_DOMAIN:9000" --token "$SHARED_SECRET" -u myapp
+curl -I "https://myapp.$WILDCARD_DOMAIN/"
 ```
 
-> Point the client at **port 9000** for the control channel. HTTP tunnels are automatically available on port 80 (via your HTTPS front).
+## 6. Rollback and redeploy
 
-Your app will be available at `https://myapp.tunnel.example.com` (via your HTTPS-terminating front).
+`startup.sh` can do the mechanical part:
+
+```bash
+./startup.sh --action redeploy --mode 4 --range 20000-20100 --yes
+./startup.sh --action rebuild  --mode 4 --range 20000-20100 --yes
+```
+
+Behaviour:
+
+- Builds the new image **before** touching the running container.
+- Keeps the previous container (stopped/renamed as a backup) until the new one
+  passes its health check.
+- On failure, removes the failed container and restores the previous container
+  with its **exact original configuration** (ports, environment, mounts,
+  network mode), not merely the previous image with defaults.
+- `--yes`/`-y` makes redeploy non-interactive; `--no-rebuild` skips the build;
+  invalid `--action`/`--mode`/range values are rejected before changes.
+- The helper does not delete persistent data under `/data`.
+
+Manual rollback:
+
+```bash
+docker stop tunnel-proxy && docker rename tunnel-proxy tunnel-proxy-failed
+docker start <previous-container-name>
+```
+
+## Platform notes
+
+### HTTP-only PaaS
+
+A platform that forwards HTTP/HTTPS to the container can serve HTTP tunnels
+**only if clients can also reach the raw TCP control port** (default 9000).
+The control channel cannot ride over HTTP, so an HTTP-only platform still
+needs a public raw TCP port or another path to 9000 (for example a VPN). If
+neither is available, the deployment is unsupported. Raw TCP/UDP tunnels
+additionally require public raw ports (or a range) forwarded unchanged, which
+most HTTP PaaS platforms do not provide. **Do not promise TCP/UDP tunnels on
+such a platform**; use a VPS with a public IP for those.
+
+### Oracle Cloud / other clouds
+
+Open the ports in both the host firewall and the VCN security list / NSG.
+Docker bridge-published ports bypass the host `INPUT` chain via Docker's own
+rules, but host networking and direct runs do not.
 
 ## Troubleshooting
 
-### Check logs
+| Symptom | Check |
+|---------|-------|
+| Startup exits on `SHARED_SECRET`/`WILDCARD_DOMAIN` | Set real values; placeholders are rejected |
+| Startup exits on certificates | DNS apex + wildcard, provider plugin/credentials, key readability; or set `HTTP_ONLY`/`EXTERNAL_SSL`/`ALLOW_HTTP_FALLBACK` |
+| `Authentication failed: invalid signature` | Client token ≠ `SHARED_SECRET` |
+| HTTP tunnel 404 | Wrong subdomain, or the name is unknown |
+| HTTP tunnel 503 + `Retry-After: 2` | Client dropped and the reconnect wait expired/queue was full |
+| TCP/UDP tunnel ready but unreachable | Port not published or blocked; range mismatch |
+| Dashboard refuses to start | `DASHBOARD_PASSWORD`/`JWT_SECRET` missing or placeholder; startup validation fails |
+| Dashboard 429 | Login throttled (5 attempts/60 s) |
+| Container unhealthy during startup | Too many published ports on a small host; use host networking / a small range |
+
 ```bash
-docker logs -f tunnel-proxy
-# Inside the container:
-docker exec tunnel-proxy cat /var/log/nginx/error.log
-docker exec tunnel-proxy cat /var/log/supervisor/haproxy.err.log
+docker top tunnel-proxy
 docker exec tunnel-proxy cat /var/log/tunnel-proxy/tunnel_proxy.log
-```
-
-### Verify process status inside the container
-```bash
-docker exec tunnel-proxy ps aux | grep -E "haproxy|nginx|python"
-```
-
-### Verify connectivity
-```bash
-# Test control channel (client connects to :9000)
-python3 examples/reference_client.py --server your-server:9000 --secret ... --local-http 127.0.0.1:3000
-
-# Test HTTP routing
-curl -H "Host: test.tunnel.example.com" http://your-server:80
-```
-
-### Control channel not working?
-- Confirm the client is connecting to **port 9000** (nginx stream), not 80
-- Confirm nginx stream is running: `docker exec tunnel-proxy ss -tlnp | grep 9000`
-- The magic is the first 2 bytes `"TN"` (0x544e)
-
-### Database issues
-```bash
-# Check database
-docker exec tunnel-proxy sqlite3 /data/tunnel_proxy.db ".tables"
+docker logs --tail 100 tunnel-proxy
 ```
