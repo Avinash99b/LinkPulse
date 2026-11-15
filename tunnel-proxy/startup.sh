@@ -9,12 +9,15 @@
 # Usage:
 #   ./startup.sh                                    interactive
 #   ./startup.sh --action restart                   restart the running container
+#   ./startup.sh --action update --yes              rebuild, keep existing config
+#   IMAGE=tunnel-proxy:new ./startup.sh --action update --no-rebuild --yes
 #   ./startup.sh --action redeploy --mode 3 --range 20000-20100 --yes
 #   ./startup.sh --action rebuild  --mode 3 --range 20000-20100 --yes
 #   ./startup.sh --help
 #
 # Actions (asked interactively when omitted):
 #   restart   restart the existing container as-is (fastest, config unchanged)
+#   update    rebuild/use a new image with the existing container configuration
 #   redeploy  replace the container with a chosen port/protocol layout
 #   rebuild   rebuild the image from source, then redeploy
 #   direct    stop the container and run proxy_server.py in the foreground
@@ -30,8 +33,8 @@
 #
 # Non-interactive use: pass --yes. With --yes every prompt is answered with its
 # default (restart if a container exists, otherwise redeploy; mode 3;
-# range $DEFAULT_RANGE; no rebuild unless the image is missing). Missing option
-# values are rejected instead of consuming the next argument.
+# range $DEFAULT_RANGE; no rebuild unless the image is missing or action=update).
+# Missing option values are rejected instead of consuming the next argument.
 #
 # Tunables (environment):
 #   ENV_FILE          .env file (default .env) -- parsed, never executed by the
@@ -45,6 +48,8 @@
 #   CONTAINER_CPUS    --cpus value   (default 0.5;  "none" or "" disables)
 #   BIND_IP           host IP to publish ports on (default "" -> all interfaces)
 #
+# Update requires an existing container and a local Unix-socket Docker daemon.
+# It ignores .env and deployment tunables; --no-rebuild uses IMAGE as-is.
 # The script never prints secrets from .env.
 
 set -uo pipefail
@@ -84,6 +89,8 @@ IS_ORACLE=""
 DOCKER_OK=""
 REPLACE_BACKUP=""
 REPLACE_STOPPED=0
+UPDATE_CONFIG=""
+BIND_OPTION=""
 
 # ---------------------------------------------------------------- helpers ---
 
@@ -95,7 +102,7 @@ die() { printf '%s %s\n' "$(c "$RED" "error:")" "$*" >&2; exit 1; }
 ok() { printf '%s %s\n' "$(c "$GRN" "ok:")" "$*"; }
 
 usage() {
-  sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,/^set -uo pipefail/{ /^set -uo pipefail/d; s/^# \{0,1\}//; p; }' "$SCRIPT_DIR/startup.sh"
   exit 0
 }
 
@@ -392,6 +399,7 @@ choose_action() {
   4) Stop the container and run directly (foreground, for debugging)
   5) Stop the container
   6) Show status and recent logs, then exit
+  7) Update image, keep configuration rebuild without changing ports/env/mounts
 EOF
     local choice
     read -rp "Choose [1]: " choice
@@ -402,6 +410,7 @@ EOF
       4) ACTION=direct ;;
       5) ACTION=stop ;;
       6) ACTION=status ;;
+      7) ACTION=update ;;
       *) die "invalid choice '${choice}'" ;;
     esac
   else
@@ -523,6 +532,12 @@ container_health() {
 }
 
 http_health_ok() {
+  if [ "$ACTION" = update ]; then
+    # Probe inside the replacement using its saved env, not the current .env or
+    # an unrelated HTTP listener on the host. Also works with custom mappings.
+    docker exec "$CONTAINER" python3 -c 'import os,urllib.request; urllib.request.urlopen("http://%s:%s/health" % (os.environ.get("HEALTHCHECK_HOST", "127.0.0.1"), os.environ.get("HTTP_PORT", "80")), timeout=4).read()' >/dev/null 2>&1
+    return $?
+  fi
   local port
   port=$(env_get HTTP_PORT); port=${port:-80}
   curl -fsS --max-time 4 "http://127.0.0.1:${port}/health" >/dev/null 2>&1
@@ -619,8 +634,10 @@ on_exit() {
 
 deploy_docker() {
   [ -n "$DOCKER_OK" ] || die "docker is not usable here"
-  validate_env_file
-  validate_paths
+  if [ "$ACTION" != update ]; then
+    validate_env_file
+    validate_paths
+  fi
 
   local args=(-d --name "$CONTAINER" --restart unless-stopped)
   local tcp="" udp=""
@@ -685,8 +702,8 @@ deploy_docker() {
     echo "  old container preserved as $backup"
   fi
 
-  if ! docker run "${args[@]}" >/dev/null; then
-    warn "docker run failed"
+  if ! start_replacement "${args[@]}"; then
+    warn "could not start the replacement container"
     trap - EXIT
     if [ -n "$REPLACE_BACKUP" ]; then
       restore_backup "$REPLACE_BACKUP" || warn "manual recovery needed: previous container is '$REPLACE_BACKUP'"
@@ -708,7 +725,39 @@ deploy_docker() {
   fi
 
   clear_backup
-  open_firewall "$tcp" "$udp"
+  [ "$ACTION" = update ] || open_firewall "$tcp" "$udp"
+}
+
+start_replacement() {
+  if [ "$ACTION" = update ]; then
+    # The payload stays in memory, not a temporary file or process arguments.
+    # Never print it: Config.Env can contain credentials.
+    printf '%s' "$UPDATE_CONFIG" | python3 "$SCRIPT_DIR/redeploy_config.py" create "$CONTAINER" \
+      || return 1
+    docker start "$CONTAINER" >/dev/null
+  else
+    docker run "$@" >/dev/null
+  fi
+}
+
+update_container() {
+  [ -z "$MODE$RANGE$BIND_OPTION" ] || die "update keeps existing configuration; --mode, --range and --bind cannot be used"
+  docker info >/dev/null 2>&1 || die "docker is not usable here"
+  DOCKER_OK=1
+  docker inspect "$CONTAINER" >/dev/null 2>&1 \
+    || die "update requires an existing '$CONTAINER' container; use redeploy for a first deployment"
+  # Unlike redeploy, update rebuilds by default, including with --yes.
+  [ -n "$NO_REBUILD" ] || REBUILD=1
+  maybe_build
+  say "Preparing $IMAGE with the configuration saved in $CONTAINER (not $ENV_FILE)"
+  UPDATE_CONFIG=$(python3 "$SCRIPT_DIR/redeploy_config.py" prepare "$CONTAINER" "$IMAGE") \
+    || die "could not prepare the saved configuration (the existing container was left untouched)"
+  deploy_docker
+  UPDATE_CONFIG=""
+  say "Updated $CONTAINER"
+  printf '  %-12s %s\n' "image" "$IMAGE"
+  echo "  environment, command, mounts, networking and resource settings preserved"
+  docker port "$CONTAINER" 2>/dev/null | sed 's/^/  /' || true
 }
 
 run_direct() {
@@ -815,7 +864,7 @@ summary() {
 while [ $# -gt 0 ]; do
   case "$1" in
     --action)
-      [ $# -ge 2 ] || die "--action requires a value (restart|redeploy|rebuild|direct|stop|status)"
+      [ $# -ge 2 ] || die "--action requires a value (restart|update|redeploy|rebuild|direct|stop|status)"
       ACTION=$2; shift 2 ;;
     --mode)
       [ $# -ge 2 ] || die "--mode requires a value (1-5)"
@@ -825,7 +874,7 @@ while [ $# -gt 0 ]; do
       RANGE=$2; shift 2 ;;
     --bind)
       [ $# -ge 2 ] || die "--bind requires a host IP"
-      BIND_IP=$2; shift 2 ;;
+      BIND_IP=$2; BIND_OPTION=1; shift 2 ;;
     --rebuild) REBUILD=1; shift ;;
     --no-rebuild) NO_REBUILD=1; shift ;;
     -y|--yes) ASSUME_YES=1; shift ;;
@@ -837,21 +886,21 @@ while [ $# -gt 0 ]; do
 done
 
 [ -z "$MODE" ] || [[ "$MODE" =~ ^[1-5]$ ]] || die "--mode must be 1-5"
-[ -z "$ACTION" ] || [[ "$ACTION" =~ ^(restart|redeploy|rebuild|direct|stop|status)$ ]] \
-  || die "--action must be restart, redeploy, rebuild, direct, stop or status"
+[ -z "$ACTION" ] || [[ "$ACTION" =~ ^(restart|update|redeploy|rebuild|direct|stop|status)$ ]] \
+  || die "--action must be restart, update, redeploy, rebuild, direct, stop or status"
 [ "$ACTION" = "rebuild" ] && REBUILD=1
 # Mode 5 is the legacy shorthand for "run directly".
 [ "$MODE" = "5" ] && [ -z "$ACTION" ] && ACTION=direct
 
-validate_bind_ip
-
-detect
+[ "$ACTION" = update ] || detect
 choose_action
+[ "$ACTION" = update ] || validate_bind_ip
 
 case "$ACTION" in
   status) show_status; exit 0 ;;
   stop) stop_container; exit 0 ;;
   restart) restart_container; summary; exit 0 ;;
+  update) update_container; exit 0 ;;
   direct) choose_mode; pick_range; run_direct ;;
 esac
 

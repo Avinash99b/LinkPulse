@@ -173,6 +173,35 @@ curl -I "https://myapp.$WILDCARD_DOMAIN/"
 ./startup.sh --action rebuild  --mode 4 --range 20000-20100 --yes
 ```
 
+To rebuild from the current sources and replace an existing container **without
+changing its configuration**, use:
+
+```bash
+./startup.sh --action update --yes
+```
+
+Or deploy an image you have already built or pulled:
+
+```bash
+IMAGE=tunnel-proxy:new ./startup.sh --action update --no-rebuild --yes
+```
+
+The interactive menu also offers **Update image, keep configuration**. Update
+reads the existing container's saved Docker configuration, not `.env`: it keeps
+environment values (including secrets), ports/bind addresses, network settings,
+mounts (including existing anonymous volumes), restart policy, resource limits,
+capabilities, sysctls, labels, healthcheck, and entrypoint/command. Image defaults
+for those settings remain as previously configured; use a normal redeploy to
+adopt changed defaults or edited `.env` values. Data in the container's writable
+layer is not copied; persistent data must be in a mount.
+
+Update requires an existing container and access to a **local Unix-socket Docker
+daemon** (including local rootless/custom contexts). Remote SSH/TCP contexts and
+auto-remove containers are refused before stopping the existing container.
+`--mode`, `--range` and `--bind` cannot be combined with update, and deployment
+tunables such as `DATA_DIR` and `CONTAINER_MEMORY` do not override saved settings.
+Both deployment paths retain the same health-check and rollback behavior.
+
 Behaviour:
 
 - Builds the new image **before** touching the running container.
