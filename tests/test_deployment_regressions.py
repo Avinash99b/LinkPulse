@@ -57,6 +57,12 @@ def test_entrypoint_has_valid_bash_syntax():
     assert result.returncode == 0, result.stderr
 
 
+def test_entrypoint_fixes_ownership_of_existing_logs_and_databases():
+    text = ENTRYPOINT.read_text()
+    assert 'find "$LOG_DIR" -maxdepth 1 -type f -exec chown "$SERVER_USER:$SERVER_GROUP"' in text
+    assert 'find /data -maxdepth 1 -name \'tunnel_proxy.db*\' -exec chown "$SERVER_USER:$SERVER_GROUP"' in text
+
+
 def test_entrypoint_drops_privileges_to_unprivileged_user():
     text = ENTRYPOINT.read_text()
     assert "setpriv" in text, "entrypoint must drop privileges with setpriv"

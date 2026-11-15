@@ -149,6 +149,19 @@ install -d -o "$SERVER_USER" -g "$SERVER_GROUP" -m 0750 /data "$LOG_DIR"
 install -d -o root -g "$SERVER_GROUP" -m 0750 "$DATA_LE_DIR"
 install -d -o root -g root -m 0700 /var/lib/letsencrypt
 
+# Ensure runtime user can write to existing application logs and databases
+# if they were created by root or under a different UID in an earlier run.
+if [ -d "$LOG_DIR" ]; then
+    chown "$SERVER_USER:$SERVER_GROUP" "$LOG_DIR" 2>/dev/null || true
+    find "$LOG_DIR" -maxdepth 1 -type f -exec chown "$SERVER_USER:$SERVER_GROUP" {} + 2>/dev/null || true
+    find "$LOG_DIR" -maxdepth 1 -type f -exec chmod u+rw {} + 2>/dev/null || true
+fi
+if [ -d /data ]; then
+    chown "$SERVER_USER:$SERVER_GROUP" /data 2>/dev/null || true
+    find /data -maxdepth 1 -name 'tunnel_proxy.db*' -exec chown "$SERVER_USER:$SERVER_GROUP" {} + 2>/dev/null || true
+    find /data -maxdepth 1 -name 'tunnel_proxy.db*' -exec chmod u+rw {} + 2>/dev/null || true
+fi
+
 # --------------------------------------------------- cert store relocation ---
 # Keep the certbot store on the persistent volume. This function never deletes
 # data: a pre-existing image directory is migrated (and moved aside, not
