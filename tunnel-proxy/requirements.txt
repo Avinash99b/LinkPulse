@@ -1,13 +1,19 @@
 # proxy_server.py itself uses only the Python standard library
-# (asyncio, ssl, sqlite3, struct, json, ...) so this file is intentionally
-# almost empty.
+# (asyncio, ssl, sqlite3, struct, json, ...) so this file stays deliberately
+# small.
 
-# Optional: enables CPU/RAM figures on the dashboard. If not installed,
-# the dashboard simply omits those two fields.
-psutil>=5.9
+# Optional: enables the CPU/RAM figures on the dashboard. If it is not
+# installed, the dashboard simply omits those two fields.
+#
+# Pinned for reproducible Docker builds; 6.1.1 ships an abi3 manylinux2014
+# x86_64 wheel that installs cleanly on the python:3.11.13-slim-bookworm
+# image used by tunnel-proxy/Dockerfile (pinned there by digest).
+psutil==6.1.1
 
 # Not a pip package: certificate issuance/renewal is delegated to the
 # `certbot` CLI tool (see README.md "Install certbot" section), plus
 # whichever `certbot-dns-<provider>` plugin matches your DNS host, e.g.:
 #   pip install certbot certbot-dns-cloudflare
 #   pip install certbot certbot-dns-route53
+#
+# certbot is installed by the Dockerfile (deployment concern), not from here.

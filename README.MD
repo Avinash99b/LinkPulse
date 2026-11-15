@@ -1,587 +1,296 @@
 # LinkPulse
 
-**A production-ready, self-hosted tunneling system for exposing local services on the public internet without dependencies on third-party SaaS.**
+Self-hosted tunneling (an ngrok alternative): expose local HTTP, TCP and UDP
+services through your own server, over one persistent authenticated connection.
 
-Expose your laptop, home server, or internal service on a public URL — HTTP tunnels with automatic wildcard SSL, or raw TCP ports — all multiplexed over a single persistent, authenticated connection. No ngrok subscription, no monthly fees, no data collection. Just you, your infrastructure, and a clean protocol.
+- **Server** — `tunnel-proxy/proxy_server.py`, Python asyncio. Binds public
+  HTTP/HTTPS/control ports and one listener per raw TCP/UDP tunnel, and stores
+  bookkeeping (not routing state) in SQLite.
+- **Client** — `my_proxy_client/my_proxy.py`, also stdlib-only asyncio. One
+  process can expose one service or several tunnels from a JSON config.
+
+Everything routes through a single binary-framed, multiplexed control
+connection. There is no external service in the data path (SQLite plus local
+files only).
 
 ```
-Your local service (port 8080)
-       ↓
-  ┌─────────────────────────┐
-  │   LinkPulse Client      │  (my_proxy)
-  │ (1,098 lines, zero deps)│
-  └─────────────────────────┘
-       ↑ single authenticated
-       │ multiplexed connection
-       ↓ (binary framed protocol)
-  ┌─────────────────────────┐
-  │  LinkPulse Server       │  (proxy_server.py)
-  │(~1,900 lines, stdlib)   │
-  └─────────────────────────┘
-       ↓
-   Public internet
-   https://yourapp.forwarding.example.com
-   tcp://yourhost:20022 (SSH)
+local service :8080 ── client ── one authenticated, multiplexed TCP connection ── server ── internet
+                                                                 https://app.example.com
+                                                                 tcp://example.com:20022
 ```
 
-## What's included
+## Requirements
 
-| Component | Size | Purpose | Language |
-|-----------|------|---------|----------|
-| **Server** (`tunnel-proxy/`) | 44 KB zip | Route public traffic to clients, manage tunnels, serve dashboard | Python (stdlib only) |
-| **Client** (`my_proxy_client/`) | 30 KB zip | Expose local services, multiplex over one connection | Python (stdlib only) |
+- Python **3.11 recommended** (the version used by the Docker image). The test
+  suite has been run locally on Python 3.12.13; Python 3.9–3.10 are not
+  verified here, and hosted CI is configured but not claimed as proof in this
+  document.
+- A wildcard DNS record: `<domain>` and `*.<domain>` must resolve to the server.
+- Docker (recommended for the server) or a direct Python run for development.
+- No Python package dependencies. `psutil` is optional and only adds CPU/RAM
+  figures to the server dashboard.
 
-Each is a complete, standalone system. Both are production-tested and thoroughly documented.
+## Quick start (server)
 
----
-
-## Quick start
-
-### Server (self-hosted on a VPS or dedicated machine)
+The server reads **environment variables only**. It does not accept or parse a
+JSON config file.
 
 ```bash
-# Extract and configure
-unzip tunnel-proxy.zip
 cd tunnel-proxy
-cp config.windows-dev.example.json config.json  # for local testing
-# or cp config.example.json config.json  # for production with Let's Encrypt
-
-# Edit config.json: shared_secret, wildcard_domain, etc.
-python3 proxy_server.py config.json
+cp .env.example .env          # fill in the required values
+docker build -t tunnel-proxy .
+docker run -d --name tunnel-proxy --restart unless-stopped \
+  --network host \
+  --cap-add NET_BIND_SERVICE \
+  --env-file .env \
+  -v /data:/data -v /var/log/tunnel-proxy:/var/log/tunnel-proxy \
+  tunnel-proxy
 ```
 
-Server listens on:
-- **Control channel** (client connections): default `:9000`
-- **HTTP public** (redirect to HTTPS): `:80`
-- **HTTPS public** (routes tunnels): `:443`
-- **Dashboard**: `:8080` (read-only status page)
+`--network host` is recommended on a VPS: it binds 80/443/9000 and the tunnel
+port range directly, with no per-port Docker NAT rules. Pass
+`--cap-add NET_BIND_SERVICE` explicitly so the unprivileged server can bind
+ports 80/443 on any Docker configuration. With bridge networking,
+publish `-p 80:80 -p 443:443 -p 9000:9000` and a **small** range such as
+`-p 20000-20100:20000-20100` (plus `/udp` if you need UDP tunnels). Port 80 is
+still needed for `/health` and the HTTP listener.
 
-### Client (run on your laptop, home server, or CI/CD environment)
+Required values:
+
+| Variable | Purpose |
+|----------|---------|
+| `SHARED_SECRET` | Shared secret every client authenticates with |
+| `WILDCARD_DOMAIN` | Apex domain whose wildcard points at the server |
+| `DASHBOARD_PASSWORD` | Server dashboard login password (min 8 characters) |
+| `JWT_SECRET` | HS256 signing secret for dashboard sessions (min 32 characters) |
+
+The server refuses to start when a required secret is missing or still a
+template placeholder. For local HTTP-only testing set `HTTP_ONLY=true`; you
+then do not need certificates.
+
+Minimal direct run:
 
 ```bash
-# Extract
-unzip my_proxy_client.zip
+cd tunnel-proxy
+SHARED_SECRET="$(openssl rand -hex 32)" \
+WILDCARD_DOMAIN="tunnel.example.com" \
+DASHBOARD_PASSWORD="a-long-password" \
+JWT_SECRET="$(openssl rand -hex 32)" \
+HTTP_PORT=8080 HTTPS_PORT=8443 DASHBOARD_PORT=8081 \
+HTTP_ONLY=true \
+python3 proxy_server.py
+```
+
+`startup.sh` is an optional interactive helper that inspects the machine and
+can build, redeploy, wait for health, and roll back a failed container:
+
+```bash
+./startup.sh --action redeploy --mode 4 --range 20000-20100 --yes
+```
+
+## Quick start (client)
+
+There is nothing to install; run the script (or the packaged `linkpulse`
+binary).
+
+```bash
 cd my_proxy_client
+export MY_PROXY_SERVER=proxy.example.com:9000
+export MY_PROXY_TOKEN='replace-with-shared-secret'
 
-# Expose a local HTTP service (port 8080)
-./my_proxy http 8080 --token <shared-secret> --server proxy.example.com:9000
-
-# Output:
-# Connected to proxy.example.com:9000 (client_id=abc123...)
-# HTTP tunnel ready: https://r8f3d2e1.forwarding.example.com -> localhost:8080
-# Dashboard: http://127.0.0.1:4040
+python3 my_proxy.py http 8080
+python3 my_proxy.py http 8080 -u myapp
+python3 my_proxy.py tcp 22 --remote-port 20022
+python3 my_proxy.py udp 5353
+python3 my_proxy.py start tunnels.json
 ```
 
-Test it:
+`linkpulse` and `my_proxy` in that directory are symlink launchers for the same
+script; use whichever is on your PATH.
+
+Keep a name to yourself with `--lease`; the default `handoff` mode gives a
+contested subdomain/port to the newest claimant.
+
+Detached mode and process management use the `linkpulse` entry point:
+
 ```bash
-curl https://r8f3d2e1.forwarding.example.com/
-```
-
-More examples:
-```bash
-# HTTP tunnel with custom subdomain
-my_proxy http 3000 -u myapp --token secret --server proxy.example.com:9000
-
-# Same, but keep the name to yourself (refuse to share/hand it over)
-my_proxy http 3000 -u myapp --lease --token secret --server proxy.example.com:9000
-
-# Raw TCP tunnel (e.g., SSH)
-my_proxy tcp 22 --token secret --server proxy.example.com:9000
-# Public access: ssh -p 20022 user@proxy.example.com
-
-# Multiple services at once
-my_proxy start config.json --token secret --server proxy.example.com:9000
-
-# Detached / background mode (-d)
-linkpulse http 8080 -d --token secret --server proxy.example.com:9000
-linkpulse tcp 22 -d --token secret --server proxy.example.com:9000
-
-# Manage client processes
+linkpulse http 8080 -d
 linkpulse clients list
 linkpulse clients info <client-id>
 linkpulse clients delete <client-id>
-linkpulse clients clear          # remove idle clients
-linkpulse clients clear -f       # stop and remove ALL clients
+linkpulse clients clear [-f]
 ```
 
----
+`clients list` shows both the machine-wide `CLIENT ID` and the per-process
+`MANAGED ID` (a detached run with no explicit client id uses the same generated
+value for both). `info`/`delete` accept either value or an unambiguous prefix.
+
+The local client dashboard runs at `http://127.0.0.1:4040` (read-only, no auth;
+bind it to loopback unless you trust the network).
+
+## Ports
+
+| Port | Purpose |
+|------|---------|
+| 80 | HTTP `/health`, apex→HTTPS redirect, HTTP tunnels |
+| 443 | HTTPS tunnels and the server dashboard (apex domain) |
+| 9000 | Control channel (raw TCP by default; optional native TLS) |
+| `TCP_PORT_MIN..MAX` | One public port per TCP tunnel (default pool 20000–20100) |
+| `UDP_PORT_MIN..MAX` | One public port per UDP tunnel (default pool 20000–20100) |
+
+HTTP tunnels consume no additional public HTTP port — they share 80/443 via the
+`Host` header — but every tunnel still needs the raw control port 9000.
+Set a small, explicitly published range (for example 20000–20100) for TCP/UDP.
+The server only checks that an allocated port is bindable *inside* the
+container, so the published range and `TCP_PORT_MIN/MAX` (and `UDP_*`) must
+match 1:1.
+
+## TLS
+
+- **Public HTTPS** is terminated by the server with the wildcard certificate.
+  In the container, `entrypoint.sh` (as root) fixes volume ownership and
+  obtains/reuses the certificate via certbot's DNS challenge, then starts
+  `proxy_server.py` as the unprivileged user. Renewal runs from a separate
+  root-only cron wrapper that invokes the pinned `/opt/venv/bin/certbot`; it is
+  not a background task of the server process.
+- `EXTERNAL_SSL=true` skips certbot entirely (put your own TLS terminator in
+  front); `HTTP_ONLY=true` runs without a 443 listener.
+- If certificates cannot be provisioned the server fails at startup rather
+  than silently downgrading. Set `ALLOW_HTTP_FALLBACK=true` only when you
+  explicitly want an HTTP-only run without a certificate.
+- **Control channel TLS** is optional: set `CONTROL_TLS=true`, with
+  `CONTROL_CERT_PATH`/`CONTROL_KEY_PATH` (defaulting to the public
+  certificate). Clients then use `--tls` (or `MY_PROXY_TLS=true`); certificate
+  verification is mandatory, using the system trust store or `--ca-cert`
+  (`MY_PROXY_CA_CERT`). Renewed certificates are reloaded in place for both the
+  public HTTPS listener and control TLS; changing the configured certificate
+  paths still requires a restart.
+
+Without control TLS, HMAC authenticates the client but the control connection
+— including HTTP headers and request/response bodies — is only as private as
+the network path. Use a VPN/WireGuard/SSH tunnel or native control TLS on
+untrusted networks. Public HTTPS protects the browser↔server leg only, not the
+client↔server leg.
+
+## HTTP reconnect waiting
+
+HTTP requests are held only briefly when an HTTP tunnel's client has just
+dropped unexpectedly:
+
+- `HTTP_RECONNECT_GRACE_SECONDS=8` — how long a request may wait.
+  `0` disables waiting (an unknown name is then an immediate 404).
+- `HTTP_RECONNECT_MAX_WAITERS_PER_NAME=16` and
+  `HTTP_RECONNECT_MAX_WAITERS=128` bound queued requests.
+- The server parks the parsed request head and the client socket. It does not
+  accumulate, spool, or replay the request body at the application level.
+  A normal bounded TCP/asyncio receive buffer with backpressure may hold some
+  bytes; there is no unbounded application-level body buffering or replay.
+- Unknown subdomains get `404`. A known name whose wait expires gets
+  `503` with `Retry-After: 2`.
+- An explicit client close or a handoff does not create a wait/reservation.
+  Waiting requests follow the current owner, including a new competitor.
+- A lease lasts only as long as its session and is not extended by waiting.
+- The grace period starts when the server detects the disconnect, which may be
+  later than the physical link died (heartbeat/inactivity detection).
+
+There is **no stream resumption**: a dropped control connection aborts open
+streams, including WebSocket connections and partially uploaded bodies. The
+client retries the control connection and re-registers its tunnels forever.
 
 ## Architecture
 
-### One persistent connection, many tunnels
-
-A single TCP connection between client and server carries all traffic via **multiplexing**:
-- Control plane: tunnel registration, heartbeats, errors
-- Data plane: independent, full-duplex streams for each HTTP request or TCP connection
-- Flow control: per-stream credit-based backpressure (256 KiB windows) — one slow tunnel doesn't starve others
-
-### Binary framed protocol
-
-Simple, efficient wire format (12-byte fixed header + payload):
-- Stream ID distinguishes which tunnel owns each frame
-- HMAC-SHA256 authentication (shared secret, no password sent over wire)
-- Version byte for forward compatibility
-- Designed for clarity: easy to implement in any language
-
-See `PROTOCOL.md` in either project for the full spec.
-
-### Routing
-
-**HTTP tunnels** (Host header–based):
-- Request to `app.forwarding.example.com` → routed to client with that subdomain → forwarded to local backend
-- Transparent: clients can upgrade to WebSocket, use keep-alive, etc.
-
-**TCP tunnels** (port-based):
-- Public port (e.g., `20022`) → routed to client that registered it → forwarded to local backend
-
-**Ownership of a public name** (subdomain or TCP/UDP port):
-- `handoff` (default): the newest client claiming the name wins; the previous owner is told
-  `Tunnel 'x' was handed off to a new client`, stops serving it, and exits if it had nothing else
-- `lease` (`--lease`): the name is reserved to the client that created it; other clients are refused
-  with an explanatory error, and a lease never takes over a name that is already in use
-- Reconnects are not conflicts: the same client process gets its own names back automatically
-
-### Authentication & security
-
-- **Shared secret** (configured in config.json): all clients must know it
-- **HMAC-SHA256 challenge-response**: secret never sent over wire; timestamp + nonce + cryptographic signature
-- **Replay protection**: nonces tracked per connection, timestamps checked
-- **Encrypted data**: use TLS on the control channel (optional, `control.tls: true`), or run over a private network (VPN, WireGuard, SSH tunnel)
-
-No traffic inspection, no logging, no data collection beyond what you configure.
-
-### Reconnect & resilience
-
-If the server or network becomes unavailable:
-- **Client detects disconnect** immediately
-- **Retries forever**: one attempt every `--retry-interval` seconds (default 5s), indefinitely —
-  a sleeping laptop or a server restart heals itself with no manual intervention
-- **`--grace-time`** only controls when retry messages switch from warnings to errors; the client never exits on its own
-- **Persistent identity**: client_id saved locally, re-registers same tunnels on reconnect
-- **Failed registrations are retried**: a name that is in use/leased or an exhausted port range is
-  re-requested every `--retry-interval` seconds until it succeeds
-- **Per-request failure handling**: local backend down? Connection refused, no hang
-
-### Dashboard
-
-Real-time status (read-only, no auth):
-- Connection state, uptime, reconnect count
-- Per-tunnel: type, public URL, local destination, bytes transferred, connection count, average latency
-- Recent log messages
-- Auto-refreshes every 2 seconds
-
-```
-$ curl http://server:8080/api/stats | jq .
-{
-  "status": "connected",
-  "client_id": "abc123...",
-  "uptime_seconds": 3600,
-  "tunnels": [
-    {
-      "type": "http",
-      "status": "active",
-      "public_url": "https://myapp.forwarding.example.com",
-      "local_destination": "localhost:3000",
-      "connections": 42,
-      "bytes_in": 2800000,
-      "bytes_out": 580000,
-      "avg_latency_ms": 12.5
-    }
-  ]
-}
-```
-
----
-
-## Setup guide
-
-### Prerequisites
-
-- **Server machine**: Linux, macOS, or Windows; Python 3.9+
-- **Client machine**: Linux, macOS, or Windows; Python 3.9+
-- **Network**: mutable DNS (wildcard `*.forwarding.example.com` pointing at your server)
-- **TLS certificates**: automatic via Let's Encrypt (production) or self-signed (local dev)
-
-### Server setup (detailed)
-
-1. **Get a domain and point DNS at your server:**
-   ```
-   forwarding.example.com     A record  12.34.56.78  (your server's IP)
-   *.forwarding.example.com  CNAME     forwarding.example.com
-   ```
-
-2. **Install Python 3.9+, extract server:**
-   ```bash
-   unzip tunnel-proxy.zip
-   cd tunnel-proxy
-   ```
-
-3. **For production (Let's Encrypt):**
-   ```bash
-   # Install certbot and a DNS plugin for your provider
-   pip install certbot certbot-dns-cloudflare  # e.g., Cloudflare
-   
-   # Configure the plugin's API credentials (see certbot-dns-cloudflare docs)
-   # typically something like ~/.config/certbot/cloudflare.ini
-   
-   # Copy and edit the config template
-   cp config.example.json config.json
-   
-   # Edit config.json:
-   # - shared_secret: a long random string (e.g., openssl rand -hex 32)
-   # - wildcard_domain: forwarding.example.com
-   # - tls.dns_plugin: cloudflare (or your provider)
-   # - tls.dns_credentials_file: path to API credentials
-   # - tls.email: your email for Let's Encrypt account
-   # - tcp.port_range: e.g., [20000, 20100]
-   ```
-
-4. **For local testing (self-signed, Windows, no certbot):**
-   ```bash
-   cp config.windows-dev.example.json config.json
-   # Edit only shared_secret if needed; everything else works out of the box
-   ```
-
-5. **Run the server:**
-   ```bash
-   python3 proxy_server.py config.json
-   ```
-
-   You'll see:
-   ```
-   INFO     tls: Generated self-signed certificate for *.forwarding.local
-   INFO     proxy: Control channel listening on 127.0.0.1:9000 (tls=False)
-   INFO     proxy: Public HTTP (redirect-only) listening on 127.0.0.1:8080
-   INFO     proxy: Public HTTPS listening on 127.0.0.1:8443
-   INFO     proxy: Dashboard listening on 127.0.0.1:8081
-   ```
-
-6. **For production, use systemd or your process manager:**
-   ```bash
-   cp systemd/tunnel-proxy.service /etc/systemd/system/
-   # Edit to point to your installation directory
-   systemctl enable --now tunnel-proxy
-   ```
-
-### Client setup (detailed)
-
-1. **Extract client:**
-   ```bash
-   unzip my_proxy_client.zip
-   cd my_proxy_client
-   ```
-
-2. **Set environment variables (optional, but recommended):**
-   ```bash
-   export MY_PROXY_SERVER=proxy.example.com:9000
-   export MY_PROXY_TOKEN=<shared-secret>
-   export MY_PROXY_DASHBOARD=127.0.0.1:4040
-   ```
-
-3. **Expose a service:**
-   ```bash
-   # HTTP: any port, custom subdomain optional
-   ./my_proxy http 8080 -u myapp
-   
-   # TCP: any port, optional preferred public port
-   ./my_proxy tcp 22 --remote-port 20022
-   
-   # Multiple services from a config file
-   cat > tunnels.json <<EOF
-   {
-     "tunnels": [
-       {"type": "http", "local": "3000", "subdomain": "api"},
-       {"type": "http", "local": "8080"},
-       {"type": "tcp", "local": "22", "remote_port": 20022}
-     ]
-   }
-   EOF
-   ./my_proxy start tunnels.json
-   ```
-
-4. **Access the local dashboard:**
-   ```
-   http://127.0.0.1:4040
-   ```
-
----
-
-## Configuration reference
-
-### Server (`config.json`)
-
-| Setting | Default | Purpose |
-|---------|---------|---------|
-| `shared_secret` | (required) | Pre-shared secret all clients authenticate with |
-| `control.host:port` | `0.0.0.0:9000` | Client connection listener |
-| `control.tls` | `false` | Wrap control channel in TLS (optional, for extra security) |
-| `http.host:port` | `0.0.0.0:80` | Public HTTP listener (redirects to HTTPS) |
-| `https.host:port` | `0.0.0.0:443` | Public HTTPS listener (routes tunnels) |
-| `wildcard_domain` | (required) | `*.forwarding.example.com` DNS must point to server |
-| `tls.provider` | `letsencrypt` | `"letsencrypt"` (production) or `"self_signed"` (dev/local) |
-| `tls.auto_provision` | `true` | Automatically provision / renew certificates |
-| `tls.cert_path` | (required) | Where certificate is stored |
-| `tls.key_path` | (required) | Where private key is stored |
-| `tcp.port_range` | `[20000, 20100]` | Available public ports for TCP tunnels |
-| `dashboard.host:port` | `127.0.0.1:8080` | Read-only status dashboard |
-| `storage.db_path` | `tunnel_proxy.db` | SQLite database (bookkeeping/observability) |
-| `logging.level` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
-
-### Client (`my_proxy`)
-
-| Option | Env var | Default | Purpose |
-|--------|---------|---------|---------|
-| `--server HOST:PORT` | `MY_PROXY_SERVER` | `127.0.0.1:9000` | Proxy server address |
-| `--token SECRET` | `MY_PROXY_TOKEN` | (required) | Shared authentication secret |
-| `--lease` | — | — | Lease the requested name instead of taking it over (default is handoff mode) |
-| `--retry-interval SECONDS` | `MY_PROXY_RETRY_INTERVAL` | `5` | Delay between reconnect attempts (retries are indefinite) |
-| `--grace-time SECONDS` | — | `10` | Escalate retry logs from warnings to errors after this long (the client never gives up) |
-| `--dashboard HOST:PORT` | `MY_PROXY_DASHBOARD` | `127.0.0.1:4040` | Local status dashboard |
-| `--no-dashboard` | — | — | Disable the dashboard |
-| `--state-file PATH` | — | `~/.my_proxy/state.json` | Persist client identity across restarts |
-| `--log-level LEVEL` | — | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
-
----
-
-## Features
-
-### ✅ What you get
-
-- **No subscription fees** — self-hosted, full control
-- **Automatic HTTPS** — Let's Encrypt wildcard certificates, auto-renewal, zero restart
-- **No data collection** — transparent tunneling, no logging of traffic
-- **Lightweight** — server ~35 KB, client ~45 KB, zero external dependencies (Python stdlib only)
-- **Cross-platform** — Windows, macOS, Linux all fully supported (Windows Proactor event loop, SO_EXCLUSIVEADDRUSE, signal.signal all handled)
-- **Multiplexed** — one connection carries all tunnels; independent flow control prevents stalling
-- **Resilient** — reconnects forever (every 5s, never gives up), retries failed registrations, graceful shutdown, per-request error handling
-- **Exclusive names on demand** — `--lease` keeps a subdomain/port yours, while the default handoff mode passes it to the newest client and tells the previous one why
-- **Observable** — real-time dashboard, detailed logs, byte counts and latency tracking
-
-### ⚠️ What's not included
-
-- **Per-client rate limiting / quotas** — add if exposing beyond trusted clients
-- **Alternative auth methods** — only shared-secret HMAC (simple, works great for self-hosted)
-- **Request inspection / replay** — intentionally transparent; operators maintain logs if needed
-- **Admin panel** — dashboard is read-only; config is hand-edited JSON
-
----
-
-## Troubleshooting
-
-### Server won't start: `certbot is not installed`
-
-Use the **self-signed provider** instead (no certbot needed):
-```json
-{
-  "tls": {
-    "provider": "self_signed",
-    "cert_path": "certs/cert.pem",
-    "key_path": "certs/key.pem"
-  }
-}
-```
-
-Or install certbot:
-```bash
-pip install certbot certbot-dns-cloudflare
-```
-
-### Client says `Authentication failed: invalid signature`
-
-The `--token` on the client doesn't match `shared_secret` in the server's config.json. Fix either one so they match.
-
-### No HTTPS after configuring Let's Encrypt
-
-Check the server logs for certbot errors. Confirm:
-- DNS records are set (`dig *.forwarding.example.com`)
-- Certbot DNS plugin is installed and configured
-- Firewall allows certbot's Let's Encrypt callback (port 443)
-
-### Local service is reachable but responses are slow
-
-Check the dashboard's per-tunnel latency. If it's high:
-- Is your local backend actually slow? (test directly: `curl localhost:8080`)
-- Is network latency high? (ping the server)
-- Are other tunnels saturating the connection? (unlikely — flow control handles this)
-
-### Ctrl+C doesn't gracefully shut down (Windows)
-
-This was a bug in the original code. **The current version fixes it** by using `signal.signal()` instead of `loop.add_signal_handler()`. Upgrade to the latest version.
-
----
-
-## Protocol details
-
-The LinkPulse protocol is deliberately simple and documented in full. Both server and client implement it exactly — no surprises.
-
-**Wire format:**
-```
-12-byte header: magic(2) | version(1) | type(1) | stream_id(4) | length(4)
-Variable payload: up to 16 MiB (frame types: HELLO, PING, STREAM_DATA, etc.)
-```
-
-**Authentication:**
-```
-HELLO frame payload (72 bytes):
-  client_id(16) | timestamp(8) | nonce(16) | HMAC-SHA256(secret, ...)(32)
-```
-
-**Multiplexing:**
-```
-Stream ID 0 = control plane (tunnels, heartbeats)
-Stream 1+ = data streams (one per HTTP request or TCP connection)
-```
-
-**Flow control:**
-```
-Per-stream, credit-based: each side has 256 KiB send window
-When window reaches 0, sender waits for STREAM_WINDOW_UPDATE
-Prevents unbounded buffering; backpressure flows end-to-end
-```
-
-See `PROTOCOL.md` in either project for the complete specification, frame types, error semantics, and reconnect behavior.
-
----
-
-## Performance & scale
-
-- **Throughput**: limited by your network, not the proxy (pure forwarding)
-- **Concurrency**: each tunnel is independent; can handle hundreds of simultaneous connections
-- **Memory**: ~few KB per active stream; bounded by number of concurrent connections
-- **Latency**: typically < 1ms added (local forwarding only); dominated by network/backend
-- **CPU**: minimal; asyncio-based, no busy loops
-
-Tested end-to-end with real HTTP/HTTPS and raw TCP traffic routing through the protocol; production-ready.
-
----
-
-## Security
-
-### What LinkPulse does
-
-- **Authenticates clients** via HMAC-SHA256 challenge-response
-- **Prevents replay attacks** via nonce tracking and timestamp checking
-- **Supports TLS on control channel** (optional; use for extra security or if running over untrusted networks)
-- **Forwards traffic transparently** (no inspection, no logging of payload content)
-
-### What you need to do
-
-- **Keep the shared secret secret** (treat like a password; rotate periodically if exposed)
-- **Use TLS on control channel** or run over a private network (VPN, WireGuard, SSH tunnel) if your network path is untrusted
-- **Keep Python updated** (especially for OpenSSL/cryptography security fixes)
-- **Monitor access logs** (server logs client connections, disconnections, and errors)
-
-### What LinkPulse doesn't do
-
-- Doesn't provide per-tunnel authorization (all clients can see all tunnels)
-- Doesn't rate-limit or quota per client (add if needed)
-- Doesn't inspect or cache traffic (all forwarding is transparent)
-- Doesn't provide audit logs of client activity (rely on your backend's logs)
-
----
-
-## Examples
-
-### Simple web app on a laptop
+- Single-threaded asyncio; no threads for request handling.
+- One TCP control connection per client process; streams are multiplexed with
+  per-stream credit-based flow control (256 KiB initial window, 64 KiB maximum
+  frame payload).
+- HELLO authentication: HMAC-SHA256 over `client_id || timestamp || nonce`, with
+  a 60-second timestamp window and single-use nonce tracking (replay
+  protection). This is one-way authentication, not a challenge-response: there
+  is no server challenge.
+- Routing tables live in memory and are rebuilt on reconnect. SQLite records
+  clients/tunnels for observability only.
+- Client identity: `client_id` is persisted per machine and shared by processes
+  on that machine; a per-process `instance_id` distinguishes a genuine
+  reconnect from a second competing process.
+- Tunnels can carry HTTP, TCP or UDP. UDP uses one `UDP_DATAGRAM` frame per
+  complete datagram (empty datagrams allowed, maximum 65507 bytes) over one
+  stream per public peer; it does not consume TCP flow-control credit.
+- Optional per-stream half-close (`STREAM_EOF`, capability `stream_eof`) keeps
+  the opposite direction open until both sides finish. Older peers fall back
+  to full `STREAM_CLOSE` aborts.
+
+See `my_proxy_client/PROTOCOL.md` for the wire format.
+
+## Limits and accounting
+
+Server defaults (environment-tunable): `MAX_CLIENTS=128`,
+`MAX_TUNNELS_PER_CLIENT=32`, `MAX_STREAMS_PER_CLIENT=256`,
+`MAX_PENDING_HTTP_CONNECTIONS=256`, `UDP_MAX_PEERS_PER_TUNNEL=128`,
+`UDP_IDLE_TIMEOUT=60` seconds, `STREAM_WRITE_TIMEOUT=30` seconds.
+
+Dashboard counters are connection/stream/byte counts; the server dashboard does
+not report latency. The client dashboard's “average latency” is a
+first-byte-since-stream-open figure, not network RTT. No throughput,
+end-to-end latency or memory figures are promised here.
+
+There is one shared TCP connection, so a large frame or a stalled stream can
+still cause head-of-line delay. Per-stream queues are bounded, but the design
+makes no claim of absolute independence from TCP behaviour.
+
+## Dashboard
+
+With HTTPS enabled, the server dashboard is served on the apex domain
+(`/` and `/dashboard/`) and requires `DASHBOARD_PASSWORD`/`JWT_SECRET`.
+With `HTTP_ONLY=true`, a standalone dashboard listener binds
+`DASHBOARD_HOST:DASHBOARD_PORT` (loopback by default) instead; it admits at
+most 128 concurrent connections and cancels its handlers on shutdown so a slow
+unauthenticated client cannot queue unbounded work.
+
+Dashboard login is throttled (5 attempts per 60 seconds per source address).
+Sessions are signed HS256 JWTs valid for at most 31 days, but they are
+in-memory: a server restart, logout, or dashboard-password rotation invalidates
+them. `GET /health` remains unauthenticated.
+
+## Testing
 
 ```bash
-# Laptop: run a dev server
-python3 -m http.server 3000  # or `npm run dev`, etc.
-
-# Expose it
-my_proxy http 3000 -u localhost-dev --token mysecret
-
-# Anyone can now reach:
-# https://localhost-dev.forwarding.example.com/
+pytest tests/ -q
 ```
 
-### SSH access from anywhere
+The suite covers tunnel ownership/reconnect behaviour, dashboard auth,
+detached-client process management, and a client↔mock-server end-to-end path.
+Results depend on the platform and Python version; this repository does not
+claim CI coverage of every OS.
 
-```bash
-# Server behind NAT: expose SSH
-my_proxy tcp 22 --remote-port 20022 --token mysecret --server tunnel.example.com:9000
+## Hosting platforms
 
-# SSH from anywhere:
-ssh -p 20022 user@tunnel.example.com
-```
+HTTP tunnels require a host that can serve 80/443 **and** expose the raw TCP
+control port (default 9000) to clients. The control channel cannot ride over
+HTTP; a platform that only forwards HTTP needs another path to 9000 (for
+example a VPN), otherwise the deployment is unsupported. Raw TCP/UDP tunnels
+additionally need a **public raw TCP or UDP port** (or a contiguous range)
+forwarded unchanged. Most HTTP PaaS platforms do not provide arbitrary raw
+TCP/UDP ports, so do not assume their “TCP service” feature proxies one until
+you have verified it. A VPS with a public IP is the recommended deployment.
 
-### CI/CD artifact uploads
+## Limitations
 
-```bash
-# CI runner: expose a local upload endpoint
-my_proxy http 8888 -u ci-uploads --token mysecret
+- No per-tenant bandwidth/rate quota or per-tunnel ACL. Connection/resource
+  caps do exist (`MAX_CLIENTS`, `MAX_TUNNELS_PER_CLIENT`,
+  `MAX_STREAMS_PER_CLIENT`, pending-HTTP/UDP limits).
+- No stream/body resumption across reconnects.
+- Dashboard/listener tuning is environment-only; there is no config-file
+  parser on the server.
+- Only the shared-secret HMAC authentication method is provided.
+- Server logs go to `LOG_FILE`/stdout with no built-in rotation; bound them with
+  logrotate, the container log driver, or a size-limited journal.
+- No cross-platform CI guarantee is claimed for the packaged binaries.
 
-# Build scripts:
-curl -X POST https://ci-uploads.forwarding.example.com/upload \
-  -F "file=@artifact.tar.gz"
-```
+## License
 
-### Multiple services, one command
-
-```bash
-cat > local.json <<EOF
-{
-  "mode": "handoff",
-  "tunnels": [
-    {"type": "http", "local": "3000", "subdomain": "api", "mode": "lease"},
-    {"type": "http", "local": "8080", "subdomain": "web"},
-    {"type": "tcp", "local": "5432", "remote_port": 20432}
-  ]
-}
-EOF
-
-my_proxy start local.json --token mysecret
-# Now running:
-# https://api.forwarding.example.com -> localhost:3000
-# https://web.forwarding.example.com -> localhost:8080
-# tcp://tunnel.example.com:20432 -> localhost:5432 (Postgres)
-```
-
----
-
-## Project stats
-
-**Server (tunnel-proxy/):**
-- `proxy_server.py`: 894 lines (main server)
-- `protocol.py`: 215 lines (wire protocol, canonical)
-- `tls_manager.py`: 240 lines (Let's Encrypt + self-signed)
-- `dashboard.py`: 251 lines (read-only web status)
-- `storage.py`: 117 lines (SQLite bookkeeping)
-- **Total: ~1,900 lines, ~35 KB**
-- **Dependencies: Python stdlib only**
-
-**Client (my_proxy_client/):**
-- `my_proxy`: 1,098 lines (single-file client)
-- **Total: ~1,100 lines, ~45 KB**
-- **Dependencies: Python stdlib only**
-
-**Documentation:**
-- Full protocol spec, architecture, config reference, troubleshooting
-
----
-
-## License & credits
-
-Built from scratch, thoroughly tested, documented in production detail. Both components are MIT-licensed (or your choice of permissive license).
-
-The protocol is simple by design — easy to re-implement in any language if you need a client in Rust, Go, Node.js, etc.
-
----
-
-## Getting started now
-
-1. **Extract server:** `unzip tunnel-proxy.zip && cd tunnel-proxy`
-2. **Configure:** `cp config.windows-dev.example.json config.json` (for testing) or `config.example.json` (for production)
-3. **Run:** `python3 proxy_server.py config.json`
-4. **Extract client:** `unzip my_proxy_client.zip && cd my_proxy_client`
-5. **Expose service:** `./my_proxy http 8080 --token <shared-secret> --server <server-ip>:9000`
-6. **Test:** `curl https://<subdomain>.<domain>/`
-7. **Dashboard:** `http://<client-ip>:4040`
-
-No signup, no SaaS, no monthly bill. Just clean, self-hosted tunneling.
-
----
-
-**Questions?** See the detailed README files in each project (tunnel-proxy/README.md and my_proxy_client/README.md).
-
-**Ready to deploy?** Follow the setup guide above, then systemd/Docker your process manager to keep it running.
+There is no `LICENSE` file and no formally declared license yet. The owner
+permits unrestricted use: *“its my own repository, dont bother about licensing
+for now, just keep it fully opensource, anyone can use however the heck they
+want”*. License formalization is deliberately deferred; do not treat this
+project as MIT-licensed or as carrying any other named license until a
+`LICENSE` file is added.

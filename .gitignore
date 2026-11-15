@@ -1,7 +1,67 @@
-tunnel-proxy/db/tunnel_proxy.db
-__pycache__/
-*.pyc
-.pytest_cache/
-*.log
+# ---------------------------------------------------------------------------
+# LinkPulse repository-wide ignores
+#
+# Concrete tracked files are unaffected; these patterns only cover generated
+# bytecode/caches, local secrets, runtime state, databases, certificates and
+# build output. `.env.example` is deliberately NOT ignored (only real `.env`).
+# ---------------------------------------------------------------------------
 
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local environment files (keep the checked-in *.example templates)
+.env
+
+# Logs
+*.log
+logs/
+
+# Client runtime state (client_id, saved token/server, managed instances)
+state.json
+authtoken.json
+clients/
+.my_proxy/
+
+# SQLite bookkeeping databases
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+tunnel-proxy/db/
+
+# TLS material produced by certbot/openssl -- never commit certificates or keys
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx
+*.der
+letsencrypt/
+
+# Build output (PyInstaller and friends)
+build/
+dist/
+*.spec
+*.pyz
+*.manifest
+
+# Local toolchain pin (client)
 my_proxy_client/.python-version
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db

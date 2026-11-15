@@ -1,104 +1,149 @@
-# Wire Protocol Specification
+# LinkPulse Wire Protocol
 
-This is the **canonical wire protocol** that both `proxy_server.py` and `my_proxy` implement exactly. Client developers must follow this specification precisely for interoperability.
+Canonical source of truth: `tunnel-proxy/protocol.py`. `my_proxy_client/my_proxy.py`
+carries a synchronized copy. Both ends must agree on framing and semantics.
 
 ## Overview
 
-One TCP connection ("the control connection") is opened by the client to the server and kept open indefinitely. Every logical thing that needs to happen -- authentication, registering tunnels, and every individual public HTTP request or TCP connection -- travels over that single connection as independently-framed messages, distinguished by a stream ID.
-
-## Frame layout
-
-Every message is a frame with a 12-byte fixed header followed by a variable-length payload:
+The client opens one TCP connection to the server's control port. Authentication,
+tunnel registration, heartbeat, and every HTTP connection / TCP connection /
+UDP peer travel over that connection as independently framed messages
+distinguished by stream ID.
 
 ```
  0        2      3      4                 8                 12
- +--------+------+------+-----------------+-----------------+
- | Magic  | Ver  | Type |    Stream ID     |     Length      |
- +--------+------+------+-----------------+-----------------+
- |                    Payload (Length bytes)                 |
- +-------------------------------------------------------------+
++--------+------+------+-----------------+-----------------+
+| Magic  | Ver  | Type |    Stream ID    |     Length      |
++--------+------+------+-----------------+-----------------+
+|                   Payload (Length bytes)                  |
++-----------------------------------------------------------+
 ```
 
-| Field     | Size | Details |
-|-----------|------|---------|
-| Magic     | 2    | ASCII `"TN"` (0x54 0x4E). Resynchronization marker. |
-| Version   | 1    | Protocol version, currently `1`. |
-| Type      | 1    | `FrameType` enum value (see below). |
-| Stream ID | 4    | Unsigned big-endian. `0` = control channel. |
-| Length    | 4    | Unsigned big-endian. Payload size in bytes. |
-| Payload   | var  | Meaning depends on `Type`. |
+| Field | Size | Details |
+|-------|------|---------|
+| Magic | 2 | ASCII `"TN"` (`0x54 0x4E`) |
+| Version | 1 | Protocol version, currently `1` |
+| Type | 1 | `FrameType` value |
+| Stream ID | 4 | Unsigned big-endian; `0` = control channel |
+| Length | 4 | Unsigned big-endian payload size |
+| Payload | var | Depends on `Type` |
 
-**Invariants:**
-- Header is fixed 12 bytes, always in network (big-endian) byte order.
-- `Length` ≤ 16 MiB (clients/servers must reject frames claiming larger payloads).
-- `STREAM_DATA` payloads are capped at 64 KiB, even if the frame format allows larger.
+Rules:
+
+- Header is always 12 bytes, network byte order.
+- `Length` must not exceed 16 MiB (16,777,216); larger frames are rejected
+  before allocating the payload.
+- `STREAM_DATA` payloads are capped at 64 KiB even though the frame format
+  permits more.
+- An unknown version, bad magic, or oversized length is a fatal protocol error
+  on that connection.
 
 ## Frame types
 
-| Value | Name                  | Direction        | Payload                                    |
-|-------|-----------------------|-------------------|-------------------------------------------|
-| 0x01  | HELLO                 | client → server   | binary auth payload (72 bytes)             |
-| 0x02  | HELLO_OK              | server → client   | JSON `{client_id, heartbeat_interval, ...}` |
-| 0x03  | HELLO_FAIL            | server → client   | JSON `{error}` (connection closes after)   |
-| 0x04  | PING                  | either            | empty                                      |
-| 0x05  | PONG                  | either            | empty                                      |
-| 0x06  | TUNNEL_OPEN_REQUEST   | client → server   | JSON `{tunnel_id, type, mode?, instance_id?, subdomain?, remote_port?}` |
-| 0x07  | TUNNEL_OPEN_RESPONSE  | server → client   | JSON `{tunnel_id, status, mode?, ...}`     |
-| 0x08  | TUNNEL_CLOSE          | either            | JSON `{tunnel_id, reason?, message?}`      |
-| 0x09  | STREAM_OPEN           | server → client   | JSON `{tunnel_id, proto, remote_addr}`, stream ID in header |
-| 0x0A  | STREAM_DATA           | either            | raw bytes (≤ 64 KiB)                       |
-| 0x0B  | STREAM_CLOSE          | either            | empty                                      |
-| 0x0C  | STREAM_WINDOW_UPDATE  | either            | 4 bytes, unsigned big-endian byte credit   |
-| 0x0D  | ERROR                 | either            | JSON `{error}`                             |
+| Value | Name | Direction | Payload |
+|-------|------|-----------|---------|
+| 0x01 | HELLO | client → server | 72-byte auth payload |
+| 0x02 | HELLO_OK | server → client | JSON `{client_id, heartbeat_interval, server_version, capabilities?}` |
+| 0x03 | HELLO_FAIL | server → client | JSON `{error}` (connection closes) |
+| 0x04 | PING | either | empty |
+| 0x05 | PONG | either | empty |
+| 0x06 | TUNNEL_OPEN_REQUEST | client → server | JSON (see below) |
+| 0x07 | TUNNEL_OPEN_RESPONSE | server → client | JSON |
+| 0x08 | TUNNEL_CLOSE | either | JSON `{tunnel_id, reason?, message?}` |
+| 0x09 | STREAM_OPEN | server → client | JSON `{tunnel_id, proto, remote_addr}` |
+| 0x0A | STREAM_DATA | either | raw bytes (≤ 64 KiB) |
+| 0x0B | STREAM_CLOSE | either | empty — abort/full close |
+| 0x0C | STREAM_WINDOW_UPDATE | either | 4-byte unsigned big-endian credit |
+| 0x0D | ERROR | either | JSON `{error}` |
+| 0x0E | UDP_DATAGRAM | either | one complete datagram |
+| 0x0F | STREAM_EOF | either | empty — half-close (capability-gated) |
+
+`STREAM_EOF` is an optional extension. `UDP_DATAGRAM` is the UDP data type.
+For compatibility with older implementations, a UDP peer may also receive
+`STREAM_DATA`; current peers should tolerate it by forwarding the bytes as a
+datagram payload rather than treating the frame as unknown.
 
 ## Authentication (HELLO)
 
-The HELLO frame payload is 72 bytes, structured as:
+Payload, exactly 72 bytes:
 
 ```
-client_id : 16 bytes  (all-zero == "assign me a new identity")
-timestamp : 8 bytes   (unsigned big-endian unix time, seconds)
-nonce     : 16 bytes  (random, single-use)
+client_id : 16 bytes  (all-zero = "assign me a new identity")
+timestamp : 8 bytes   (unsigned big-endian Unix seconds)
+nonce     : 16 bytes  (random, single use)
 hmac      : 32 bytes  HMAC-SHA256(secret, client_id || timestamp || nonce)
 ```
 
-**Process:**
-1. Client generates or loads its persistent client_id (UUID, 16 bytes). First time is all-zero.
-2. Client gets current unix timestamp and a fresh random nonce.
-3. Client computes `HMAC = HMAC-SHA256(shared_secret, client_id || timestamp || nonce)` where `||` is concatenation.
-4. Client sends HELLO frame with this payload.
-5. Server verifies:
-   - Timestamp is within 60 seconds of server's clock (bounds replay window)
-   - HMAC matches (constant-time comparison)
-   - `(client_id, nonce)` hasn't been seen before in this skew window (prevents replay)
-6. Server either sends HELLO_OK (with an assigned client_id if the request had all-zero) or HELLO_FAIL.
-7. If HELLO_FAIL, connection closes immediately.
+Process:
 
-**Security note:** This scheme proves possession of the secret and prevents replay, but does **not** provide confidentiality of tunneled data. For production, either:
-- Enable TLS on the control channel (`control.tls: true` in server config), or
-- Run the control connection over a private network (VPN, WireGuard, SSH tunnel).
+1. Client loads its persisted `client_id` (or sends zeros on first connect),
+   gets the current Unix time, and generates a fresh nonce.
+2. Client sends HELLO with the HMAC.
+3. Server checks:
+   - `|now - timestamp| <= 60` seconds;
+   - HMAC matches (constant-time comparison);
+   - `(client_id, nonce)` has not been seen within the skew window.
+4. Server replies HELLO_OK (assigning a `client_id` if the request was
+   all-zero) or HELLO_FAIL and closes.
+
+This is **one-way** authentication: it proves possession of the secret and
+prevents replay, but there is no server challenge and no confidentiality.
+Enable native control TLS (`CONTROL_TLS=true` on the server, `--tls` on the
+client with mandatory certificate verification) or run over a private network.
+Public HTTPS does not protect this leg.
+
+Replay state is pruned after the timestamp validity window, so a captured
+HELLO stays rejected for the whole window but is not remembered forever.
+
+## Capabilities
+
+HELLO_OK may include an optional `capabilities` array. The server advertises:
+
+```json
+{ "client_id": "...", "heartbeat_interval": 20, "server_version": 1,
+  "capabilities": ["stream_eof"] }
+```
+
+When the client sees `stream_eof`, it may include the same capability in each
+`TUNNEL_OPEN_REQUEST`:
+
+```json
+{ "tunnel_id": "...", "type": "http", "capabilities": ["stream_eof"] }
+```
+
+`STREAM_EOF` is used only when both sides advertised the capability. Otherwise
+the connection keeps the legacy behavior: end-of-data is signalled with an
+abortive `STREAM_CLOSE`, which tears down both directions.
 
 ## Multiplexing
 
-Stream ID = 0 is reserved for control-plane frames (HELLO, PING, TUNNEL_OPEN_*, etc.).
+Stream 0 is the control plane. Every other stream ID (allocated by the server,
+monotonically increasing with wraparound) represents one proxied connection:
 
-Every other stream ID (1 to 2^32-1, allocated by server, monotonically increasing with wraparound) represents one proxied connection:
-- For HTTP: one stream = one TCP connection to the public HTTPS listener
-- For TCP: one stream = one incoming TCP connection to a public port
+- HTTP: one stream per public TCP connection (which may carry keep-alive
+  requests).
+- TCP: one stream per incoming public TCP connection.
+- UDP: one stream per distinct public peer address.
 
-Frames for different streams can be interleaved freely on the wire.
+Frames from different streams may be interleaved freely.
 
 ## Flow control
 
-Each stream has an independent, per-direction, credit-based flow-control window:
+Each stream has independent per-direction credit:
 
-- Each side starts with **256 KiB** of *send* credit toward the peer, per stream
-- Before sending STREAM_DATA, sender must have available credit ≥ 1 byte; it consumes credit equal to payload size
-- Receiver, once it has flushed the data onward, sends STREAM_WINDOW_UPDATE back with an increment restoring credit
-- In this implementation, increments are batched: updates sent once ≥ 128 KiB unacknowledged
-- If window reaches zero, sender blocks (awaits STREAM_WINDOW_UPDATE) rather than buffering unboundedly
+- Both sides start with a 256 KiB send window per stream.
+- Before sending `STREAM_DATA`, the sender must hold credit ≥ 1 byte and
+  consumes credit equal to the payload size.
+- The receiver sends `STREAM_WINDOW_UPDATE` after flushing data onward; this
+  implementation batches updates at roughly 128 KiB.
+- A sender with zero credit waits instead of buffering without bound.
+- Credit is capped at 512 KiB (`MAX_WINDOW_CREDIT`, twice the initial window)
+  so a malicious peer cannot inflate the window arbitrarily.
 
-This gives simple, symmetric backpressure without per-request buffering.
+`UDP_DATAGRAM` does **not** consume TCP stream credit. Per-stream queues and
+session/global limits bound memory. Streams share one TCP connection, so a
+large frame or blocked write can still cause head-of-line delay; per-stream
+flow control does not remove TCP's own ordering behaviour.
 
 ## Tunnel lifecycle
 
@@ -108,23 +153,24 @@ This gives simple, symmetric backpressure without per-request buffering.
 {
   "tunnel_id": "uuid-hex",
   "type": "http" | "tcp" | "udp",
-  "mode": "handoff" | "lease",   // optional, default "handoff"
-  "instance_id": "hex",          // optional: one random id per client process
-  "subdomain": "app",            // http only, optional
-  "remote_port": 20000           // tcp/udp only, optional
+  "mode": "handoff" | "lease",
+  "instance_id": "hex",
+  "capabilities": ["stream_eof"],
+  "subdomain": "app",
+  "remote_port": 20000
 }
 ```
 
-- `tunnel_id` is client-generated and persistent across reconnects (same tunnel_id after reconnect = resume that tunnel)
-- `type` is required; "http", "tcp" or "udp"
-- `subdomain` (http only): client requests a specific subdomain. If omitted or taken, server assigns one.
-- `remote_port` (tcp/udp only): client requests a specific port. If omitted or taken, server assigns one.
-- `mode` says what to do when the requested name is already registered (see
-  [Tunnel ownership modes](#tunnel-ownership-modes)). Unknown values are rejected.
-- `instance_id` is a per-process random string. `client_id` is shared by every
-  client process on a machine (they persist it in the same state file), so the
-  server uses `instance_id` to tell a genuine reconnect (same client_id **and**
-  same instance_id) from a second competing process (different instance_id).
+- `tunnel_id` is client-generated and stable across reconnects. Re-requesting
+  the same ID after a reconnect means “resume my logical tunnel”.
+  A duplicate ID does not create a second name/listener; conflicting/duplicate
+  claims are rejected safely.
+- `mode` is optional (default `handoff`); unknown values are rejected.
+- `instance_id` is per client process. `client_id` is shared machine-wide, so
+  the pair `(client_id, instance_id)` distinguishes a reconnect from a second
+  competing process.
+- `subdomain` (HTTP) may be omitted; the server assigns one and returns it.
+- `remote_port` (TCP/UDP) may be omitted; the server allocates from its range.
 
 ### TUNNEL_OPEN_RESPONSE (server → client)
 
@@ -132,160 +178,177 @@ This gives simple, symmetric backpressure without per-request buffering.
 {
   "tunnel_id": "uuid-hex",
   "status": "ok" | "error",
-  "type": "http" | "tcp",
-  "mode": "handoff" | "lease",                          // echoed back, if ok
-  "public_url": "https://app.forwarding.example.com",  // http only, if ok
-  "public_host": "forwarding.example.com",              // tcp only, if ok
-  "remote_port": 20000,                                 // tcp/udp only, if ok
-  "error": "reason for failure",                        // if error
-  "reason": "leased" | "in_use" | "exhausted" | "invalid"  // if error, optional
+  "type": "http" | "tcp" | "udp",
+  "mode": "handoff" | "lease",
+  "subdomain": "app",
+  "public_url": "https://app.example.com",
+  "public_host": "example.com",
+  "remote_port": 20000,
+  "error": "reason",
+  "reason": "leased" | "in_use" | "exhausted" | "invalid"
 }
 ```
 
-The client is expected to retry a failed registration periodically (the
-reference client retries every 5s while it stays connected), because a name can
-become available later (the holder disconnected, a lease expired with its
-session, ports freed up, ...).
+On success the client stores the granted `subdomain` (including an
+auto-assigned one) so the URL survives reconnects. Failed registrations should
+be retried; names become available when an owner disconnects, a lease session
+ends, or ports free up.
 
-### TUNNEL_CLOSE (either direction)
+### TUNNEL_CLOSE
 
 ```json
-{
-  "tunnel_id": "uuid-hex",
-  "reason": "handoff" | "reclaimed",   // server-initiated closes only
-  "message": "human-readable explanation"
-}
+{ "tunnel_id": "uuid-hex", "reason": "handoff" | "reclaimed" | "...", "message": "..." }
 ```
 
-Unregisters the tunnel. The tunnel is freed for reuse. Any in-flight streams for this tunnel are aborted.
-
 Client → server closes carry only `tunnel_id`. Server → client closes are
-revocations and carry a `reason`/`message` so the client can say *why* its
-tunnel disappeared:
+revocations:
 
-| `reason` | meaning | client reaction |
-|----------|---------|-----------------|
-| `handoff` | Another client claimed the same name in handoff mode. | Report the message, stop serving that tunnel, and (if it has no tunnels left) exit cleanly. |
-| `reclaimed` | The same client process reconnected and took its own registration back. | Ignore; the tunnel is re-opened by the matching `TUNNEL_OPEN_RESPONSE`. |
+| reason | meaning | client reaction |
+|--------|---------|-----------------|
+| `handoff` | Another client claimed the name in handoff mode | Report, stop serving, exit if nothing left |
+| `reclaimed` | Same client process reconnected and took its own registration back | Ignore; the matching open response re-establishes it |
 
-## Tunnel ownership modes
+Any in-flight streams for the tunnel are aborted.
 
-Public names (subdomain / TCP port / UDP port) are shared, not
-permanently reserved. Each tunnel declares how contests for its name are
-resolved; the server enforces the mode stored on the **existing** tunnel.
+## Ownership modes
 
-| mode | behaviour when the name is already registered |
-|------|-----------------------------------------------|
-| `handoff` (default) | The newcomer wins. The current owner's tunnel is revoked (`TUNNEL_CLOSE` with `reason="handoff"`), its in-flight streams are aborted, and the newcomer is granted the name. |
-| `lease` | The newcomer is refused with `status="error"`, `reason="leased"`. The holder keeps serving. A client asking for a lease on a name that is already in use is likewise refused (`reason="in_use"`) — a lease never takes over an existing tunnel. |
+| Mode | When the name is already registered |
+|------|-------------------------------------|
+| `handoff` (default) | Newcomer wins. Current owner gets `TUNNEL_CLOSE reason="handoff"`, its streams abort, newcomer gets the name. |
+| `lease` | Newcomer refused with `status="error", reason="leased"`. A lease request over an in-use name is refused with `reason="in_use"`; a lease never takes over. |
 
-Two exceptions, both about *identity*:
+Identity exceptions:
 
-- A reconnect of the same client process (same `client_id` **and** same
-  `instance_id`, or an older client that sends no `instance_id`) always
-  reclaims its own previous registration, even a leased one — the server may
-  not have noticed the old TCP connection dying yet. The previous
-  registration is revoked silently (`reason="reclaimed"` only if it lived on
-  a different connection).
-- A second process with the same `client_id` but a different `instance_id`
-  counts as a **competitor**, not a reconnect: it is refused by a lease and
-  takes over in handoff mode.
+- A reconnect of the same client process (same `client_id` and
+  `instance_id`; an older client with no `instance_id` is treated permissively)
+  reclaims its own registration, even a lease. The old registration is closed;
+  `reason="reclaimed"` is sent only if it lived on a different connection.
+- A different `instance_id` is a competitor, not a reconnect: refused by a
+  lease, able to take over in handoff mode.
 
-A lease lasts as long as the owning client's session. If the owner becomes
-unreachable for `heartbeat_timeout_seconds` the server drops the session and
-the name returns to the pool (the same stale-session rule that applies to
-every other tunnel), so leases cannot block a name forever.
+A lease lives only as long as the owning session. It is not permanent and is
+not extended by HTTP reconnect waiting.
 
 ## Stream lifecycle
 
 ### STREAM_OPEN (server → client)
 
-When the server accepts a new public connection destined for a tunnel, it allocates a stream ID and sends:
-
 ```
 Frame header: stream_id = allocated_id
-Payload: JSON { "tunnel_id": "...", "proto": "http|tcp", "remote_addr": "ip:port" }
+Payload: JSON { "tunnel_id": "...", "proto": "http" | "tcp" | "udp",
+                "remote_addr": "ip:port" }
 ```
 
-Client must:
-1. Connect to the local backend (host:port from tunnel spec)
-2. If connection succeeds: register a stream and start pumping data in both directions
-3. If connection fails (refused, timeout): send STREAM_CLOSE immediately
+For HTTP/TCP the client connects to the local backend, then pumps bytes both
+ways. If the backend cannot be reached it sends `STREAM_CLOSE` (an abort; no
+half-close is attempted) and the tunnel stays registered.
 
-### STREAM_DATA (either direction)
+For UDP the client opens a datagram endpoint to the local backend for that
+stream and forwards complete datagrams.
 
-Raw bytes. Payload ≤ 64 KiB. Respects flow control windows.
+### STREAM_DATA
 
-### STREAM_CLOSE (either direction)
+Raw bytes, ≤ 64 KiB per frame, subject to credit. The sender must not send more
+than the receiver's window.
 
-Empty payload. Sent when one side has finished (EOF from local backend, or error). The other side should close its corresponding socket and stop using the stream.
+### STREAM_EOF (optional, capability-gated)
 
-### STREAM_WINDOW_UPDATE (either direction)
+Empty payload. Signals that the sender will write no more data on this stream,
+while the receiver may still send in the opposite direction. The stream is
+fully closed once both directions have finished. If either peer did not
+advertise `stream_eof`, `STREAM_EOF` is not sent.
 
-4-byte unsigned big-endian increment. Sent after flushing received data to restore send credit for the peer.
+### STREAM_CLOSE
 
-## Heartbeat
+Empty payload. Abortive/full close: the peer stops using the stream and closes
+the corresponding socket/endpoint. This is the legacy semantics and remains the
+fallback when half-close is not negotiated.
 
-- Server sends PING every `heartbeat_interval_seconds` (default 20s, sent in HELLO_OK)
-- Peer responds with PONG (or any frame can refresh the "last seen" timer)
-- If no frame received for `heartbeat_timeout_seconds` (default 60s), peer considers connection dead and disconnects
+### STREAM_WINDOW_UPDATE
+
+4-byte unsigned big-endian increment. Restores send credit for the peer.
+
+### UDP_DATAGRAM
+
+Payload is exactly one complete UDP datagram, preserving datagram boundaries.
+An empty payload is a valid (zero-length) datagram. The maximum payload is
+65507 bytes. UDP frames do not consume TCP stream credit. A stream maps one
+public peer to one local datagram endpoint; an idle peer is expired after the
+configured `UDP_IDLE_TIMEOUT`, and the number of peers per tunnel is capped.
+
+## Heartbeat and inactivity
+
+- The server sends PING every `heartbeat_interval` seconds (default 20, sent in
+  HELLO_OK).
+- PONG (or any frame) refreshes the peer's last-seen timer.
+- No frame within `heartbeat_timeout` (default 60 s) means the connection is
+  considered dead and is closed.
+- The client also runs an inactivity watchdog (~3× heartbeat interval) so a
+  silently dropped path triggers a reconnect.
 
 ## Reconnect semantics
 
-- Client persists its `client_id` and presents it on every future HELLO
-- Server recognizes it as the same client (not a new one)
-- Subdomains/ports are *not* "reserved" — they're granted to whichever client currently asks for them
-  - A client wanting a stable public URL re-requests the same `subdomain` or `remote_port` on reconnect
-  - If no one else claimed it, client gets it back automatically
-  - If somebody else did claim it, the ownership mode decides who wins (see [Tunnel ownership modes](#tunnel-ownership-modes))
-- A client that wants to keep its name to itself should request `mode: "lease"`
-- **In-flight streams are NOT resumed**: if control connection drops, open streams are aborted (their sockets closed). Full resumption would require sequence numbers, retransmit buffers, and significantly more state. For a self-hosted tool, occasional dropped requests on reconnect are acceptable.
-- If a HELLO arrives for a `client_id` that already has a live session (race), the server keeps both sessions; name contests between them are resolved like any other contest (by mode and `instance_id`)
-- The client retries a dropped/unreachable control connection indefinitely (every 5s by default); it never exits because the server is down
+- The client persists `client_id` and presents it on every HELLO; the server
+  recognizes the same machine.
+- Public names are not reserved ahead of time. The client re-requests the same
+  `tunnel_id`/subdomain/port; if free it gets them back, otherwise the
+  ownership mode decides.
+- **In-flight streams are not resumed.** A control connection drop aborts open
+  streams and their sockets. WebSockets, in-flight HTTP requests and partial
+  bodies cannot be resumed; no retransmit buffer or sequence-number scheme
+  exists.
+- The client retries the connection and failed registrations indefinitely
+  (every 5 s by default).
+- For a short period after an unexpectedly dropped HTTP owner, the server may
+  park new request heads and sockets and forward them to the reconnected
+  owner (or the current legitimate owner). It does not accumulate, spool, or
+  replay a request body at the application level; only normal bounded TCP
+  receive buffering/backpressure applies. A waiting request is not a name
+  reservation or lease extension. Unknown names → 404; an expired wait/queue overflow → 503
+  (`Retry-After: 2`). Grace `0` disables the wait.
 
-## Error handling
+## Errors
 
-**Malformed frames** (bad magic, oversized length):
-- Raise ProtocolError, close connection, client reconnects with backoff
+| Condition | Behaviour |
+|-----------|-----------|
+| Bad magic / version / oversized length | Fatal protocol error; close connection |
+| HELLO_FAIL | Server closes; client exits (bad secret is not retried) |
+| ERROR frame | Soft report; does not tear down the connection |
+| Heartbeat timeout | Connection closed; client reconnects |
+| Local backend unreachable | Per-request failure; tunnel stays registered |
+| Unknown/invalid tunnel type or mode | `TUNNEL_OPEN_RESPONSE` error with `reason="invalid"` |
+| Name unavailable | Error with `reason="leased"`/`"in_use"`/`"exhausted"`; client retries |
 
-**Authentication failure (HELLO_FAIL)**:
-- Server closes connection immediately
-- Client exits (not retried; wrong secret can't be fixed by retrying)
+## Limits
 
-**ERROR frame**:
-- Generic soft error report; doesn't tear down the connection
+Server-side defaults (environment-tunable): `MAX_CLIENTS=128`,
+`MAX_TUNNELS_PER_CLIENT=32`, `MAX_STREAMS_PER_CLIENT=256`,
+`MAX_PENDING_HTTP_CONNECTIONS=256`, `UDP_MAX_PEERS_PER_TUNNEL=128`,
+`UDP_IDLE_TIMEOUT=60` s, `STREAM_WRITE_TIMEOUT=30` s.
 
-**Heartbeat timeout**:
-- Either side closes connection and cleans up
-- Client enters reconnect loop with backoff
+## Versioning and extensibility
 
-**Local service unreachable (STREAM_OPEN received, connection to backend fails)**:
-- Client sends STREAM_CLOSE immediately
-- Tunnel remains active (per-request failure, not tunnel-level)
-
-## Version and extensibility
-
-- `Version` byte is currently always `1`
-- New frame types can be added; unknown types are logged/ignored (not fatal)
-- JSON payloads can gain new optional fields without a version bump (forward-compatible)
-- Future version changes would dispatch on the `Version` byte before interpreting `Type`
-
----
+- `Version` is currently always `1`; an unknown version is rejected.
+- New frame types can be added; unknown types are logged and ignored rather
+  than fatal where safe.
+- JSON payloads may gain optional fields without a version bump, and
+  capabilities negotiate optional behaviour.
+- Peers must not assume features; capability negotiation and graceful fallback
+  are the compatibility mechanism.
 
 ## Implementation checklist
 
-When implementing a client or alternative server:
-
-- [ ] Frame parsing: struct.unpack/pack with big-endian byte order
-- [ ] Magic bytes check (must be `b"TN"`)
-- [ ] Length ceiling enforcement (reject > 16 MiB)
-- [ ] HELLO payload: 72 bytes, HMAC-SHA256 over (client_id || timestamp || nonce)
-- [ ] Flow control windows: per-stream, independent directions, credit-based
-- [ ] STREAM_DATA chunking: split payloads > 64 KiB into multiple frames
-- [ ] Multiplexing: interleave frames from different streams freely
-- [ ] Ownership modes: store `mode` per tunnel, evict on `handoff`, refuse on `lease`, and treat same `(client_id, instance_id)` as a reconnect
-- [ ] Reconnect: client persists client_id, re-requests same tunnels, retries forever (never gives up)
-- [ ] Graceful shutdown: close tunnels cleanly before disconnecting
-- [ ] Error handling: malformed frames are fatal; auth failures don't retry
-
-Refer to `my_proxy` (client) and `proxy_server.py` (server) in this project for reference implementations.
+- [ ] Frame parse: magic, version, big-endian length, 16 MiB ceiling
+- [ ] HELLO: exactly 72 bytes; HMAC over `client_id || timestamp || nonce`;
+      timestamp skew and nonce replay checks
+- [ ] Capabilities: advertise/echo `stream_eof`; fall back otherwise
+- [ ] Flow control: per-stream, per-direction, 256 KiB initial window
+- [ ] `STREAM_DATA` chunking at 64 KiB
+- [ ] Multiplexing: interleave frames from different streams
+- [ ] Ownership: store per-tunnel mode; handoff evicts, lease refuses; treat
+      `(client_id, instance_id)` as a reconnect
+- [ ] UDP: datagram boundaries, empty datagrams, 65507 ceiling, no credit
+- [ ] Half-close: directional EOF keeps the other direction until both finish
+- [ ] Reconnect: persist identity, re-request tunnels, retry forever, never
+      resume streams
+- [ ] Errors: malformed frames fatal; auth failure not retried

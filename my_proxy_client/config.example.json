@@ -2,6 +2,8 @@
   "server": "proxy.example.com:9000",
   "token": "shared-secret-here",
   "mode": "handoff",
+  "tls": false,
+  "ca_cert": null,
   "tunnels": [
     {
       "type": "http",

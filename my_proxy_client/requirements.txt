@@ -1,5 +1,9 @@
-# my_proxy uses only Python standard library (asyncio, ssl, struct, json, etc.)
-# No external dependencies required.
+# my_proxy uses only the Python standard library (asyncio, ssl, struct, json,
+# etc.). There are NO runtime dependencies, so this file is intentionally empty
+# and is kept only for documentation/consistency.
 #
-# This file is intentionally empty, kept for documentation purposes and
-# consistency with typical Python project structure.
+# Do not add runtime packages here: the client is meant to run on a bare
+# Python 3.9+ interpreter with nothing installed.
+#
+# Build-time tooling for the standalone binary lives in ../build-requirements.txt
+# and test tooling in ../requirements-dev.txt.

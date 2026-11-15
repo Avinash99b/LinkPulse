@@ -1,0 +1,7 @@
+# Development / test tooling -- NOT needed to run any LinkPulse component.
+#
+# Pinned so CI runs the exact same test runner everywhere. The test suite in
+# tests/ targets Python 3.9+, and pytest 8.3.4 supports Python 3.8+.
+#
+# Install with:  python -m pip install -r requirements-dev.txt
+pytest==8.3.4

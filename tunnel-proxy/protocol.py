@@ -64,6 +64,28 @@ CONTROL_STREAM_ID = 0
 # it must wait for a WINDOW_UPDATE). See FlowWindow in proxy_server.py.
 INITIAL_WINDOW = 256 * 1024
 
+# Hard ceiling on the send credit either side may hold for one stream. A
+# WINDOW_UPDATE that would push the window above this is capped/ignored so a
+# malicious peer cannot inflate our send window without bound.
+MAX_WINDOW_CREDIT = 2 * INITIAL_WINDOW
+
+# Control/JSON payloads (tunnel/stream metadata, errors) are small; cap them
+# before any buffer is allocated so a peer cannot claim 16 MiB for a frame
+# that can never legitimately be that large.
+MAX_CONTROL_PAYLOAD = 64 * 1024
+
+# A single UDP datagram may never exceed the maximum UDP payload size (the
+# 65535-byte IP datagram limit minus the 8-byte UDP header and 20-byte IP
+# header). Empty datagrams (Length 0) are legal and meaningful for UDP.
+UDP_MAX_DATAGRAM = 65507
+
+# Capabilities negotiated between the server and a client connection.
+# `stream_eof` advertises that the peer understands STREAM_EOF (a write-half
+# close) in addition to STREAM_CLOSE (a full abort). When both sides agree,
+# a stream can keep the opposite direction alive after one side finishes.
+STREAM_CAPABILITY = "stream_eof"
+SERVER_CAPABILITIES = (STREAM_CAPABILITY,)
+
 # ---------------------------------------------------------------------------
 # Tunnel ownership modes
 # ---------------------------------------------------------------------------
@@ -105,8 +127,11 @@ class FrameType(enum.IntEnum):
     # --- per-connection multiplexed data streams ----------------------------
     STREAM_OPEN = 0x09            # server -> client: new inbound connection
     STREAM_DATA = 0x0A            # either direction: payload chunk
-    STREAM_CLOSE = 0x0B           # either direction: stream finished/aborted
+    STREAM_CLOSE = 0x0B           # either direction: stream aborted (full close)
     STREAM_WINDOW_UPDATE = 0x0C   # either direction: flow-control credit
+    STREAM_EOF = 0x0F             # either direction: sender's write-half ended
+                                  #   (half-close; only used once both sides
+                                  #    advertised the "stream_eof" capability)
 
     # --- datagram (UDP) traffic ---------------------------------------------
     UDP_DATAGRAM = 0x0E           # either direction: one complete UDP datagram
@@ -140,18 +165,57 @@ def encode_frame(frame_type: int, stream_id: int, payload: bytes = b"", version:
     return header + payload
 
 
-async def read_frame(reader: asyncio.StreamReader) -> Frame:
-    """Read exactly one frame from an asyncio StreamReader.
+async def read_frame_header(reader: asyncio.StreamReader) -> tuple[int, int, int, int]:
+    """Read and validate just the 12-byte frame header.
 
-    Raises asyncio.IncompleteReadError on clean/unclean EOF and
-    ProtocolError on a malformed header (bad magic / oversized length).
+    Validates the magic, the protocol version and the advertised payload
+    length against MAX_ALLOWED_LENGTH, so a caller can decide how much (if
+    any) payload it is willing to read before allocating a buffer.
+
+    Returns (version, frame_type, stream_id, length).
     """
     header = await reader.readexactly(HEADER_LEN)
     magic, version, ftype, stream_id, length = struct.unpack(_HEADER_FMT, header)
     if magic != PROTO_MAGIC:
         raise ProtocolError(f"bad magic bytes: {magic!r}")
+    if version != PROTO_VERSION:
+        raise ProtocolError(f"unsupported protocol version {version} (expected {PROTO_VERSION})")
     if length > MAX_ALLOWED_LENGTH:
         raise ProtocolError(f"frame length {length} exceeds maximum {MAX_ALLOWED_LENGTH}")
+    return version, ftype, stream_id, length
+
+
+async def read_frame(reader: asyncio.StreamReader, *, max_payload: int = MAX_ALLOWED_LENGTH) -> Frame:
+    """Read exactly one frame from an asyncio StreamReader.
+
+    The header is validated first (magic, version, length) so an oversized
+    or unknown-version frame is rejected *before* any payload is buffered.
+    `max_payload` lets a caller impose a tighter ceiling than
+    MAX_ALLOWED_LENGTH (e.g. HELLO, which must be exactly 72 bytes).
+
+    Raises asyncio.IncompleteReadError on clean/unclean EOF and
+    ProtocolError on a malformed header (bad magic / version / oversized
+    length) or a fixed-size frame carrying the wrong number of bytes.
+    """
+    version, ftype, stream_id, length = await read_frame_header(reader)
+    if length > max_payload:
+        raise ProtocolError(
+            f"frame type {ftype} length {length} exceeds allowed maximum {max_payload}"
+        )
+    expected = _FIXED_FRAME_SIZES.get(ftype)
+    if expected is not None and length != expected:
+        raise ProtocolError(
+            f"frame type {ftype} must carry exactly {expected} bytes, got {length}"
+        )
+    max_for_type = _MAX_FRAME_PAYLOADS.get(ftype)
+    if max_for_type is not None and length > max_for_type:
+        raise ProtocolError(
+            f"frame type {ftype} payload {length} exceeds maximum {max_for_type}"
+        )
+    if ftype in _CONTROL_PAYLOAD_TYPES and length > MAX_CONTROL_PAYLOAD:
+        raise ProtocolError(
+            f"control frame {ftype} payload {length} exceeds maximum {MAX_CONTROL_PAYLOAD}"
+        )
     payload = await reader.readexactly(length) if length else b""
     return Frame(version=version, type=ftype, stream_id=stream_id, payload=payload)
 
@@ -182,6 +246,39 @@ HELLO_PAYLOAD_LEN = struct.calcsize(_HELLO_FMT)
 NULL_CLIENT_ID = b"\x00" * 16
 HELLO_TIMESTAMP_SKEW_SECONDS = 60
 
+# Frame types whose payload has a fixed, known size. Any frame of one of
+# these types carrying a different Length is rejected by read_frame() as
+# malformed, which keeps the parser honest about control frames.
+_FIXED_FRAME_SIZES = {
+    FrameType.HELLO: HELLO_PAYLOAD_LEN,
+    FrameType.PING: 0,
+    FrameType.PONG: 0,
+    FrameType.STREAM_WINDOW_UPDATE: 4,
+    # STREAM_CLOSE/STREAM_EOF are pure signals and must carry no payload.
+    FrameType.STREAM_CLOSE: 0,
+    FrameType.STREAM_EOF: 0,
+}
+
+# Types with a variable but bounded payload. A STREAM_DATA frame is capped at
+# MAX_FRAME_PAYLOAD (64 KiB) so one stream cannot head-of-line-block the rest;
+# UDP datagrams at the protocol maximum.
+_MAX_FRAME_PAYLOADS = {
+    FrameType.STREAM_DATA: MAX_FRAME_PAYLOAD,
+    FrameType.UDP_DATAGRAM: UDP_MAX_DATAGRAM,
+}
+
+# JSON-carrying control/stream frames must stay small. This bounds memory
+# before the payload is read, independently of MAX_ALLOWED_LENGTH.
+_CONTROL_PAYLOAD_TYPES = frozenset({
+    FrameType.HELLO_OK,
+    FrameType.HELLO_FAIL,
+    FrameType.TUNNEL_OPEN_REQUEST,
+    FrameType.TUNNEL_OPEN_RESPONSE,
+    FrameType.TUNNEL_CLOSE,
+    FrameType.STREAM_OPEN,
+    FrameType.ERROR,
+})
+
 
 def build_hello_payload(secret: str, client_id_bytes: bytes = NULL_CLIENT_ID) -> bytes:
     """Build a HELLO payload. Used by clients (and by our own tests)."""
@@ -198,9 +295,12 @@ def build_hello_payload(secret: str, client_id_bytes: bytes = NULL_CLIENT_ID) ->
 def verify_hello_payload(payload: bytes, secret: str, seen_nonces: dict) -> tuple[bool, str | None, str | None]:
     """Validate a HELLO payload.
 
-    `seen_nonces` is a dict of (client_id_bytes+nonce) -> timestamp used for
-    replay protection; the caller is responsible for periodically pruning
-    entries older than HELLO_TIMESTAMP_SKEW_SECONDS.
+    `seen_nonces` is a dict of (client_id_bytes+nonce) -> expiry timestamp
+    (unix seconds) used for replay protection; the caller is responsible for
+    periodically pruning entries whose expiry has passed. Retaining an
+    expiry derived from the HELLO timestamp + allowed skew (rather than the
+    receive time) bounds how long a nonce can be replayed in either
+    direction, no matter how late the frame arrives.
 
     Returns (ok, client_id_hex_or_None, error_reason_or_None).
     """
@@ -224,7 +324,12 @@ def verify_hello_payload(payload: bytes, secret: str, seen_nonces: dict) -> tupl
     nonce_key = client_id_bytes + nonce
     if nonce_key in seen_nonces:
         return False, None, "replayed nonce"
-    seen_nonces[nonce_key] = now
+    # Keep the nonce at most until the HELLO timestamp itself stops being
+    # acceptable, so replays cannot be stretched by a late arrival. The +1
+    # covers the inclusive `abs(now - ts) <= SKEW` boundary: at exactly
+    # ts = now - SKEW the HELLO is still valid, so the nonce must still be
+    # retained then.
+    seen_nonces[nonce_key] = ts + HELLO_TIMESTAMP_SKEW_SECONDS + 1
 
     if client_id_bytes == NULL_CLIENT_ID:
         client_id_bytes = uuid.uuid4().bytes
