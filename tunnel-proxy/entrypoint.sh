@@ -410,7 +410,15 @@ fi
 
 probe_port() { # probe_port <port>
     setpriv "${SERVER_CAPS[@]}" --reuid="$SERVER_USER" --regid="$SERVER_GROUP" --init-groups -- \
-        "$PYTHON_BIN" -c 'import socket,sys; s=socket.socket(); s.bind(("0.0.0.0", int(sys.argv[1]))); s.close()' "$1"
+        "$PYTHON_BIN" -c 'import errno,socket,sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    s.bind(("0.0.0.0", int(sys.argv[1])))
+except OSError as exc:
+    if exc.errno in (errno.EACCES, errno.EPERM):
+        sys.exit(1)
+s.close()' "$1"
 }
 
 if [ -n "$need_ports" ]; then
